@@ -1,0 +1,16 @@
+{
+  "name": "@vault-sync/obsidian-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs"
+  },
+  "dependencies": {
+    "@vault-sync/core": "*",
+    "aws4fetch": "^1.0.18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.7"
+  }
+}

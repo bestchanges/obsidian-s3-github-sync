@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Python virtualenv
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*

@@ -1,0 +1,59 @@
+# Install into your VAULT CONTENT repo at .github/workflows/s3-sync.yml
+# Requires (see SETUP.md):
+#   - repo variables: S3_SYNC_BUCKET, S3_SYNC_REGION, S3_SYNC_ROLE_ARN, S3_SYNC_TOOL_REPO
+#   - ".sync-tool/" added to the content repo's .gitignore
+name: S3 sync
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/15 * * * *" # catches S3-side (plugin) changes + runs compaction
+  workflow_dispatch:
+
+concurrency:
+  group: s3-sync
+  cancel-in-progress: false # serialize runs; CAS guards cross-client races
+
+permissions:
+  id-token: write # OIDC → AWS role
+  contents: write # push sync commits
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout vault content
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: merge bases via `git show <lastSyncedCommit>:<path>`
+
+      - name: Checkout sync tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.S3_SYNC_TOOL_REPO }} # e.g. your-user/vault-sync
+          path: .sync-tool
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: .sync-tool/package-lock.json
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.S3_SYNC_ROLE_ARN }}
+          aws-region: ${{ vars.S3_SYNC_REGION }}
+
+      - name: Install sync tool
+        run: npm ci --prefix .sync-tool
+
+      - name: Run sync
+        env:
+          BUCKET: ${{ vars.S3_SYNC_BUCKET }}
+          AWS_REGION: ${{ vars.S3_SYNC_REGION }}
+          REPO_DIR: ${{ github.workspace }}
+          RETENTION_DAYS: "30"
+        run: npx --prefix .sync-tool tsx .sync-tool/packages/git-sync/src/main.ts

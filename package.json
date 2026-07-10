@@ -1,0 +1,17 @@
+{
+  "name": "vault-sync",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p packages/core && tsc --noEmit -p packages/git-sync && tsc --noEmit -p packages/obsidian-plugin",
+    "build:plugin": "node packages/obsidian-plugin/esbuild.config.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}

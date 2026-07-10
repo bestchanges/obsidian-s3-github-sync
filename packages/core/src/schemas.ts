@@ -1,0 +1,67 @@
+/** Protocol schemas — see design doc §1.2 */
+
+export const SCHEMA_VERSION = 1;
+
+/** Live file entry carried in a delta. `mtime` is author-time metadata, never a change signal (§1.6). */
+export interface FileEntry {
+  /** "md5:<hex>" of content — the ONLY change signal */
+  hash: string;
+  /** S3 version of the object this entry describes (merge base lookup, §1.5) */
+  s3VersionId?: string;
+  size: number;
+  /** ISO-8601 edit time on the source device */
+  mtime: string;
+}
+
+export interface Tombstone {
+  deleted: true;
+}
+
+export type DeltaEntry = FileEntry | Tombstone;
+
+/** One append-only journal object: deltas/<pad10(rev)>.json.gz */
+export interface Delta {
+  rev: number;
+  by: string;
+  at: string;
+  files: Record<string, DeltaEntry>;
+}
+
+export type SnapshotEntry = DeltaEntry & { rev: number; by: string };
+
+/** snapshot.json.gz — folded state of all deltas up to `revision` */
+export interface Snapshot {
+  schemaVersion: number;
+  revision: number;
+  updatedAt: string;
+  files: Record<string, SnapshotEntry>;
+}
+
+export function isTombstone(e: DeltaEntry | SnapshotEntry): boolean {
+  return (e as Tombstone).deleted === true;
+}
+
+export function emptySnapshot(): Snapshot {
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    revision: 0,
+    updatedAt: new Date(0).toISOString(),
+    files: {},
+  };
+}
+
+export function pad10(rev: number): string {
+  return String(rev).padStart(10, "0");
+}
+
+export function parseDelta(value: unknown): Delta {
+  const d = value as Delta;
+  if (
+    typeof d !== "object" || d === null ||
+    typeof d.rev !== "number" || typeof d.by !== "string" ||
+    typeof d.files !== "object" || d.files === null
+  ) {
+    throw new Error("parseDelta: malformed delta object");
+  }
+  return d;
+}
