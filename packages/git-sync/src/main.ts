@@ -35,6 +35,8 @@ const WRITER_ID = "git-sync";
 const STATE_PATH = ".sync/state.json";
 const S3SYNCIGNORE = ".s3syncignore";
 const CONCURRENCY = 50;
+/** Files larger than this stay S3-only — never pulled into git (GitHub's 100MB hard limit; keeps the repo lean). */
+const DEFAULT_MAX_GIT_FILE_BYTES = 25 * 1024 * 1024;
 
 interface SyncStateFile {
   lastSyncedRev: number;
@@ -127,6 +129,16 @@ async function main(): Promise<void> {
   for (const p of gitIgnored) {
     log(`skip (.gitignore, stays S3-only): ${p}`);
     s3Changed.delete(p);
+  }
+  // Oversized files stay S3-only: never write them into the git tree (size is in the manifest,
+  // so no download needed). Guards against GitHub's file-size limit wedging the push.
+  const maxGitFileBytes = Number(process.env.GIT_MAX_FILE_BYTES ?? DEFAULT_MAX_GIT_FILE_BYTES);
+  for (const [p, entry] of [...s3Changed]) {
+    const size = (entry as FileEntry & SnapshotEntry).size;
+    if (!isTombstone(entry) && typeof size === "number" && size > maxGitFileBytes) {
+      log(`skip (${size}B > ${maxGitFileBytes}B, stays S3-only): ${p}`);
+      s3Changed.delete(p);
+    }
   }
 
   log(
