@@ -23,7 +23,15 @@ const TEXT_EXTS = new Set([
   "md", "txt", "json", "csv", "canvas", "yml", "yaml", "html", "css", "js", "ts", "svg", "mermaid",
 ]);
 const ALWAYS_EXCLUDED = [".obsidian/", ".sync/", ".git/"];
+/** git-side-only metadata: must never be synced as vault content — a vault that lacks these
+ * would otherwise tombstone them out of S3 (and thus out of the repo). Matched by basename. */
+const GIT_META_FILES = new Set([".gitignore", ".gitattributes", ".gitmodules", ".s3syncignore"]);
 const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
+/** Offline-delete safety: absence on disk is NOT a reliable delete signal (a stale/copied/moved
+ * state looks identical to a mass delete). Below the floor we trust it as genuine offline deletes;
+ * above the fraction we treat it as a state mismatch and RESTORE from S3 instead of tombstoning. */
+const MASS_MISSING_MIN = 10;
+const MASS_MISSING_FRACTION = 0.5;
 
 export interface FileState {
   hash: string;
@@ -40,6 +48,8 @@ export interface EngineOptions {
   deviceId: string;
   excludedFolders: string[];
   concurrency: number;
+  /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
+  verbose: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -48,6 +58,15 @@ export class SyncEngine {
   readonly applying = new Set<string>();
   private dirty = new Set<string>();
   private running = false;
+  // per-cycle activity counters (for the verbose summary)
+  private pulled = 0;
+  private pushed = 0;
+  private merged = 0;
+
+  /** show a Notice; gated by verbose unless force=true (errors/conflicts/user actions) */
+  private notify(msg: string, force = false): void {
+    if (force || this.opts.verbose) new Notice(msg);
+  }
 
   constructor(
     private vault: Vault,
@@ -58,6 +77,7 @@ export class SyncEngine {
 
   // ------------------------------------------------------------- exclusions
   isExcluded(path: string): boolean {
+    if (GIT_META_FILES.has(path.split("/").pop() ?? "")) return true;
     const folders = [...ALWAYS_EXCLUDED, ...this.opts.excludedFolders.map((f) => f.replace(/\/?$/, "/"))];
     return folders.some((f) => path.startsWith(f));
   }
@@ -83,9 +103,39 @@ export class SyncEngine {
         if (contentHash(new Uint8Array(content)) !== st.hash) this.dirty.add(file.path);
       }
     }
-    for (const path of Object.keys(this.state.files)) {
-      if (!known.has(path) && !this.isExcluded(path)) this.dirty.add(path); // deleted offline
+    const missing = Object.keys(this.state.files).filter(
+      (p) => !known.has(p) && !this.isExcluded(p),
+    );
+    const total = Object.keys(this.state.files).length;
+    if (
+      missing.length >= MASS_MISSING_MIN &&
+      missing.length / Math.max(1, total) > MASS_MISSING_FRACTION
+    ) {
+      // Too many files vanished at once — almost certainly a stale/copied/moved state, not real
+      // deletions. Restoring is safe; mass-tombstoning would wipe the vault everywhere. Force a
+      // cold re-pull, which re-downloads the missing files instead of deleting them (§offline-safety).
+      this.notify(
+        `Sync: ${missing.length} of ${total} tracked files are missing locally — treating this as a ` +
+          `state mismatch and restoring from S3, not deleting. Use "Resync everything" if this is wrong.`,
+        true,
+      );
+      this.state.lastSyncedRev = 0;
+    } else {
+      for (const p of missing) this.dirty.add(p); // small offline deletes propagate as tombstones
     }
+  }
+
+  /** User-triggered full reconcile: forget the cursor, re-pull the entire S3 state, re-scan all
+   * local files. Overlaps union-merge (nothing lost). The escape hatch for stale/foreign state. */
+  async resyncEverything(): Promise<void> {
+    this.state.lastSyncedRev = 0;
+    this.state.files = {};
+    this.dirty.clear();
+    await this.scanOffline(); // re-mark every local file dirty (empty state → all are "new")
+    this.notify("Resync: reconciling the whole vault with S3…", true);
+    await this.sync();
+    await this.opts.onStateChanged(this.state); // force-persist the reset even if S3 was empty
+    this.notify("Resync complete", true);
   }
 
   // ------------------------------------------------------------- sync cycle
@@ -93,10 +143,21 @@ export class SyncEngine {
   async sync(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.pulled = this.pushed = this.merged = 0;
+    const rev0 = this.state.lastSyncedRev;
     try {
       await this.pull();
       await this.push();
-      await this.opts.onStateChanged(this.state);
+      const activity = this.pulled + this.pushed + this.merged;
+      // Persist only when state actually changed — no-op polls (the common case) skip the write.
+      if (activity > 0 || this.state.lastSyncedRev !== rev0) {
+        await this.opts.onStateChanged(this.state);
+      }
+      if (activity > 0) {
+        this.notify(
+          `Sync: ↓${this.pulled} ↑${this.pushed}` + (this.merged ? ` (${this.merged} merged)` : ""),
+        );
+      }
     } finally {
       this.running = false;
     }
@@ -154,6 +215,7 @@ export class SyncEngine {
           return;
         }
         await this.withApplying(path, () => this.vault.adapter.remove(path));
+        this.pulled++;
       }
       delete this.state.files[path];
       this.dirty.delete(path);
@@ -176,6 +238,7 @@ export class SyncEngine {
       if (!obj) return;
       await this.write(path, obj.body, remote.mtime);
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
+      this.pulled++;
       return;
     }
 
@@ -201,7 +264,8 @@ export class SyncEngine {
     await this.write(path, encodeText(merged.text), new Date().toISOString());
     this.record(path, { ...remote, hash: contentHash(merged.text) });
     this.dirty.add(path); // merged result must go back to S3
-    if (merged.hadConflicts) new Notice(`Sync: union-merged conflict in ${path}`);
+    this.merged++;
+    if (merged.hadConflicts) this.notify(`Sync: union-merged conflict in ${path}`, true);
   }
 
   private async push(): Promise<void> {
@@ -255,6 +319,7 @@ export class SyncEngine {
       else this.state.files[path] = st;
     }
     this.state.lastSyncedRev = result.rev;
+    this.pushed += Object.keys(files).length;
     this.dirty.clear();
   }
 

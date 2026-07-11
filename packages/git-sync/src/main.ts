@@ -81,7 +81,12 @@ async function main(): Promise<void> {
   } catch {
     /* optional file */
   }
-  ig.add([STATE_PATH, S3SYNCIGNORE, ".sync/", ".github/", ".sync-tool/"]);
+  // git-side-only metadata stays out of S3 in BOTH directions: never pushed, and an S3 tombstone
+  // for one is ignored (so a vault that lacks .gitignore can't delete it from the repo).
+  ig.add([
+    STATE_PATH, S3SYNCIGNORE, ".sync/", ".github/", ".sync-tool/",
+    ".gitignore", ".gitattributes", ".gitmodules", ".git/",
+  ]);
 
   // ---- detect git-side changes (§3.3 step 3) -----------------------------
   let gitChanged: Map<string, "upsert" | "delete">;

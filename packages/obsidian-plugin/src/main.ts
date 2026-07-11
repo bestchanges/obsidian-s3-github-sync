@@ -1,6 +1,7 @@
-import { Notice, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile } from "obsidian";
-import { SyncEngine, SyncState } from "./engine";
+import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, normalizePath } from "obsidian";
+import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
+import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
 
 interface Settings {
   bucket: string;
@@ -9,8 +10,12 @@ interface Settings {
   secretAccessKey: string;
   prefix: string;
   deviceId: string;
+  /** machine the deviceId/state were minted on — recomputed each load, never trusted from disk;
+   * a mismatch means data.json was copied from another device (regenerate id + full resync) */
+  machineFingerprint: string;
   pollIntervalSec: number; // default 15 (§2.3)
   excludedFolders: string[]; // local-only until re-enabled (§2.2)
+  verbose: boolean; // Notice on every sync cycle that did something
   mobileConcurrency: number;
   desktopConcurrency: number;
 }
@@ -21,16 +26,47 @@ const DEFAULT_SETTINGS: Settings = {
   accessKeyId: "",
   secretAccessKey: "",
   prefix: "",
-  deviceId: `device:${Math.random().toString(36).slice(2, 8)}`,
+  deviceId: "", // minted on first load from the machine label + a random suffix
+  machineFingerprint: "",
   pollIntervalSec: 15,
   excludedFolders: [],
+  verbose: false,
   mobileConcurrency: 8,
   desktopConcurrency: 50,
 };
 
 interface PersistedData {
   settings: Settings;
-  syncState: SyncState;
+}
+
+/** Older builds embedded syncState in data.json — read once for migration into the state file. */
+interface LegacyData {
+  settings?: Settings;
+  syncState?: SyncState;
+}
+
+/** Compact on-disk state: short keys + array entries, gzipped into its own file. Keeps data.json
+ * small/copyable and avoids rewriting ~4 MB of plain JSON (20k files) on every sync. */
+type CompactEntry = [hash: string, mtime: string] | [hash: string, mtime: string, s3VersionId: string];
+interface CompactState {
+  r: number;
+  f: Record<string, CompactEntry>;
+}
+
+function serializeState(s: SyncState): CompactState {
+  const f: Record<string, CompactEntry> = {};
+  for (const [p, st] of Object.entries(s.files)) {
+    f[p] = st.s3VersionId ? [st.hash, st.mtime, st.s3VersionId] : [st.hash, st.mtime];
+  }
+  return { r: s.lastSyncedRev, f };
+}
+
+function deserializeState(c: CompactState): SyncState {
+  const files: Record<string, FileState> = {};
+  for (const [p, e] of Object.entries(c.f ?? {})) {
+    files[p] = { hash: e[0], mtime: e[1], s3VersionId: e[2] };
+  }
+  return { lastSyncedRev: c.r ?? 0, files };
 }
 
 const PUSH_DEBOUNCE_MS = 5_000; // §2.2
@@ -41,14 +77,21 @@ export default class S3SyncPlugin extends Plugin {
   private engine: SyncEngine | null = null;
   private pushTimer: number | null = null;
   private pollTimer: number | null = null;
+  private foreignStateDetected = false;
 
   async onload(): Promise<void> {
-    const data = ((await this.loadData()) ?? {}) as Partial<PersistedData>;
+    const data = ((await this.loadData()) ?? {}) as LegacyData;
     this.settings = { ...DEFAULT_SETTINGS, ...data.settings };
-    this.syncState = data.syncState ?? { lastSyncedRev: 0, files: {} };
+    this.syncState = await this.loadState(data.syncState);
+    await this.ensureDeviceIdentity();
 
     this.addSettingTab(new S3SyncSettingTab(this));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync("manual") });
+    this.addCommand({
+      id: "resync-everything",
+      name: "Resync everything from S3",
+      callback: () => void this.resyncEverything(),
+    });
 
     // vault change tracking (§2.2) — events don't fire while the app is closed
     const onChange = (file: TAbstractFile) => {
@@ -78,6 +121,81 @@ export default class S3SyncPlugin extends Plugin {
     return !!(this.settings.bucket && this.settings.accessKeyId && this.settings.secretAccessKey);
   }
 
+  // -------------------------------------------------- device identity (§2 discussion)
+  /** A fingerprint of the physical machine — recomputed at runtime, never read from data.json,
+   * so a copied bundle can't fake it. Desktop uses the OS hostname; mobile falls back to the UA. */
+  private computeFingerprint(): string {
+    const req = (window as unknown as { require?: (m: string) => { hostname(): string } }).require;
+    if (!Platform.isMobile && req) {
+      try {
+        return "host:" + req("os").hostname();
+      } catch {
+        /* fall through to UA */
+      }
+    }
+    return "ua:" + (navigator.userAgent || "unknown");
+  }
+
+  private slug(s: string): string {
+    return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "device";
+  }
+
+  /** Human-readable device label: hostname on desktop, model-ish token on mobile. */
+  private deviceLabel(): string {
+    const req = (window as unknown as { require?: (m: string) => { hostname(): string } }).require;
+    if (!Platform.isMobile && req) {
+      try {
+        const host = String(req("os").hostname()).split(".")[0];
+        if (host) return this.slug(host);
+      } catch {
+        /* fall through */
+      }
+    }
+    const m = (navigator.userAgent || "").match(/iPhone|iPad|Android|Macintosh|Windows|Linux/i);
+    return this.slug(m ? m[0] : "device");
+  }
+
+  /** Label + first-run random suffix → unique by design, even across identical hardware. */
+  private mintDeviceId(): string {
+    return `${this.deviceLabel()}-${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  /** Mint an id on first run; if the stored fingerprint says this data.json came from a different
+   * machine, regenerate the id AND reset the cursor so startup does a clean full resync. */
+  private async ensureDeviceIdentity(): Promise<void> {
+    const fp = this.computeFingerprint();
+    let changed = false;
+    if (!this.settings.deviceId) {
+      this.settings.deviceId = this.mintDeviceId();
+      this.settings.machineFingerprint = fp;
+      changed = true;
+    } else if (!this.settings.machineFingerprint) {
+      this.settings.machineFingerprint = fp; // upgrade from a build without fingerprints
+      changed = true;
+    } else if (this.settings.machineFingerprint !== fp) {
+      this.settings.deviceId = this.mintDeviceId();
+      this.settings.machineFingerprint = fp;
+      this.syncState = { lastSyncedRev: 0, files: {} }; // foreign state → cold full pull
+      this.foreignStateDetected = true;
+      changed = true;
+    }
+    if (changed) await this.persistSettings();
+    if (this.foreignStateDetected) await this.persistState();
+  }
+
+  async resyncEverything(): Promise<void> {
+    if (!this.engine) {
+      new Notice("S3 Vault Sync: not configured");
+      return;
+    }
+    try {
+      await this.engine.resyncEverything();
+    } catch (err) {
+      console.error("[s3-sync] resync failed", err);
+      new Notice(`S3 resync failed: ${String(err)}`);
+    }
+  }
+
   rebuildEngine(): void {
     if (!this.configured()) {
       this.engine = null;
@@ -98,9 +216,10 @@ export default class S3SyncPlugin extends Plugin {
         deviceId: this.settings.deviceId,
         excludedFolders: this.settings.excludedFolders,
         concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
+        verbose: this.settings.verbose,
         onStateChanged: async (state) => {
           this.syncState = state;
-          await this.persist();
+          await this.persistState();
         },
       },
     );
@@ -111,6 +230,9 @@ export default class S3SyncPlugin extends Plugin {
     if (!this.engine) {
       new Notice("S3 Vault Sync: not configured (see settings)");
       return;
+    }
+    if (this.foreignStateDetected) {
+      new Notice(`S3 Vault Sync: new device "${this.settings.deviceId}" — running a full resync`);
     }
     await this.engine.scanOffline(); // offline catch-up (§2.4)
     await this.runSync("startup");
@@ -147,8 +269,42 @@ export default class S3SyncPlugin extends Plugin {
     }
   }
 
-  async persist(): Promise<void> {
-    await this.saveData({ settings: this.settings, syncState: this.syncState } satisfies PersistedData);
+  private statePath(): string {
+    return normalizePath(`${this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync"}/state.json.gz`);
+  }
+
+  /** Load per-device sync state from its gzipped file; migrate an older embedded state once. */
+  private async loadState(legacy?: SyncState): Promise<SyncState> {
+    const path = this.statePath();
+    try {
+      if (await this.app.vault.adapter.exists(path)) {
+        const buf = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+        return deserializeState(decodeJsonGz<CompactState>(buf));
+      }
+    } catch (err) {
+      console.error("[s3-sync] state file unreadable — starting fresh (a resync will rebuild it)", err);
+    }
+    if (legacy && (legacy.lastSyncedRev || Object.keys(legacy.files ?? {}).length)) {
+      await this.writeStateFile(legacy); // one-time migration out of data.json
+      return legacy;
+    }
+    return { lastSyncedRev: 0, files: {} };
+  }
+
+  private async writeStateFile(state: SyncState): Promise<void> {
+    const bytes = encodeJsonGz(serializeState(state));
+    const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    await this.app.vault.adapter.writeBinary(this.statePath(), ab);
+  }
+
+  /** data.json now holds ONLY settings — small and safe to copy between devices. */
+  async persistSettings(): Promise<void> {
+    await this.saveData({ settings: this.settings } satisfies PersistedData);
+  }
+
+  /** The heavy per-file state lives in its own gzipped file, written only when it changed. */
+  async persistState(): Promise<void> {
+    await this.writeStateFile(this.syncState);
   }
 }
 
@@ -162,7 +318,7 @@ class S3SyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     const s = this.plugin.settings;
     const save = async () => {
-      await this.plugin.persist();
+      await this.plugin.persistSettings();
       this.plugin.rebuildEngine();
       this.plugin.startPolling();
     };
@@ -200,7 +356,16 @@ class S3SyncSettingTab extends PluginSettingTab {
         }));
     new Setting(containerEl)
       .setName("Device ID")
-      .setDesc("Writer identity for echo suppression — unique per device.")
+      .setDesc("Writer identity for echo suppression. Auto-generated per device; change only if you must.")
       .addText((t) => t.setValue(s.deviceId).onChange(async (v) => { s.deviceId = v.trim(); await save(); }));
+    new Setting(containerEl)
+      .setName("Verbose notifications")
+      .setDesc("Show a notice after each sync cycle that transferred files (conflicts always notify).")
+      .addToggle((t) => t.setValue(s.verbose).onChange(async (v) => { s.verbose = v; await save(); }));
+    new Setting(containerEl)
+      .setName("Resync everything")
+      .setDesc("Forget the local cursor and reconcile the whole vault against S3 (union-merges overlaps, nothing lost). Use after moving devices or if state looks wrong.")
+      .addButton((b) =>
+        b.setButtonText("Resync").setWarning().onClick(() => void this.plugin.resyncEverything()));
   }
 }
