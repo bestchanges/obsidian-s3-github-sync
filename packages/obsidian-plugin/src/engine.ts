@@ -26,6 +26,11 @@ const ALWAYS_EXCLUDED = [".obsidian/", ".sync/", ".git/"];
 /** git-side-only metadata: must never be synced as vault content — a vault that lacks these
  * would otherwise tombstone them out of S3 (and thus out of the repo). Matched by basename. */
 const GIT_META_FILES = new Set([".gitignore", ".gitattributes", ".gitmodules", ".s3syncignore"]);
+/** Per-device files that must never sync: Obsidian's workspace UI state and this plugin's own
+ * gzipped cursor. Enforced here (not only via .gitignore) so they can't leak on either leg. */
+function isPerDeviceFile(basename: string): boolean {
+  return basename === "state.json.gz" || /^workspace.*\.json$/.test(basename);
+}
 const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
 /** Offline-delete safety: absence on disk is NOT a reliable delete signal (a stale/copied/moved
  * state looks identical to a mass delete). Below the floor we trust it as genuine offline deletes;
@@ -77,7 +82,8 @@ export class SyncEngine {
 
   // ------------------------------------------------------------- exclusions
   isExcluded(path: string): boolean {
-    if (GIT_META_FILES.has(path.split("/").pop() ?? "")) return true;
+    const base = path.split("/").pop() ?? "";
+    if (GIT_META_FILES.has(base) || isPerDeviceFile(base)) return true;
     const folders = [...ALWAYS_EXCLUDED, ...this.opts.excludedFolders.map((f) => f.replace(/\/?$/, "/"))];
     return folders.some((f) => path.startsWith(f));
   }
