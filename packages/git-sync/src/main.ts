@@ -88,6 +88,9 @@ async function main(): Promise<void> {
   ig.add([
     STATE_PATH, S3SYNCIGNORE, ".sync/", ".github/", ".sync-tool/",
     ".gitignore", ".gitattributes", ".gitmodules", ".git/",
+    // per-device files: Obsidian workspace UI state + the plugin's gzipped cursor. Excluded here
+    // (not only via .gitignore) so a missing/misconfigured .gitignore can't leak them.
+    ".obsidian/workspace*.json", "state.json.gz",
   ]);
 
   // ---- detect git-side changes (§3.3 step 3) -----------------------------
