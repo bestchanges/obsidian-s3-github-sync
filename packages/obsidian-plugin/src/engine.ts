@@ -133,20 +133,20 @@ export class SyncEngine {
     this.dirty.clear();
     await this.scanOffline(); // re-mark every local file dirty (empty state → all are "new")
     this.notify("Resync: reconciling the whole vault with S3…", true);
-    await this.sync();
+    await this.sync(true); // full pull: ignore echo suppression so THIS device's own files restore too
     await this.opts.onStateChanged(this.state); // force-persist the reset even if S3 was empty
     this.notify("Resync complete", true);
   }
 
   // ------------------------------------------------------------- sync cycle
   /** One full cycle: pull remote changes (merge conflicts), then push dirty set. */
-  async sync(): Promise<void> {
+  async sync(fullPull = false): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.pulled = this.pushed = this.merged = 0;
     const rev0 = this.state.lastSyncedRev;
     try {
-      await this.pull();
+      await this.pull(fullPull);
       await this.push();
       const activity = this.pulled + this.pushed + this.merged;
       // Persist only when state actually changed — no-op polls (the common case) skip the write.
@@ -163,11 +163,14 @@ export class SyncEngine {
     }
   }
 
-  private async pull(): Promise<void> {
+  private async pull(fullPull = false): Promise<void> {
     let deltas: Delta[];
     let changed: Map<string, SnapshotEntry>;
     let targetRev: number;
 
+    // fullPull (resync): don't echo-suppress — the goal is to restore the ENTIRE live state,
+    // including files this device once wrote but has since lost locally.
+    const excludeBy = fullPull ? undefined : this.opts.deviceId;
     deltas = await listDeltasSince(this.storage, this.state.lastSyncedRev, this.opts.concurrency);
     if (hasGap(this.state.lastSyncedRev, deltas) || (await this.behindSnapshot(deltas))) {
       // cold path (§1.4): journal pruned past us — diff against the snapshot
@@ -175,16 +178,16 @@ export class SyncEngine {
       if (!snap) return;
       changed = new Map(
         Object.entries(snap.snapshot.files).filter(
-          ([, e]) => e.rev > this.state.lastSyncedRev && e.by !== this.opts.deviceId,
+          ([, e]) => e.rev > this.state.lastSyncedRev && (fullPull || e.by !== this.opts.deviceId),
         ),
       );
       targetRev = Math.max(snap.snapshot.revision, deltas.at(-1)?.rev ?? 0);
-      for (const [path, entry] of changedEntries(deltas, snap.snapshot.revision, this.opts.deviceId)) {
+      for (const [path, entry] of changedEntries(deltas, snap.snapshot.revision, excludeBy)) {
         changed.set(path, entry);
       }
     } else {
       if (deltas.length === 0) return;
-      changed = changedEntries(deltas, this.state.lastSyncedRev, this.opts.deviceId);
+      changed = changedEntries(deltas, this.state.lastSyncedRev, excludeBy);
       targetRev = deltas.at(-1)!.rev;
     }
 
