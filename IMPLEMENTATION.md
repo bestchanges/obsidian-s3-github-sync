@@ -290,7 +290,19 @@ as usual (the forced copy goes stale until the command is re-run), never deleted
 `applyRemote` per path: identical hash → just record; clean local (or absent) → take remote (subject
 to the download cap); local also changed → **conflict**. Conflicts on binary files or content
 `> LWW_SIZE_LIMIT` (5 MB) are **last-writer-wins (keep local, re-push)**; text conflicts within the
-limit union-merge against the versioned base (fetched via the recorded `s3VersionId`). Remote writes
+limit union-merge against the versioned base (fetched via the recorded `s3VersionId`).
+
+> [!note] First-run bootstrap (`EngineOptions.firstRun`)
+> On a device that has **never synced** (no persisted state file, and not a copied/foreign state),
+> the first pull treats every local↔remote collision as **clean → take remote as-is** rather than a
+> conflict. A fresh vault's `.obsidian/*.json` on disk is Obsidian's just-generated *defaults*, not
+> real edits; union-merging them would corrupt the canonical settings and propagate the corruption on
+> the next push. Local-only files (absent from remote) never reach `applyRemote`, so genuine new
+> content still uploads. The guard clears after the first pull. It is deliberately **off** for a
+> foreign (copied) state and for user `Resync everything`, where local content is real and the
+> lossless union merge is correct. The plugin sets `firstRun = !hadPriorState && !foreignStateDetected`.
+
+Remote writes
 land with the **manifest's mtime** (`DataWriteOptions`), so sort-by-modified is consistent across
 devices and the offline pre-filter stays trustworthy. Writes made by sync are wrapped in an
 `applying` set (released after 500 ms) so the resulting vault event is recognized as an echo, not a
@@ -301,10 +313,16 @@ new edit.
 - **Verbose mode** (default off): a notice after every cycle that transferred anything —
   `Sync: ↓<pulled> ↑<pushed> (<merged> merged) · <skipped> kept in cloud (over size limit)`. Errors
   and merge conflicts always notify regardless.
-- **Settings tab**: bucket, region, access key id, secret (password field), key prefix, poll
-  interval (≥ 5 s), excluded folders, **max download size (MB)**, device id, verbose toggle, **Resync
-  everything** (warning), **Export setup vault** (CTA).
-- **Commands**: `Sync now`, `Resync everything from S3`, `Export setup vault (for a new device)`,
+- **Pause sync** (`settings.syncPaused`, default off): a plugin-level gate — startup/poll/edit
+  cycles no-op and manual sync/resync are refused with a notice, while dirty tracking keeps running
+  so edits flush the moment sync resumes. Use it to finish enabling/configuring plugins on a new
+  device before the first sync, or to stop temporarily. Resuming (settings toggle or command) kicks
+  an immediate sync and restarts polling.
+- **Settings tab**: **pause sync** (top), bucket, region, access key id, secret (password field),
+  key prefix, poll interval (≥ 5 s), excluded folders, **max download size (MB)**, device id, verbose
+  toggle, **Resync everything** (warning), **Export setup vault** (CTA).
+- **Commands**: `Sync now`, `Resync everything from S3`, `Pause/resume sync`,
+  `Export setup vault (for a new device)`,
   `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only).
 - **Polling**: `LIST` every `pollIntervalSec` (default 15). Startup runs `scanOffline` → sync → start
   polling once the vault index is ready.
@@ -315,7 +333,9 @@ Provisions a new device from **any** device (desktop or mobile) — no CLI. `bui
 an in-memory zip (`fflate`) containing an empty `vault/` with only this plugin (`main.js` +
 `manifest.json`), `community-plugins.json` pre-listing the plugin, and a `data.json` that is **plugin
 defaults + this device's connection fields** with `deviceId`/`machineFingerprint` cleared,
-`maxDownloadMB = 10`, and **no state file** (clean full pull on first run). Setup instructions ride at
+`maxDownloadMB = 10`, `syncPaused = true` (§4.9 — the new device enables/configures its plugins,
+then resumes sync to pull the vault), and **no state file** (clean full pull on first run, taking
+remote as-is on every collision per the §4.8 bootstrap). Setup instructions ride at
 the zip **root**, outside `vault/`, so they never sync to S3. `deliverFile` adapts to platform:
 `navigator.share({ files })` (mobile share sheet) with a browser-download fallback (desktop).
 

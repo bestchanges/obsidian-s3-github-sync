@@ -80,6 +80,13 @@ export interface EngineOptions {
   maxDownloadBytes: number;
   /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
   verbose: boolean;
+  /** First-ever sync on this device: the local state has never been persisted, so files that
+   * collide with remote are Obsidian's just-generated config defaults (or a copied scratch state),
+   * NOT genuine edits. When true the first pull takes remote as-is on any collision instead of
+   * union-merging — which would otherwise corrupt the canonical .obsidian settings and push the
+   * corruption everywhere. Must be false for a copied (foreign) state and for user resyncs, where
+   * local content is real and union-merge is the right, lossless choice. */
+  firstRun?: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -112,6 +119,10 @@ export class SyncEngine {
   /** paths currently being written by sync itself — vault events for them are echoes (§2.3) */
   readonly applying = new Set<string>();
   private dirty = new Set<string>();
+  /** First-ever-sync guard: while true, a pull takes remote as-is on any local collision instead of
+   * union-merging (kills the fresh-device default-config corruption). Cleared after the first pull.
+   * See EngineOptions.firstRun and applyRemote(). */
+  private bootstrap: boolean;
   // Serialization: one cycle runs at a time. Concurrent requests (poll / edit save / manual /
   // resync) coalesce into a single queued slot instead of overlapping — which used to let a resync
   // wipe the state mid-cycle while its own sync no-op'd. `running` holds the lock; `queuedReq` is
@@ -144,7 +155,9 @@ export class SyncEngine {
     private storage: StorageAdapter,
     private state: SyncState,
     private opts: EngineOptions,
-  ) {}
+  ) {
+    this.bootstrap = opts.firstRun ?? false;
+  }
 
   // ------------------------------------------------------------- exclusions
   isExcluded(path: string): boolean {
@@ -415,6 +428,7 @@ export class SyncEngine {
     else if (req.scanConfig) await this.scanConfigDir();
 
     await this.pull(req.fullPull);
+    this.bootstrap = false; // first pull is done — later collisions are real edits again
     // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
     // dirty) and so a delete-vs-edit re-push it triggers is flushed in the same cycle.
     if (req.forcePaths.length) this.forceResult = await this.forceDownload(req.forcePaths);
@@ -505,7 +519,12 @@ export class SyncEngine {
       return;
     }
 
-    const localDirty = localBuf !== null && (!st || localHash !== st.hash);
+    // First-ever sync (bootstrap): a local file that collides with remote is NOT a genuine edit —
+    // it's Obsidian's just-generated config default (or a copied scratch state). Union-merging it
+    // into the canonical file would corrupt it and push the corruption everywhere, so treat every
+    // collision as clean and take remote as-is. Local-only files (absent from remote) never reach
+    // here, so genuine new content the user added before first sync still uploads normally.
+    const localDirty = !this.bootstrap && localBuf !== null && (!st || localHash !== st.hash);
     if (!localDirty) {
       // Per-device download cap: oversized remote files stay in the cloud on this device to save
       // space. Leave local as-is and DON'T record — the file just isn't present here, so it's not
@@ -513,6 +532,10 @@ export class SyncEngine {
       // never capped, so a big file this device authors still syncs up. A locally-dirty file is
       // exempt (below): we must resolve it, and it's already taking space anyway.
       if (!this.downloadAllowed(remote.size)) {
+        // In bootstrap the colliding local file is a default we don't want to keep OR push up, but
+        // it's over the cap so we won't download either — drop it from the dirty set so push()
+        // can't upload the default (it's untracked, so push wouldn't otherwise skip it).
+        if (this.bootstrap) this.dirty.delete(path);
         this.skipped++;
         return;
       }
