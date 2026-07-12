@@ -17,4 +17,4 @@ npm run typecheck
 npm run build:plugin  # → packages/obsidian-plugin/dist/main.js
 ```
 
-Deployment: see **SETUP.md**. Design rationale: see the design doc (`Sync System Design.md`).
+Deployment: see **SETUP.md**. Design rationale (the "why"): **System Design.md**. Implementation reference as built (the "what"): **IMPLEMENTATION.md**.
