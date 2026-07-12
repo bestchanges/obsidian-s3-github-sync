@@ -23,6 +23,10 @@ interface Settings {
   verbose: boolean; // Notice on every sync cycle that did something
   mobileConcurrency: number;
   desktopConcurrency: number;
+  /** When true, all sync is held off — startup/poll/edit cycles no-op and manual sync/resync are
+   * refused with a notice. Edits are still tracked (marked dirty) and flush once resumed. Use it to
+   * finish configuring plugins on a new device before the first sync, or to pause temporarily. */
+  syncPaused: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -39,6 +43,7 @@ const DEFAULT_SETTINGS: Settings = {
   verbose: false,
   mobileConcurrency: 8,
   desktopConcurrency: 50,
+  syncPaused: false,
 };
 
 interface PersistedData {
@@ -84,6 +89,10 @@ export default class S3SyncPlugin extends Plugin {
   private pushTimer: number | null = null;
   private pollTimer: number | null = null;
   private foreignStateDetected = false;
+  /** True until this device has ever persisted sync state — i.e. no state file existed on load and
+   * none was migrated. Gates the engine's first-run "remote wins on collision" bootstrap so a fresh
+   * device doesn't union-merge Obsidian's generated config defaults into the canonical settings. */
+  private hadPriorState = false;
 
   async onload(): Promise<void> {
     const data = ((await this.loadData()) ?? {}) as LegacyData;
@@ -97,6 +106,11 @@ export default class S3SyncPlugin extends Plugin {
       id: "resync-everything",
       name: "Resync everything from S3",
       callback: () => void this.resyncEverything(),
+    });
+    this.addCommand({
+      id: "toggle-sync-pause",
+      name: "Pause/resume sync",
+      callback: () => void this.setSyncPaused(!this.settings.syncPaused),
     });
     this.addCommand({
       id: "export-starter-vault",
@@ -218,7 +232,9 @@ export default class S3SyncPlugin extends Plugin {
       const manifestJson = await adapter.read(normalizePath(`${dir}/manifest.json`));
 
       // Export = plugin DEFAULTS + this device's connection fields. Identity is cleared so the new
-      // device mints its own, and no state file is included → clean full pull on first run.
+      // device mints its own, and no state file is included → clean full pull on first run. Sync is
+      // paused so the user can enable/configure plugins on the new device before the first sync —
+      // they resume it (settings toggle or "Pause/resume sync" command) when ready.
       const settings: Settings = {
         ...DEFAULT_SETTINGS,
         bucket: this.settings.bucket,
@@ -226,6 +242,7 @@ export default class S3SyncPlugin extends Plugin {
         accessKeyId: this.settings.accessKeyId,
         secretAccessKey: this.settings.secretAccessKey,
         prefix: this.settings.prefix,
+        syncPaused: true,
       };
       const dataJson = JSON.stringify({ settings } satisfies PersistedData, null, 2) + "\n";
 
@@ -241,9 +258,27 @@ export default class S3SyncPlugin extends Plugin {
     }
   }
 
+  /** Toggle the pause gate. Resuming persists first, then kicks an immediate sync and (re)starts
+   * the poll so tracked-but-unpushed edits flush right away. Pausing just persists the flag. */
+  async setSyncPaused(paused: boolean): Promise<void> {
+    this.settings.syncPaused = paused;
+    await this.persistSettings();
+    if (paused) {
+      new Notice("S3 Vault Sync paused — no syncing until you resume.");
+    } else {
+      new Notice("S3 Vault Sync resumed.");
+      this.startPolling();
+      void this.runSync("manual");
+    }
+  }
+
   async resyncEverything(): Promise<void> {
     if (!this.engine) {
       new Notice("S3 Vault Sync: not configured");
+      return;
+    }
+    if (this.settings.syncPaused) {
+      new Notice("S3 Vault Sync is paused — resume it in settings before resyncing.");
       return;
     }
     try {
@@ -320,6 +355,9 @@ export default class S3SyncPlugin extends Plugin {
           : 0,
         concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
         verbose: this.settings.verbose,
+        // Fresh device (never synced) that isn't inheriting a copied state: let the first pull take
+        // remote as-is on collisions instead of union-merging Obsidian's generated config defaults.
+        firstRun: !this.hadPriorState && !this.foreignStateDetected,
         onStateChanged: async (state) => {
           this.syncState = state;
           await this.persistState();
@@ -337,8 +375,11 @@ export default class S3SyncPlugin extends Plugin {
     if (this.foreignStateDetected) {
       new Notice(`S3 Vault Sync: new device "${this.settings.deviceId}" — running a full resync`);
     }
+    if (this.settings.syncPaused) {
+      new Notice("S3 Vault Sync is paused — resume it in settings when you're ready to sync.");
+    }
     await this.runSync("startup"); // offline catch-up (§2.4) + first sync, serialized in one cycle
-    this.startPolling();
+    this.startPolling(); // ticks no-op while paused; resuming restarts an immediate sync
   }
 
   startPolling(): void {
@@ -358,6 +399,12 @@ export default class S3SyncPlugin extends Plugin {
   private syncFailures = 0;
   private async runSync(reason: string): Promise<void> {
     if (!this.engine) return;
+    if (this.settings.syncPaused) {
+      // Held off by the user. Automatic triggers stay silent; a manual "Sync now" tells them why
+      // nothing happened. Dirty tracking keeps running, so edits flush on resume.
+      if (reason === "manual") new Notice("S3 Vault Sync is paused — resume it in settings to sync.");
+      return;
+    }
     // The engine serializes the cycle and runs the pre-scan inside its lock. Startup does a full
     // offline catch-up (which also walks the config dir); poll/manual do the cheap config rescan;
     // "debounced-edit" fires after every keystroke burst, so it skips the config walk entirely.
@@ -393,6 +440,7 @@ export default class S3SyncPlugin extends Plugin {
     try {
       if (await this.app.vault.adapter.exists(path)) {
         const buf = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+        this.hadPriorState = true;
         return deserializeState(decodeJsonGz<CompactState>(buf));
       }
     } catch (err) {
@@ -400,6 +448,7 @@ export default class S3SyncPlugin extends Plugin {
     }
     if (legacy && (legacy.lastSyncedRev || Object.keys(legacy.files ?? {}).length)) {
       await this.writeStateFile(legacy); // one-time migration out of data.json
+      this.hadPriorState = true;
       return legacy;
     }
     return { lastSyncedRev: 0, files: {} };
@@ -436,6 +485,15 @@ class S3SyncSettingTab extends PluginSettingTab {
       this.plugin.rebuildEngine();
       this.plugin.startPolling();
     };
+
+    new Setting(containerEl)
+      .setName("Pause sync")
+      .setDesc(
+        "Hold off all syncing — e.g. until you've finished enabling and configuring plugins on a " +
+          "new device, or to stop temporarily. Edits are still tracked and flush when you resume.",
+      )
+      .addToggle((t) =>
+        t.setValue(s.syncPaused).onChange((v) => void this.plugin.setSyncPaused(v)));
 
     new Setting(containerEl).setName("Bucket").addText((t) =>
       t.setValue(s.bucket).onChange(async (v) => { s.bucket = v.trim(); await save(); }));
@@ -496,8 +554,9 @@ class S3SyncSettingTab extends PluginSettingTab {
       .setName("Set up a new device")
       .setDesc(
         "Export a zip: an empty vault with this plugin preconfigured (defaults, 10 MB download cap, " +
-          "no local state). On the new device open it as a vault and turn on community plugins — it " +
-          "syncs the whole vault. Works on mobile too (share sheet). Contains your secret key — share privately.",
+          "no local state, sync paused). On the new device open it as a vault and turn on community " +
+          "plugins; enable/configure your plugins, then resume sync (settings toggle) to pull the " +
+          "vault. Works on mobile too (share sheet). Contains your secret key — share privately.",
       )
       .addButton((b) =>
         b.setButtonText("Export setup vault").setCta().onClick(() => void this.plugin.exportStarterVault()));
