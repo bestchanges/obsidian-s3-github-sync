@@ -114,21 +114,67 @@ export class SyncEngine {
     if (!this.isExcluded(path) && !this.applying.has(path)) this.dirty.add(path);
   }
 
+  /** Mark one existing file dirty if it's new or its content changed (mtime pre-filter, hash
+   * decides — a touch with identical bytes is not a change). Shared by the offline scan and the
+   * per-poll config rescan. */
+  private async markIfChanged(path: string, mtimeMs: number): Promise<void> {
+    const st = this.state.files[path];
+    if (!st) {
+      this.dirty.add(path); // new (or re-enabled folder → scoped first-run, §2.2)
+      return;
+    }
+    if (new Date(mtimeMs).toISOString() !== st.mtime) {
+      const content = await this.vault.adapter.readBinary(path);
+      if (contentHash(new Uint8Array(content)) !== st.hash) this.dirty.add(path);
+    }
+  }
+
+  /** Recursively list files under the vault's config dir (e.g. ".obsidian"). Vault.getFiles()
+   * and the vault change events both omit the config dir and other dotfolders, so the ONLY way to
+   * see ".obsidian" content is to walk it through the raw adapter. Returns vault-relative paths. */
+  private async listConfigFiles(): Promise<string[]> {
+    const out: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      let listing: { files: string[]; folders: string[] };
+      try {
+        listing = await this.vault.adapter.list(dir);
+      } catch {
+        return; // dir absent (e.g. a custom/mobile config dir that doesn't exist) — nothing to scan
+      }
+      out.push(...listing.files);
+      for (const sub of listing.folders) await walk(sub);
+    };
+    await walk(this.vault.configDir);
+    return out;
+  }
+
+  /** Re-scan just the config dir for new/changed files and mark them dirty. Config files emit no
+   * vault events, so this must run each poll to catch in-session settings changes (installing a
+   * plugin, tweaking appearance). Deletions are NOT tombstoned here — they're picked up by the next
+   * startup scanOffline(), which is the only place absence is a reliable delete signal (§offline). */
+  async scanConfigDir(): Promise<void> {
+    for (const path of await this.listConfigFiles()) {
+      if (this.isExcluded(path)) continue;
+      const stat = await this.vault.adapter.stat(path);
+      if (stat) await this.markIfChanged(path, stat.mtime);
+    }
+  }
+
   /** Detect files edited while Obsidian was closed (§2.4): mtime pre-filter, hash decides. */
   async scanOffline(): Promise<void> {
     const known = new Set<string>();
     for (const file of this.vault.getFiles()) {
       if (this.isExcluded(file.path)) continue;
       known.add(file.path);
-      const st = this.state.files[file.path];
-      if (!st) {
-        this.dirty.add(file.path); // new (or re-enabled folder → scoped first-run, §2.2)
-        continue;
-      }
-      if (new Date(file.stat.mtime).toISOString() !== st.mtime) {
-        const content = await this.vault.adapter.readBinary(file.path);
-        if (contentHash(new Uint8Array(content)) !== st.hash) this.dirty.add(file.path);
-      }
+      await this.markIfChanged(file.path, file.stat.mtime);
+    }
+    // getFiles() skips the config dir — walk it explicitly so ".obsidian" content is both detected
+    // as dirty AND counted as "known" (otherwise every tracked config file would look deleted below).
+    for (const path of await this.listConfigFiles()) {
+      if (this.isExcluded(path)) continue;
+      known.add(path);
+      const stat = await this.vault.adapter.stat(path);
+      if (stat) await this.markIfChanged(path, stat.mtime);
     }
     const missing = Object.keys(this.state.files).filter(
       (p) => !known.has(p) && !this.isExcluded(p),
