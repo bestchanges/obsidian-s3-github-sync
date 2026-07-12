@@ -1,4 +1,4 @@
-import { Notice, TFile, Vault } from "obsidian";
+import { Notice, Vault } from "obsidian";
 import {
   appendDelta,
   changedEntries,
@@ -282,13 +282,12 @@ export class SyncEngine {
   }
 
   private async applyRemote(path: string, entry: SnapshotEntry): Promise<void> {
-    const local = this.vault.getAbstractFileByPath(path);
     const st = this.state.files[path];
 
     if (isTombstone(entry)) {
-      if (local instanceof TFile) {
-        const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
-        if (st && contentHash(buf) !== st.hash) {
+      const localBuf = await this.readLocal(path);
+      if (localBuf) {
+        if (st && contentHash(localBuf) !== st.hash) {
           this.dirty.add(path); // delete-vs-edit: our edit wins (§1.5) → re-push
           return;
         }
@@ -301,8 +300,7 @@ export class SyncEngine {
     }
 
     const remote = entry as FileEntry & SnapshotEntry;
-    const localBuf =
-      local instanceof TFile ? new Uint8Array(await this.vault.adapter.readBinary(path)) : null;
+    const localBuf = await this.readLocal(path);
     const localHash = localBuf ? contentHash(localBuf) : null;
     if (localHash === remote.hash) {
       this.record(path, remote); // already identical — just record
@@ -363,8 +361,10 @@ export class SyncEngine {
     const newStates = new Map<string, FileState | null>();
 
     await mapPool(paths, this.opts.concurrency, async (path) => {
-      const file = this.vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) {
+      // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
+      // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
+      const stat = await this.vault.adapter.stat(path);
+      if (!stat || stat.type !== "file") {
         if (this.state.files[path]) {
           files[path] = { deleted: true }; // deleted locally → tombstone
           newStates.set(path, null);
@@ -374,7 +374,7 @@ export class SyncEngine {
       const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
       const hash = contentHash(buf);
       const st = this.state.files[path];
-      const mtime = new Date(file.stat.mtime).toISOString();
+      const mtime = new Date(stat.mtime).toISOString();
       if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
       const res = await this.storage.put(`files/${path}`, buf);
       const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
@@ -411,6 +411,18 @@ export class SyncEngine {
   }
 
   // ------------------------------------------------------------- helpers
+  /** Read a local file's bytes via the raw adapter, or null if it isn't a file. Works uniformly
+   * for regular notes AND config-dir files (the vault index excludes the latter). */
+  private async readLocal(path: string): Promise<Uint8Array | null> {
+    try {
+      const stat = await this.vault.adapter.stat(path);
+      if (!stat || stat.type !== "file") return null;
+      return new Uint8Array(await this.vault.adapter.readBinary(path));
+    } catch {
+      return null;
+    }
+  }
+
   private isTextPath(path: string): boolean {
     const ext = path.split(".").pop()?.toLowerCase() ?? "";
     return TEXT_EXTS.has(ext);
