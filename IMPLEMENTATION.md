@@ -384,14 +384,24 @@ GitHub's 100 MB limit. (No download needed; the size is in the manifest.)
 
 ## 5.4 Reconcile
 
-For each path in `gitChanged ∪ s3Changed` (50-way parallel):
+The per-path decision lives in `reconcileFile` (`reconcile.ts`) behind a small `ReconcileIO` seam, so
+it is unit-tested without a real repo/S3/filesystem (`test/reconcile.test.ts`). For each path in
+`gitChanged ∪ s3Changed` (50-way parallel):
 
 - git-only upsert → PUT to S3 if the content hash differs from remote (idempotence); git-only delete
   → tombstone if remote still lives.
 - S3-only → write into the working tree, or `rm` on a tombstone.
-- both → resolve: delete-vs-edit → edit wins; else three-way `unionMerge` with
+- both → resolve: delete-vs-edit → edit wins; else, **if the path is text-mergeable** (extension in
+  `TEXT_EXTS` and both sides ≤ `LWW_SIZE_LIMIT` 5 MB), three-way `unionMerge` with
   `base = git show <lastSyncedCommit>:<path>` (warm) or empty (cold), writing the result to the tree
-  **and** queuing the S3 PUT.
+  **and** queuing the S3 PUT; otherwise (binary/oversized) **last-writer-wins** — keep git's bytes and
+  re-push (mirrors the plugin's keep-local LWW so neither side loses an edit).
+
+> [!important] Content is handled as **raw bytes** end to end
+> Local reads/writes and S3 get/put move `Uint8Array`; text is decoded (`decodeText`) only inside the
+> union-merge branch above. Reading or writing a binary file as UTF-8 replaces every invalid byte with
+> U+FFFD — irreversibly corrupting it and inflating its size (~1.5–2×). The `TEXT_EXTS` / `LWW_SIZE_LIMIT`
+> classification is duplicated here to stay in lockstep with the plugin's `engine.ts` (§4.8).
 
 ## 5.5 Write cycle, compaction, commit
 
