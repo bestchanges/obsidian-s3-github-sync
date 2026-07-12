@@ -268,6 +268,23 @@ resolved and already occupies space). Skips are counted and surfaced in the verb
 the cap and running Resync fetches previously-skipped files. The setting lives in per-device
 `data.json`, so phones keep 10 MB while the laptop can set 0.
 
+### 4.7.1 On-demand force-download of a note's linked files
+
+The **`Force download linked files of this note`** command (active-note `checkCallback`) lets a capped
+device pull a specific note's oversized attachments without lowering the global cap or a full resync.
+`main.ts` collects the note's link/embed targets as Obsidian **linkpaths** — from
+`metadataCache.resolvedLinks` **and** the raw `links`/`embeds` in the file cache, so targets that
+aren't present locally (the whole point) still surface — strips heading/block subpaths via
+`getLinkpath`, and hands them to `SyncEngine.forceDownloadPaths`. The engine runs this as a normal
+**serialized cycle** (`forcePaths` on the request; coalesces like any other): it loads the full live
+remote state (`loadRemoteState`), resolves each linkpath to a live remote path (exact, then `+".md"`
+for wikilinks, then basename/suffix match with shortest-path tiebreak; tombstones never match), and
+fetches each clean/absent target **ignoring `maxDownloadBytes`**, recording it in state. Locally-dirty
+targets are left for normal reconcile; unmatched candidates are reported. The command surfaces a
+`downloaded N, M already present, K not found in cloud` notice. Because the fetched files are now
+tracked and present, they aren't re-uploaded; a later remote edit that's still over the cap is skipped
+as usual (the forced copy goes stale until the command is re-run), never deleted.
+
 ## 4.8 Conflict handling & mtime alignment (`applyRemote`)
 
 `applyRemote` per path: identical hash → just record; clean local (or absent) → take remote (subject
@@ -287,7 +304,8 @@ new edit.
 - **Settings tab**: bucket, region, access key id, secret (password field), key prefix, poll
   interval (≥ 5 s), excluded folders, **max download size (MB)**, device id, verbose toggle, **Resync
   everything** (warning), **Export setup vault** (CTA).
-- **Commands**: `Sync now`, `Resync everything from S3`, `Export setup vault (for a new device)`.
+- **Commands**: `Sync now`, `Resync everything from S3`, `Export setup vault (for a new device)`,
+  `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only).
 - **Polling**: `LIST` every `pollIntervalSec` (default 15). Startup runs `scanOffline` → sync → start
   polling once the vault index is ready.
 
