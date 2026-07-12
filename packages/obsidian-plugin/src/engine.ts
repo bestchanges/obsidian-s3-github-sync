@@ -62,6 +62,10 @@ export interface EngineOptions {
   selfDir: string;
   excludedFolders: string[];
   concurrency: number;
+  /** per-device download cap in bytes: remote files larger than this are NOT downloaded to this
+   * device (they stay in the cloud), keeping mobile vaults small. 0 = no limit. Uploads are never
+   * capped — a file this device creates/edits always syncs up regardless of size. */
+  maxDownloadBytes: number;
   /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
   verbose: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
@@ -76,10 +80,17 @@ export class SyncEngine {
   private pulled = 0;
   private pushed = 0;
   private merged = 0;
+  private skipped = 0; // remote files left in the cloud this cycle (over the download cap)
 
   /** show a Notice; gated by verbose unless force=true (errors/conflicts/user actions) */
   private notify(msg: string, force = false): void {
     if (force || this.opts.verbose) new Notice(msg);
+  }
+
+  /** Per-device download gate: 0 = unlimited. Unknown size → allow (correctness over space). */
+  private downloadAllowed(size: number | undefined): boolean {
+    const limit = this.opts.maxDownloadBytes;
+    return limit <= 0 || typeof size !== "number" || size <= limit;
   }
 
   constructor(
@@ -159,7 +170,7 @@ export class SyncEngine {
   async sync(fullPull = false): Promise<void> {
     if (this.running) return;
     this.running = true;
-    this.pulled = this.pushed = this.merged = 0;
+    this.pulled = this.pushed = this.merged = this.skipped = 0;
     const rev0 = this.state.lastSyncedRev;
     try {
       await this.pull(fullPull);
@@ -169,9 +180,11 @@ export class SyncEngine {
       if (activity > 0 || this.state.lastSyncedRev !== rev0) {
         await this.opts.onStateChanged(this.state);
       }
-      if (activity > 0) {
+      if (activity > 0 || this.skipped > 0) {
         this.notify(
-          `Sync: ↓${this.pulled} ↑${this.pushed}` + (this.merged ? ` (${this.merged} merged)` : ""),
+          `Sync: ↓${this.pulled} ↑${this.pushed}` +
+            (this.merged ? ` (${this.merged} merged)` : "") +
+            (this.skipped ? ` · ${this.skipped} kept in cloud (over size limit)` : ""),
         );
       }
     } finally {
@@ -252,6 +265,15 @@ export class SyncEngine {
 
     const localDirty = localBuf !== null && (!st || localHash !== st.hash);
     if (!localDirty) {
+      // Per-device download cap: oversized remote files stay in the cloud on this device to save
+      // space. Leave local as-is and DON'T record — the file just isn't present here, so it's not
+      // "missing" (no tombstone) and a later resync with a higher cap will fetch it. Uploads are
+      // never capped, so a big file this device authors still syncs up. A locally-dirty file is
+      // exempt (below): we must resolve it, and it's already taking space anyway.
+      if (!this.downloadAllowed(remote.size)) {
+        this.skipped++;
+        return;
+      }
       // clean local (or absent) → take remote as-is
       const obj = await this.storage.get(`files/${path}`);
       if (!obj) return;
