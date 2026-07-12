@@ -76,4 +76,4 @@ if [ "$LIFECYCLE" = 1 ]; then
 fi
 
 step "Bucket ready"
-log "Next: ./02-create-user.sh   (per-user AWS identity + plugin access key)"
+log 'Next: ./02-create-user.sh   (per-user AWS identity + plugin access key)'
