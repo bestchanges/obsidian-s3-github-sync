@@ -131,32 +131,55 @@ export class SyncEngine {
 
   /** Recursively list files under the vault's config dir (e.g. ".obsidian"). Vault.getFiles()
    * and the vault change events both omit the config dir and other dotfolders, so the ONLY way to
-   * see ".obsidian" content is to walk it through the raw adapter. Returns vault-relative paths. */
-  private async listConfigFiles(): Promise<string[]> {
+   * see ".obsidian" content is to walk it through the raw adapter. Returns vault-relative paths, or
+   * null if the config dir itself couldn't be read — callers must NOT infer deletions from null (an
+   * unreadable dir is not an empty one, and treating it as empty would tombstone all config files). */
+  private async listConfigFiles(): Promise<string[] | null> {
+    let rootListing: { files: string[]; folders: string[] };
+    try {
+      rootListing = await this.vault.adapter.list(this.vault.configDir);
+    } catch {
+      return null; // config dir absent/unreadable — signal "unknown", not "empty"
+    }
     const out: string[] = [];
-    const walk = async (dir: string): Promise<void> => {
-      let listing: { files: string[]; folders: string[] };
-      try {
-        listing = await this.vault.adapter.list(dir);
-      } catch {
-        return; // dir absent (e.g. a custom/mobile config dir that doesn't exist) — nothing to scan
-      }
+    const walk = async (listing: { files: string[]; folders: string[] }): Promise<void> => {
       out.push(...listing.files);
-      for (const sub of listing.folders) await walk(sub);
+      for (const sub of listing.folders) {
+        try {
+          await walk(await this.vault.adapter.list(sub));
+        } catch {
+          /* skip an unreadable subdir — a partial listing is still useful */
+        }
+      }
     };
-    await walk(this.vault.configDir);
+    await walk(rootListing);
     return out;
   }
 
-  /** Re-scan just the config dir for new/changed files and mark them dirty. Config files emit no
-   * vault events, so this must run each poll to catch in-session settings changes (installing a
-   * plugin, tweaking appearance). Deletions are NOT tombstoned here — they're picked up by the next
-   * startup scanOffline(), which is the only place absence is a reliable delete signal (§offline). */
+  /** True for paths inside the vault's config dir (e.g. ".obsidian/…"). */
+  private isConfigPath(path: string): boolean {
+    return path.startsWith(this.vault.configDir + "/");
+  }
+
+  /** Re-scan just the config dir and mark changes dirty. Config files emit no vault events, so this
+   * runs each poll to catch in-session settings changes (installing a plugin, tweaking appearance)
+   * AND deletions — mid-session, absence IS a reliable delete signal (unlike startup, where a stale
+   * or copied state could masquerade as deletions). Skips entirely if the config dir is unreadable,
+   * so a transient list failure can't mass-tombstone. push() re-stats before tombstoning anyway. */
   async scanConfigDir(): Promise<void> {
-    for (const path of await this.listConfigFiles()) {
+    const configFiles = await this.listConfigFiles();
+    if (!configFiles) return; // unreadable → don't infer changes or deletions this cycle
+    const present = new Set<string>();
+    for (const path of configFiles) {
       if (this.isExcluded(path)) continue;
+      present.add(path);
       const stat = await this.vault.adapter.stat(path);
       if (stat) await this.markIfChanged(path, stat.mtime);
+    }
+    // Any config file we're tracking that's no longer on disk was deleted → mark dirty so push()
+    // tombstones it (push re-stats, so a file that's actually present won't be wrongly deleted).
+    for (const p of Object.keys(this.state.files)) {
+      if (this.isConfigPath(p) && !present.has(p) && !this.isExcluded(p)) this.dirty.add(p);
     }
   }
 
@@ -170,11 +193,18 @@ export class SyncEngine {
     }
     // getFiles() skips the config dir — walk it explicitly so ".obsidian" content is both detected
     // as dirty AND counted as "known" (otherwise every tracked config file would look deleted below).
-    for (const path of await this.listConfigFiles()) {
-      if (this.isExcluded(path)) continue;
-      known.add(path);
-      const stat = await this.vault.adapter.stat(path);
-      if (stat) await this.markIfChanged(path, stat.mtime);
+    const configFiles = await this.listConfigFiles();
+    if (configFiles) {
+      for (const path of configFiles) {
+        if (this.isExcluded(path)) continue;
+        known.add(path);
+        const stat = await this.vault.adapter.stat(path);
+        if (stat) await this.markIfChanged(path, stat.mtime);
+      }
+    } else {
+      // Config dir unreadable: we can't confirm any config file is gone, so keep tracked config
+      // paths out of the "missing" set below — don't tombstone what we simply couldn't see.
+      for (const p of Object.keys(this.state.files)) if (this.isConfigPath(p)) known.add(p);
     }
     const missing = Object.keys(this.state.files).filter(
       (p) => !known.has(p) && !this.isExcluded(p),
