@@ -88,9 +88,13 @@ async function main(): Promise<void> {
   ig.add([
     STATE_PATH, S3SYNCIGNORE, ".sync/", ".github/", ".sync-tool/",
     ".gitignore", ".gitattributes", ".gitmodules", ".git/",
-    // per-device files: Obsidian workspace UI state + the plugin's gzipped cursor. Excluded here
-    // (not only via .gitignore) so a missing/misconfigured .gitignore can't leak them.
+    // per-device / never-sync — kept in lockstep with the plugin's isExcluded() so neither leg
+    // tombstones what the other keeps. Enforced here (not only via .gitignore) so a missing or
+    // misconfigured .gitignore can't leak them. NOTE: only vault-s3-sync's OWN data.json is
+    // per-device; other plugins' data.json syncs so their settings distribute across devices.
+    ".DS_Store", ".trash/",
     ".obsidian/workspace*.json", "state.json.gz",
+    ".obsidian/plugins/vault-s3-sync/data.json",
   ]);
 
   // ---- detect git-side changes (§3.3 step 3) -----------------------------

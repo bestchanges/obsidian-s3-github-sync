@@ -22,14 +22,20 @@ import {
 const TEXT_EXTS = new Set([
   "md", "txt", "json", "csv", "canvas", "yml", "yaml", "html", "css", "js", "ts", "svg", "mermaid",
 ]);
-const ALWAYS_EXCLUDED = [".obsidian/", ".sync/", ".git/"];
+// .obsidian now syncs (app + plugin settings distribute across devices); only repo infrastructure
+// and the per-device paths below are held back. Folders matched by prefix.
+const ALWAYS_EXCLUDED = [".sync/", ".git/", ".github/", ".sync-tool/", ".trash/"];
 /** git-side-only metadata: must never be synced as vault content — a vault that lacks these
  * would otherwise tombstone them out of S3 (and thus out of the repo). Matched by basename. */
 const GIT_META_FILES = new Set([".gitignore", ".gitattributes", ".gitmodules", ".s3syncignore"]);
-/** Per-device files that must never sync: Obsidian's workspace UI state and this plugin's own
- * gzipped cursor. Enforced here (not only via .gitignore) so they can't leak on either leg. */
-function isPerDeviceFile(basename: string): boolean {
-  return basename === "state.json.gz" || /^workspace.*\.json$/.test(basename);
+/** Per-device files that must never sync anywhere: OS cruft, Obsidian's workspace UI state, and
+ * this plugin's own gzipped cursor. Enforced here (not only via .gitignore) so they can't leak on
+ * either leg. NOTE: this plugin's data.json (its creds) is per-device too but is excluded by full
+ * path in isExcluded() — OTHER plugins' data.json DOES sync, so we can't match it by basename. */
+function isPerDeviceFile(path: string): boolean {
+  const base = path.split("/").pop() ?? "";
+  if (base === ".DS_Store" || base === "state.json.gz") return true;
+  return path.startsWith(".obsidian/") && /^workspace.*\.json$/.test(base);
 }
 const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
 /** Offline-delete safety: absence on disk is NOT a reliable delete signal (a stale/copied/moved
@@ -51,6 +57,9 @@ export interface SyncState {
 
 export interface EngineOptions {
   deviceId: string;
+  /** this plugin's own install dir (e.g. ".obsidian/plugins/vault-s3-sync") — its data.json holds
+   * per-device creds and is never synced, while other plugins' data.json is. */
+  selfDir: string;
   excludedFolders: string[];
   concurrency: number;
   /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
@@ -83,7 +92,8 @@ export class SyncEngine {
   // ------------------------------------------------------------- exclusions
   isExcluded(path: string): boolean {
     const base = path.split("/").pop() ?? "";
-    if (GIT_META_FILES.has(base) || isPerDeviceFile(base)) return true;
+    if (GIT_META_FILES.has(base) || isPerDeviceFile(path)) return true;
+    if (path === `${this.opts.selfDir}/data.json`) return true; // our creds — per-device
     const folders = [...ALWAYS_EXCLUDED, ...this.opts.excludedFolders.map((f) => f.replace(/\/?$/, "/"))];
     return folders.some((f) => path.startsWith(f));
   }
