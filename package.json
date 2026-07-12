@@ -9,6 +9,7 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p packages/core && tsc --noEmit -p packages/git-sync && tsc --noEmit -p packages/obsidian-plugin",
     "build:plugin": "node packages/obsidian-plugin/esbuild.config.mjs",
+    "bump:plugin": "node scripts/bump-plugin-version.mjs",
     "make-starter": "node scripts/make-starter-vault.mjs"
   },
   "devDependencies": {
