@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, normalizePath } from "obsidian";
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
+import { buildStarterZip, deliverFile } from "./starter";
 import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
 
 interface Settings {
@@ -97,6 +98,11 @@ export default class S3SyncPlugin extends Plugin {
       name: "Resync everything from S3",
       callback: () => void this.resyncEverything(),
     });
+    this.addCommand({
+      id: "export-starter-vault",
+      name: "Export setup vault (for a new device)",
+      callback: () => void this.exportStarterVault(),
+    });
 
     // vault change tracking (§2.2) — events don't fire while the app is closed
     const onChange = (file: TAbstractFile) => {
@@ -186,6 +192,42 @@ export default class S3SyncPlugin extends Plugin {
     }
     if (changed) await this.persistSettings();
     if (this.foreignStateDetected) await this.persistState();
+  }
+
+  /** Package an empty vault + this plugin (preconfigured, no per-device state) into a zip and hand
+   * it to the OS — share sheet on mobile, download on desktop. Runs on any device, no CLI needed. */
+  async exportStarterVault(): Promise<void> {
+    if (!this.configured()) {
+      new Notice("S3 Vault Sync: set the bucket and access keys first.");
+      return;
+    }
+    try {
+      const dir = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+      const adapter = this.app.vault.adapter;
+      const mainJs = new Uint8Array(await adapter.readBinary(normalizePath(`${dir}/main.js`)));
+      const manifestJson = await adapter.read(normalizePath(`${dir}/manifest.json`));
+
+      // Export = plugin DEFAULTS + this device's connection fields. Identity is cleared so the new
+      // device mints its own, and no state file is included → clean full pull on first run.
+      const settings: Settings = {
+        ...DEFAULT_SETTINGS,
+        bucket: this.settings.bucket,
+        region: this.settings.region,
+        accessKeyId: this.settings.accessKeyId,
+        secretAccessKey: this.settings.secretAccessKey,
+        prefix: this.settings.prefix,
+      };
+      const dataJson = JSON.stringify({ settings } satisfies PersistedData, null, 2) + "\n";
+
+      new Notice("Building setup vault…");
+      const zip = buildStarterZip({ pluginId: this.manifest.id, mainJs, manifestJson, dataJson });
+      const how = await deliverFile(zip, "starter-vault.zip");
+      if (how === "shared") new Notice("Setup vault ready — choose where to send it.");
+      else if (how === "downloaded") new Notice("Saved starter-vault.zip to your downloads.");
+    } catch (err) {
+      console.error("[s3-sync] starter export failed", err);
+      new Notice(`Setup vault export failed: ${String(err)}`);
+    }
   }
 
   async resyncEverything(): Promise<void> {
@@ -387,5 +429,14 @@ class S3SyncSettingTab extends PluginSettingTab {
       .setDesc("Forget the local cursor and reconcile the whole vault against S3 (union-merges overlaps, nothing lost). Use after moving devices or if state looks wrong.")
       .addButton((b) =>
         b.setButtonText("Resync").setWarning().onClick(() => void this.plugin.resyncEverything()));
+    new Setting(containerEl)
+      .setName("Set up a new device")
+      .setDesc(
+        "Export a zip: an empty vault with this plugin preconfigured (defaults, 10 MB download cap, " +
+          "no local state). On the new device open it as a vault and turn on community plugins — it " +
+          "syncs the whole vault. Works on mobile too (share sheet). Contains your secret key — share privately.",
+      )
+      .addButton((b) =>
+        b.setButtonText("Export setup vault").setCta().onClick(() => void this.plugin.exportStarterVault()));
   }
 }
