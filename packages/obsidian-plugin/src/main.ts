@@ -15,6 +15,10 @@ interface Settings {
   machineFingerprint: string;
   pollIntervalSec: number; // default 15 (§2.3)
   excludedFolders: string[]; // local-only until re-enabled (§2.2)
+  /** per-device download cap in MB; files larger than this stay in the cloud on THIS device to
+   * save space (uploads always sync). 0 = no limit. Lives in per-device data.json, so each device
+   * sets its own (e.g. 10 on mobile, 0 on the laptop). */
+  maxDownloadMB: number;
   verbose: boolean; // Notice on every sync cycle that did something
   mobileConcurrency: number;
   desktopConcurrency: number;
@@ -30,6 +34,7 @@ const DEFAULT_SETTINGS: Settings = {
   machineFingerprint: "",
   pollIntervalSec: 15,
   excludedFolders: [],
+  maxDownloadMB: 10, // small by default → mobile stays lean; set 0 on desktop for the full vault
   verbose: false,
   mobileConcurrency: 8,
   desktopConcurrency: 50,
@@ -216,6 +221,9 @@ export default class S3SyncPlugin extends Plugin {
         deviceId: this.settings.deviceId,
         selfDir: this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync",
         excludedFolders: this.settings.excludedFolders,
+        maxDownloadBytes: this.settings.maxDownloadMB > 0
+          ? Math.round(this.settings.maxDownloadMB * 1024 * 1024)
+          : 0,
         concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
         verbose: this.settings.verbose,
         onStateChanged: async (state) => {
@@ -354,6 +362,17 @@ class S3SyncSettingTab extends PluginSettingTab {
         t.setValue(s.excludedFolders.join("\n")).onChange(async (v) => {
           s.excludedFolders = v.split("\n").map((x) => x.trim()).filter(Boolean);
           await save();
+        }));
+    new Setting(containerEl)
+      .setName("Max download size (MB)")
+      .setDesc(
+        "Per-device. Files larger than this stay in the cloud and aren't downloaded here — keeps " +
+          "mobile vaults small. Uploads are never limited. 0 = no limit (download everything).",
+      )
+      .addText((t) =>
+        t.setValue(String(s.maxDownloadMB)).onChange(async (v) => {
+          const n = Number(v);
+          if (Number.isFinite(n) && n >= 0) { s.maxDownloadMB = n; await save(); }
         }));
     new Setting(containerEl)
       .setName("Device ID")
