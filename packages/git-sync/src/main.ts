@@ -10,26 +10,21 @@ import path from "node:path";
 import ignoreFactory from "ignore";
 import {
   appendDelta,
-  changedEntries,
-  contentHash,
-  decodeText,
   Delta,
   DeltaEntry,
-  encodeText,
   FileEntry,
   foldDeltas,
   isTombstone,
   listDeltasSince,
-  loadRemoteState,
   mapPool,
   pruneDeltas,
   readSnapshot,
   SnapshotEntry,
-  unionMerge,
   writeSnapshot,
 } from "@vault-sync/core";
 import { Git } from "./git";
 import { S3SdkAdapter } from "./s3-adapter";
+import { reconcileFile, ReconcileIO, UploadAction } from "./reconcile";
 
 const WRITER_ID = "git-sync";
 const STATE_PATH = ".sync/state.json";
@@ -159,80 +154,42 @@ async function main(): Promise<void> {
   );
 
   // ---- reconcile (§3.3 step 5) -------------------------------------------
-  const uploads = new Map<string, { content: string; entry: FileEntry } | { tombstone: true }>();
+  // Content is handled as RAW BYTES throughout; text is decoded only inside the union-merge branch.
+  // Reading/writing binary files as UTF-8 corrupts and inflates them (invalid bytes → U+FFFD).
+  const uploads = new Map<string, UploadAction>();
   const allPaths = new Set([...gitChanged.keys(), ...s3Changed.keys()]);
 
-  await mapPool([...allPaths], CONCURRENCY, async (p) => {
-    const inGit = gitChanged.get(p);
-    const inS3 = s3Changed.get(p);
-    const abs = path.join(repoDir, p);
-
-    const readLocal = async (): Promise<string | null> => {
+  const io: ReconcileIO = {
+    readLocal: async (p) => {
       try {
-        return await fs.readFile(abs, "utf8");
+        return await fs.readFile(path.join(repoDir, p)); // no encoding → raw Buffer (a Uint8Array)
       } catch {
         return null;
       }
-    };
-    const fetchRemote = async (entry: SnapshotEntry): Promise<string | null> => {
-      if (isTombstone(entry)) return null;
+    },
+    fetchRemote: async (p, entry) => {
       const obj = await storage.get(`files/${p}`, {
         versionId: (entry as FileEntry & SnapshotEntry).s3VersionId,
       });
-      return obj ? decodeText(obj.body) : null;
-    };
-    const queueUpload = async (content: string): Promise<void> => {
-      uploads.set(p, {
-        content,
-        entry: {
-          hash: contentHash(content),
-          size: encodeText(content).byteLength,
-          mtime: await git.authorDateIso(p),
-        },
-      });
-    };
-    const writeLocal = async (content: string): Promise<void> => {
+      return obj ? obj.body : null;
+    },
+    writeLocal: async (p, bytes) => {
+      const abs = path.join(repoDir, p);
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, content, "utf8");
-    };
+      await fs.writeFile(abs, bytes); // raw bytes, no encoding
+    },
+    removeLocal: async (p) => {
+      await fs.rm(path.join(repoDir, p), { force: true });
+    },
+    mergeBase: async (p) =>
+      warmGit ? ((await git.showAt(state.lastSyncedCommit!, p)) ?? "") : "",
+    authorDate: (p) => git.authorDateIso(p),
+    log,
+  };
 
-    if (inGit && !inS3) {
-      // git → S3
-      if (inGit === "delete") {
-        if (remote.files[p] && !isTombstone(remote.files[p])) uploads.set(p, { tombstone: true });
-      } else {
-        const content = await readLocal();
-        if (content === null) return;
-        const remoteEntry = remote.files[p];
-        const remoteHash =
-          remoteEntry && !isTombstone(remoteEntry) ? (remoteEntry as FileEntry).hash : null;
-        if (contentHash(content) !== remoteHash) await queueUpload(content); // idempotence (§3.7)
-      }
-    } else if (inS3 && !inGit) {
-      // S3 → git
-      if (isTombstone(inS3)) {
-        await fs.rm(abs, { force: true });
-      } else {
-        const content = await fetchRemote(inS3);
-        if (content !== null) await writeLocal(content);
-      }
-    } else if (inGit && inS3) {
-      // both — union merge (§1.5), or resolve delete-vs-edit: edit wins
-      const local = inGit === "delete" ? null : await readLocal();
-      const remoteContent = await fetchRemote(inS3);
-      if (local === null && remoteContent === null) return; // deleted on both sides
-      if (local === null) {
-        await writeLocal(remoteContent!); // their edit wins over our delete
-      } else if (remoteContent === null) {
-        await queueUpload(local); // our edit wins over their delete (un-tombstones)
-      } else {
-        const base = warmGit ? ((await git.showAt(state.lastSyncedCommit!, p)) ?? "") : "";
-        const merged = unionMerge(base, local, remoteContent);
-        if (merged.hadConflicts) log(`union-merged conflict: ${p}`);
-        if (merged.text !== remoteContent) await queueUpload(merged.text);
-        if (merged.text !== local) await writeLocal(merged.text);
-      }
-    }
+  await mapPool([...allPaths], CONCURRENCY, async (p) => {
+    const action = await reconcileFile(p, gitChanged.get(p), s3Changed.get(p), remote, io);
+    if (action) uploads.set(p, action);
   });
 
   // ---- push to S3: files, then one delta (§1.3) ---------------------------
@@ -243,7 +200,7 @@ async function main(): Promise<void> {
       if ("tombstone" in u) {
         files[p] = { deleted: true };
       } else {
-        const res = await storage.put(`files/${p}`, encodeText(u.content));
+        const res = await storage.put(`files/${p}`, u.content); // raw bytes
         files[p] = { ...u.entry, s3VersionId: res.versionId };
       }
     });
