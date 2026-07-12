@@ -309,6 +309,12 @@ export default class S3SyncPlugin extends Plugin {
   private async runSync(reason: string): Promise<void> {
     if (!this.engine) return;
     try {
+      // Config dir emits no vault events, so scan it here — but only on the low-frequency triggers.
+      // "debounced-edit" fires after every note edit (non-config), so scanning then would re-walk
+      // the whole config dir on each keystroke burst for nothing.
+      if (reason === "poll" || reason === "startup" || reason === "manual") {
+        await this.engine.scanConfigDir();
+      }
       await this.engine.sync();
       this.syncFailures = 0;
     } catch (err) {
