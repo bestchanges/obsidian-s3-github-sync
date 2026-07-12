@@ -25,6 +25,7 @@ import {
 import { Git } from "./git";
 import { S3SdkAdapter } from "./s3-adapter";
 import { reconcileFile, ReconcileIO, UploadAction } from "./reconcile";
+import { makeMergeBaseResolver } from "./merge-base";
 
 const WRITER_ID = "git-sync";
 const STATE_PATH = ".sync/state.json";
@@ -159,6 +160,11 @@ async function main(): Promise<void> {
   const uploads = new Map<string, UploadAction>();
   const allPaths = new Set([...gitChanged.keys(), ...s3Changed.keys()]);
 
+  // Anchor the merge base at git-sync's OWN last sync commit (where git and S3 last agreed), NOT the
+  // pre-commit HEAD cursor which predates that commit's own writes — a stale base makes a self-
+  // committed file that also has a newer S3 edit duplicate the whole changed block (§3.5, merge-base.ts).
+  const mergeBase = await makeMergeBaseResolver(git, warmGit ? state.lastSyncedCommit : null);
+
   const io: ReconcileIO = {
     readLocal: async (p) => {
       try {
@@ -181,8 +187,7 @@ async function main(): Promise<void> {
     removeLocal: async (p) => {
       await fs.rm(path.join(repoDir, p), { force: true });
     },
-    mergeBase: async (p) =>
-      warmGit ? ((await git.showAt(state.lastSyncedCommit!, p)) ?? "") : "",
+    mergeBase,
     authorDate: (p) => git.authorDateIso(p),
     log,
   };

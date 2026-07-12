@@ -64,6 +64,14 @@ export class Git {
     return res.exitCode === 0 ? res.stdout : null;
   }
 
+  /** SHA of the most recent commit by `author` reachable from `ref` (HEAD by default), or null if
+   * none. Used to locate git-sync's own last sync commit — the point where git and S3 last agreed —
+   * which is the correct three-way merge base (§3.5). `--author` is a regex over name+email. */
+  async lastCommitBy(author: string, ref = "HEAD"): Promise<string | null> {
+    const out = (await this.run(["log", "-1", "--format=%H", `--author=${author}`, ref])).trim();
+    return out || null;
+  }
+
   /** batch .gitignore check; returns the subset of paths that ARE ignored.
    * -z on both input and output so non-ASCII paths round-trip unquoted (otherwise returned paths
    * come back octal-escaped and never match the raw input keys). */
