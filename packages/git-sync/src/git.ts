@@ -28,26 +28,34 @@ export class Git {
     return res.exitCode === 0;
   }
 
-  /** name-status diff; renames become D(old) + A(new) */
+  /** name-status diff; renames become D(old) + A(new).
+   * -z (NUL-terminated) output so non-ASCII paths are emitted raw — git's default core.quotepath
+   * octal-escapes and double-quotes them (e.g. Cyrillic note names), which would make every such
+   * path unreadable on disk and silently skip the file. With -z the record stream is
+   * `status\0path\0` (or `Rxxx\0old\0new\0` for renames/copies). */
   async diffNameStatus(from: string, to: string): Promise<GitChange[]> {
-    const out = await this.run(["diff", "--name-status", "-M", `${from}..${to}`]);
+    const out = await this.run(["diff", "--name-status", "-M", "-z", `${from}..${to}`]);
+    const tokens = out.split("\0").filter((t) => t !== "");
     const changes: GitChange[] = [];
-    for (const line of out.split("\n").filter(Boolean)) {
-      const parts = line.split("\t");
-      const status = parts[0];
+    let i = 0;
+    while (i < tokens.length) {
+      const status = tokens[i++];
       if (status.startsWith("R")) {
-        changes.push({ path: parts[1], status: "D" }, { path: parts[2], status: "A" });
-      } else if (status === "A" || status === "M" || status === "D") {
-        changes.push({ path: parts[1], status });
+        changes.push({ path: tokens[i++], status: "D" }, { path: tokens[i++], status: "A" });
       } else if (status.startsWith("C")) {
-        changes.push({ path: parts[2], status: "A" });
+        i++; // skip source of a copy
+        changes.push({ path: tokens[i++], status: "A" });
+      } else if (status === "A" || status === "M" || status === "D") {
+        changes.push({ path: tokens[i++], status });
+      } else {
+        i++; // unknown single-path status (e.g. T/U) — consume its path to stay aligned
       }
     }
     return changes;
   }
 
   async trackedFiles(): Promise<string[]> {
-    return (await this.run(["ls-files"])).split("\n").filter(Boolean);
+    return (await this.run(["ls-files", "-z"])).split("\0").filter(Boolean);
   }
 
   /** file content at a commit, or null if it didn't exist there */
@@ -56,15 +64,17 @@ export class Git {
     return res.exitCode === 0 ? res.stdout : null;
   }
 
-  /** batch .gitignore check; returns the subset of paths that ARE ignored */
+  /** batch .gitignore check; returns the subset of paths that ARE ignored.
+   * -z on both input and output so non-ASCII paths round-trip unquoted (otherwise returned paths
+   * come back octal-escaped and never match the raw input keys). */
   async checkIgnore(paths: string[]): Promise<Set<string>> {
     if (paths.length === 0) return new Set();
-    const res = await execa("git", ["check-ignore", "--stdin"], {
+    const res = await execa("git", ["check-ignore", "-z", "--stdin"], {
       cwd: this.cwd,
-      input: paths.join("\n"),
+      input: paths.join("\0"),
       reject: false, // exit 1 = none ignored
     });
-    return new Set(res.stdout.split("\n").filter(Boolean));
+    return new Set(res.stdout.split("\0").filter(Boolean));
   }
 
   /** commit author date for a path (best available author-time, §3.5) */
