@@ -214,6 +214,7 @@ export default class S3SyncPlugin extends Plugin {
       this.syncState,
       {
         deviceId: this.settings.deviceId,
+        selfDir: this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync",
         excludedFolders: this.settings.excludedFolders,
         concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
         verbose: this.settings.verbose,
