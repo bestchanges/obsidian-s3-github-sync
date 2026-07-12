@@ -1,4 +1,4 @@
-import { Notice, TFile, Vault } from "obsidian";
+import { Notice, Vault } from "obsidian";
 import {
   appendDelta,
   changedEntries,
@@ -131,32 +131,55 @@ export class SyncEngine {
 
   /** Recursively list files under the vault's config dir (e.g. ".obsidian"). Vault.getFiles()
    * and the vault change events both omit the config dir and other dotfolders, so the ONLY way to
-   * see ".obsidian" content is to walk it through the raw adapter. Returns vault-relative paths. */
-  private async listConfigFiles(): Promise<string[]> {
+   * see ".obsidian" content is to walk it through the raw adapter. Returns vault-relative paths, or
+   * null if the config dir itself couldn't be read — callers must NOT infer deletions from null (an
+   * unreadable dir is not an empty one, and treating it as empty would tombstone all config files). */
+  private async listConfigFiles(): Promise<string[] | null> {
+    let rootListing: { files: string[]; folders: string[] };
+    try {
+      rootListing = await this.vault.adapter.list(this.vault.configDir);
+    } catch {
+      return null; // config dir absent/unreadable — signal "unknown", not "empty"
+    }
     const out: string[] = [];
-    const walk = async (dir: string): Promise<void> => {
-      let listing: { files: string[]; folders: string[] };
-      try {
-        listing = await this.vault.adapter.list(dir);
-      } catch {
-        return; // dir absent (e.g. a custom/mobile config dir that doesn't exist) — nothing to scan
-      }
+    const walk = async (listing: { files: string[]; folders: string[] }): Promise<void> => {
       out.push(...listing.files);
-      for (const sub of listing.folders) await walk(sub);
+      for (const sub of listing.folders) {
+        try {
+          await walk(await this.vault.adapter.list(sub));
+        } catch {
+          /* skip an unreadable subdir — a partial listing is still useful */
+        }
+      }
     };
-    await walk(this.vault.configDir);
+    await walk(rootListing);
     return out;
   }
 
-  /** Re-scan just the config dir for new/changed files and mark them dirty. Config files emit no
-   * vault events, so this must run each poll to catch in-session settings changes (installing a
-   * plugin, tweaking appearance). Deletions are NOT tombstoned here — they're picked up by the next
-   * startup scanOffline(), which is the only place absence is a reliable delete signal (§offline). */
+  /** True for paths inside the vault's config dir (e.g. ".obsidian/…"). */
+  private isConfigPath(path: string): boolean {
+    return path.startsWith(this.vault.configDir + "/");
+  }
+
+  /** Re-scan just the config dir and mark changes dirty. Config files emit no vault events, so this
+   * runs each poll to catch in-session settings changes (installing a plugin, tweaking appearance)
+   * AND deletions — mid-session, absence IS a reliable delete signal (unlike startup, where a stale
+   * or copied state could masquerade as deletions). Skips entirely if the config dir is unreadable,
+   * so a transient list failure can't mass-tombstone. push() re-stats before tombstoning anyway. */
   async scanConfigDir(): Promise<void> {
-    for (const path of await this.listConfigFiles()) {
+    const configFiles = await this.listConfigFiles();
+    if (!configFiles) return; // unreadable → don't infer changes or deletions this cycle
+    const present = new Set<string>();
+    for (const path of configFiles) {
       if (this.isExcluded(path)) continue;
+      present.add(path);
       const stat = await this.vault.adapter.stat(path);
       if (stat) await this.markIfChanged(path, stat.mtime);
+    }
+    // Any config file we're tracking that's no longer on disk was deleted → mark dirty so push()
+    // tombstones it (push re-stats, so a file that's actually present won't be wrongly deleted).
+    for (const p of Object.keys(this.state.files)) {
+      if (this.isConfigPath(p) && !present.has(p) && !this.isExcluded(p)) this.dirty.add(p);
     }
   }
 
@@ -170,11 +193,18 @@ export class SyncEngine {
     }
     // getFiles() skips the config dir — walk it explicitly so ".obsidian" content is both detected
     // as dirty AND counted as "known" (otherwise every tracked config file would look deleted below).
-    for (const path of await this.listConfigFiles()) {
-      if (this.isExcluded(path)) continue;
-      known.add(path);
-      const stat = await this.vault.adapter.stat(path);
-      if (stat) await this.markIfChanged(path, stat.mtime);
+    const configFiles = await this.listConfigFiles();
+    if (configFiles) {
+      for (const path of configFiles) {
+        if (this.isExcluded(path)) continue;
+        known.add(path);
+        const stat = await this.vault.adapter.stat(path);
+        if (stat) await this.markIfChanged(path, stat.mtime);
+      }
+    } else {
+      // Config dir unreadable: we can't confirm any config file is gone, so keep tracked config
+      // paths out of the "missing" set below — don't tombstone what we simply couldn't see.
+      for (const p of Object.keys(this.state.files)) if (this.isConfigPath(p)) known.add(p);
     }
     const missing = Object.keys(this.state.files).filter(
       (p) => !known.has(p) && !this.isExcluded(p),
@@ -282,13 +312,12 @@ export class SyncEngine {
   }
 
   private async applyRemote(path: string, entry: SnapshotEntry): Promise<void> {
-    const local = this.vault.getAbstractFileByPath(path);
     const st = this.state.files[path];
 
     if (isTombstone(entry)) {
-      if (local instanceof TFile) {
-        const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
-        if (st && contentHash(buf) !== st.hash) {
+      const localBuf = await this.readLocal(path);
+      if (localBuf) {
+        if (st && contentHash(localBuf) !== st.hash) {
           this.dirty.add(path); // delete-vs-edit: our edit wins (§1.5) → re-push
           return;
         }
@@ -301,8 +330,7 @@ export class SyncEngine {
     }
 
     const remote = entry as FileEntry & SnapshotEntry;
-    const localBuf =
-      local instanceof TFile ? new Uint8Array(await this.vault.adapter.readBinary(path)) : null;
+    const localBuf = await this.readLocal(path);
     const localHash = localBuf ? contentHash(localBuf) : null;
     if (localHash === remote.hash) {
       this.record(path, remote); // already identical — just record
@@ -363,8 +391,10 @@ export class SyncEngine {
     const newStates = new Map<string, FileState | null>();
 
     await mapPool(paths, this.opts.concurrency, async (path) => {
-      const file = this.vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) {
+      // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
+      // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
+      const stat = await this.vault.adapter.stat(path);
+      if (!stat || stat.type !== "file") {
         if (this.state.files[path]) {
           files[path] = { deleted: true }; // deleted locally → tombstone
           newStates.set(path, null);
@@ -374,7 +404,7 @@ export class SyncEngine {
       const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
       const hash = contentHash(buf);
       const st = this.state.files[path];
-      const mtime = new Date(file.stat.mtime).toISOString();
+      const mtime = new Date(stat.mtime).toISOString();
       if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
       const res = await this.storage.put(`files/${path}`, buf);
       const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
@@ -411,6 +441,18 @@ export class SyncEngine {
   }
 
   // ------------------------------------------------------------- helpers
+  /** Read a local file's bytes via the raw adapter, or null if it isn't a file. Works uniformly
+   * for regular notes AND config-dir files (the vault index excludes the latter). */
+  private async readLocal(path: string): Promise<Uint8Array | null> {
+    try {
+      const stat = await this.vault.adapter.stat(path);
+      if (!stat || stat.type !== "file") return null;
+      return new Uint8Array(await this.vault.adapter.readBinary(path));
+    } catch {
+      return null;
+    }
+  }
+
   private isTextPath(path: string): boolean {
     const ext = path.split(".").pop()?.toLowerCase() ?? "";
     return TEXT_EXTS.has(ext);
