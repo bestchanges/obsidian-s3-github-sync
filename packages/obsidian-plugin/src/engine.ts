@@ -11,6 +11,7 @@ import {
   hasGap,
   isTombstone,
   listDeltasSince,
+  loadRemoteState,
   mapPool,
   readSnapshot,
   SnapshotEntry,
@@ -55,6 +56,17 @@ export interface SyncState {
   files: Record<string, FileState>;
 }
 
+/** Outcome of a "force download" request (the linked-files command). Counts + the candidates that
+ * had no live remote content, so the caller can give the user a precise summary. */
+export interface ForceDownloadResult {
+  requested: number;
+  downloaded: number;
+  /** already present locally and current — nothing to fetch */
+  upToDate: number;
+  /** candidates with no matching live object in S3 (never uploaded, or tombstoned) */
+  notFound: string[];
+}
+
 export interface EngineOptions {
   deviceId: string;
   /** this plugin's own install dir (e.g. ".obsidian/plugins/vault-s3-sync") — its data.json holds
@@ -91,6 +103,9 @@ interface CycleReq {
   announce: boolean;
   /** show those notices even without verbose mode (user-initiated actions: manual sync, resync) */
   force: boolean;
+  /** paths/linkpaths to force-download from S3 ignoring the per-device size cap (§4.7.1).
+   * Resolved against live remote state; empty on ordinary cycles. */
+  forcePaths: string[];
 }
 
 export class SyncEngine {
@@ -109,6 +124,9 @@ export class SyncEngine {
   private pushed = 0;
   private merged = 0;
   private skipped = 0; // remote files left in the cloud this cycle (over the download cap)
+  // Result of the most recent forced-download cycle, read back by forceDownloadPaths() after the
+  // cycle it queued has run. Only forced cycles set it; ordinary cycles leave it untouched.
+  private forceResult: ForceDownloadResult | null = null;
 
   /** show a Notice; gated by verbose unless force=true (errors/conflicts/user actions) */
   private notify(msg: string, force = false): void {
@@ -271,7 +289,28 @@ export class SyncEngine {
       label: "resync",
       announce: true,
       force: true, // a resync is a deliberate user action — always surface start/done
+      forcePaths: [],
     });
+  }
+
+  /** Force-download specific files from S3, bypassing the per-device size cap. Powers the "sync
+   * linked files of this note" command so a mobile user can pull a note's oversized attachments on
+   * demand without lowering the global cap. `candidates` are vault paths or Obsidian linkpaths (a
+   * bare filename, a partial path, or a note name without ".md"); each is resolved against the live
+   * remote state. Serialized like every other cycle. */
+  async forceDownloadPaths(candidates: string[]): Promise<ForceDownloadResult> {
+    this.forceResult = null;
+    await this.request({
+      resetCursor: false,
+      scanOffline: false,
+      scanConfig: false,
+      fullPull: false,
+      label: "force download",
+      announce: true,
+      force: true, // user-initiated — always surface the outcome
+      forcePaths: candidates,
+    });
+    return this.forceResult ?? { requested: candidates.length, downloaded: 0, upToDate: 0, notFound: [] };
   }
 
   // ------------------------------------------------------------- sync cycle
@@ -296,6 +335,7 @@ export class SyncEngine {
       label: opts.label ?? "sync",
       announce: opts.announce ?? false,
       force: false,
+      forcePaths: [],
     });
   }
 
@@ -332,6 +372,7 @@ export class SyncEngine {
       label: add.resetCursor && !base?.resetCursor ? add.label : base?.label ?? add.label,
       announce: true,
       force: (base?.force ?? false) || add.force,
+      forcePaths: [...(base?.forcePaths ?? []), ...add.forcePaths],
     };
   }
 
@@ -374,6 +415,9 @@ export class SyncEngine {
     else if (req.scanConfig) await this.scanConfigDir();
 
     await this.pull(req.fullPull);
+    // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
+    // dirty) and so a delete-vs-edit re-push it triggers is flushed in the same cycle.
+    if (req.forcePaths.length) this.forceResult = await this.forceDownload(req.forcePaths);
     await this.push();
 
     const activity = this.pulled + this.pushed + this.merged;
@@ -505,6 +549,74 @@ export class SyncEngine {
     this.dirty.add(path); // merged result must go back to S3
     this.merged++;
     if (merged.hadConflicts) this.notify(`Sync: union-merged conflict in ${path}`, true);
+  }
+
+  /** Fetch the given candidates from S3 ignoring the size cap (§4.7.1). Resolves each
+   * linkpath against the full live remote state (snapshot ⊕ newer deltas) so files not present
+   * locally — the whole point on a capped device — still resolve. Writes clean/absent targets and
+   * records them; never clobbers a locally-dirty file (that's for normal reconcile to resolve). */
+  private async forceDownload(candidates: string[]): Promise<ForceDownloadResult> {
+    const result: ForceDownloadResult = {
+      requested: candidates.length,
+      downloaded: 0,
+      upToDate: 0,
+      notFound: [],
+    };
+    const { state } = await loadRemoteState(this.storage, this.opts.concurrency);
+    // Resolve to distinct live remote paths; a candidate that matches nothing is reported not-found.
+    const paths = new Set<string>();
+    for (const c of candidates) {
+      const resolved = this.resolveRemotePath(c, state.files);
+      if (resolved) paths.add(resolved);
+      else result.notFound.push(c);
+    }
+    await mapPool([...paths], this.opts.concurrency, async (path) => {
+      if (this.isExcluded(path) || !this.isSafePath(path)) return;
+      const remote = state.files[path] as FileEntry & SnapshotEntry;
+      const localBuf = await this.readLocal(path);
+      const localHash = localBuf ? contentHash(localBuf) : null;
+      if (localHash === remote.hash) {
+        this.record(path, remote); // already have the bytes — just make sure it's tracked
+        result.upToDate++;
+        return;
+      }
+      const st = this.state.files[path];
+      const localDirty = localBuf !== null && (!st || localHash !== st.hash);
+      if (localDirty) {
+        result.upToDate++; // a local edit exists; don't overwrite it — leave it for reconcile
+        return;
+      }
+      const obj = await this.storage.get(`files/${path}`);
+      if (!obj) {
+        result.notFound.push(path);
+        return;
+      }
+      await this.write(path, obj.body, remote.mtime);
+      this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
+      this.pulled++;
+      result.downloaded++;
+    });
+    return result;
+  }
+
+  /** Map an Obsidian linkpath (or a full vault path) to a live remote path. Tries: exact match,
+   * exact + ".md" (wikilink to a note), then a basename/suffix match across live entries, shortest
+   * path winning (Obsidian's own tiebreak for ambiguous shortlinks). Tombstoned paths never match. */
+  private resolveRemotePath(candidate: string, files: Record<string, SnapshotEntry>): string | null {
+    const c = candidate.replace(/^\.?\//, "").trim();
+    if (!c) return null;
+    const live = (p: string): boolean => p in files && !isTombstone(files[p]);
+    if (live(c)) return c;
+    if (live(c + ".md")) return c + ".md";
+    const hasSlash = c.includes("/");
+    const matches = Object.keys(files).filter((p) => {
+      if (!live(p)) return false;
+      if (hasSlash) return p === c || p.endsWith("/" + c);
+      const base = p.split("/").pop();
+      return base === c || base === c + ".md";
+    });
+    if (matches.length === 0) return null;
+    return matches.sort((a, b) => a.length - b.length)[0];
   }
 
   private async push(): Promise<void> {

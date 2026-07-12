@@ -1,4 +1,4 @@
-import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, normalizePath } from "obsidian";
+import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
@@ -102,6 +102,16 @@ export default class S3SyncPlugin extends Plugin {
       id: "export-starter-vault",
       name: "Export setup vault (for a new device)",
       callback: () => void this.exportStarterVault(),
+    });
+    this.addCommand({
+      id: "force-sync-linked-files",
+      name: "Force download linked files of this note (ignore size limit)",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md" || !this.engine) return false;
+        if (!checking) void this.forceSyncLinkedFiles(file);
+        return true;
+      },
     });
 
     // vault change tracking (§2.2) — events don't fire while the app is closed
@@ -241,6 +251,47 @@ export default class S3SyncPlugin extends Plugin {
     } catch (err) {
       console.error("[s3-sync] resync failed", err);
       new Notice(`S3 resync failed: ${String(err)}`);
+    }
+  }
+
+  /** Collect the link/embed targets of a note as Obsidian linkpaths. Uses BOTH the resolved-links
+   * map (present files) and the raw links/embeds in the metadata cache — the latter is what surfaces
+   * targets that aren't downloaded locally yet (the whole reason to force them). Heading/block
+   * subpaths (#…, #^…) are stripped so we match on the file path alone. */
+  private resolveLinkCandidates(file: TFile): string[] {
+    const out = new Set<string>();
+    const resolved = this.app.metadataCache.resolvedLinks[file.path] ?? {};
+    for (const dest of Object.keys(resolved)) out.add(dest);
+    const cache = this.app.metadataCache.getFileCache(file);
+    for (const ref of [...(cache?.links ?? []), ...(cache?.embeds ?? [])]) {
+      const linkpath = getLinkpath(ref.link);
+      if (linkpath) out.add(linkpath);
+    }
+    return [...out];
+  }
+
+  /** Command: force-download every file linked/embedded by the active note, ignoring this device's
+   * download-size cap. Lets a mobile user pull a note's oversized attachments on demand. */
+  async forceSyncLinkedFiles(file: TFile): Promise<void> {
+    if (!this.engine) {
+      new Notice("S3 Vault Sync: not configured");
+      return;
+    }
+    const candidates = this.resolveLinkCandidates(file);
+    if (candidates.length === 0) {
+      new Notice("S3 Vault Sync: this note has no linked files.");
+      return;
+    }
+    new Notice(`S3 Vault Sync: force-downloading ${candidates.length} linked file(s)…`);
+    try {
+      const r = await this.engine.forceDownloadPaths(candidates);
+      const parts = [`downloaded ${r.downloaded}`];
+      if (r.upToDate) parts.push(`${r.upToDate} already present`);
+      if (r.notFound.length) parts.push(`${r.notFound.length} not found in cloud`);
+      new Notice(`S3 Vault Sync: ${parts.join(", ")}.`);
+    } catch (err) {
+      console.error("[s3-sync] force download failed", err);
+      new Notice(`S3 Vault Sync: force download failed — ${String(err)}`);
     }
   }
 
