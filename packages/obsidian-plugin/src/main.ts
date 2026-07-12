@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, normalizePath } from "obsidian";
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
-import { buildStarterZip, deliverFile } from "./starter";
+import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
 
 interface Settings {
@@ -219,11 +219,12 @@ export default class S3SyncPlugin extends Plugin {
       };
       const dataJson = JSON.stringify({ settings } satisfies PersistedData, null, 2) + "\n";
 
-      new Notice("Building setup vault…");
-      const zip = buildStarterZip({ pluginId: this.manifest.id, mainJs, manifestJson, dataJson });
-      const how = await deliverFile(zip, "starter-vault.zip");
-      if (how === "shared") new Notice("Setup vault ready — choose where to send it.");
-      else if (how === "downloaded") new Notice("Saved starter-vault.zip to your downloads.");
+      const vaultName = safeVaultName(this.app.vault.getName());
+      new Notice("Building vault zip…");
+      const zip = buildStarterZip({ vaultName, pluginId: this.manifest.id, mainJs, manifestJson, dataJson });
+      const how = await deliverFile(zip, `${vaultName}.zip`);
+      if (how === "shared") new Notice(`${vaultName}.zip ready — choose where to send it.`);
+      else if (how === "downloaded") new Notice(`Saved ${vaultName}.zip to your downloads.`);
     } catch (err) {
       console.error("[s3-sync] starter export failed", err);
       new Notice(`Setup vault export failed: ${String(err)}`);

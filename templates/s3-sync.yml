@@ -53,6 +53,7 @@ jobs:
       - name: Run sync
         env:
           BUCKET: ${{ vars.S3_SYNC_BUCKET }}
+          PREFIX: ${{ vars.S3_SYNC_PREFIX }} # <user>/vaults/<name>/ — must match the plugin's prefix
           AWS_REGION: ${{ vars.S3_SYNC_REGION }}
           REPO_DIR: ${{ github.workspace }}
           RETENTION_DAYS: "30"
