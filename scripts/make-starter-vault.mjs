@@ -2,19 +2,20 @@
 /**
  * make-starter-vault: bundle a ready-to-sync vault zip for a device.
  *
- * The zip holds an EMPTY Obsidian vault containing only the S3-sync plugin (main.js + manifest.json)
- * and a data.json that carries S3 connection fields on top of the plugin's DEFAULT settings — most
- * importantly the 10 MB download cap, so a new device starts lean. Per-device fields are cleared
- * (deviceId + machineFingerprint → the device mints its own identity) and NO state.json.gz is
- * included, so the plugin does a clean full pull of the whole vault on first run.
+ * The zip contains ONLY the vault: a single top folder (named with --name) holding just the S3-sync
+ * plugin (main.js + manifest.json) and a data.json that carries S3 connection fields on top of the
+ * plugin's DEFAULT settings — most importantly the 10 MB download cap, so a device starts lean.
+ * Per-device fields are cleared (deviceId + machineFingerprint → the device mints its own identity)
+ * and NO state.json.gz is included, so the plugin does a clean full pull on first run.
  *
- * Setup instructions live at the zip root, OUTSIDE the vault folder, so they never sync up to S3.
+ * "Extract here" on the target device yields a ready-to-open vault folder. No instructions ride
+ * inside the zip — those are delivered out of band.
  *
  * Credentials come from a file or the environment — never argv — so the secret key can't leak into
  * process listings. This is the CLI companion to the in-plugin "Export setup vault" button.
  *
  * Usage:
- *   node scripts/make-starter-vault.mjs \
+ *   node scripts/make-starter-vault.mjs --name <vault> \
  *     --bucket <b> --region <r> --prefix <user/vaults/name/> \
  *     --creds-file <json {accessKeyId,secretAccessKey}> [--out <file.zip>] [--no-build]
  *
@@ -61,21 +62,10 @@ function die(msg) {
   process.exit(1);
 }
 
-function setupReadme() {
-  return [
-    "# S3 Vault Sync — set up this vault on a device",
-    "",
-    "1. In Obsidian, choose \"Open folder as vault\" and pick the `vault/` folder next to this file.",
-    "2. Settings → Community plugins → \"Turn on community plugins\" (accept the trust prompt).",
-    "3. \"S3 Vault Sync\" is already enabled — it starts pulling the whole vault from S3.",
-    "",
-    "Notes",
-    "- This device starts with a 10 MB download cap: bigger files stay in the cloud to keep the local",
-    "  vault small. Change it under the plugin settings → \"Max download size (MB)\" (0 = no limit).",
-    "- A unique device id is generated automatically the first time the plugin loads.",
-    "- This bundle carries your S3 access key. Delete it once the device is set up.",
-    "",
-  ].join("\n");
+/** Keep the vault name usable as a directory segment (no separators / control chars). */
+function safeVaultName(name) {
+  const cleaned = String(name).replace(/[\\/\x00-\x1f]+/g, " ").trim();
+  return cleaned || "vault";
 }
 
 async function loadCreds() {
@@ -106,7 +96,8 @@ async function main() {
   const bucket = flag("--bucket");
   const region = flag("--region", DEFAULT_SETTINGS.region);
   const prefix = flag("--prefix", "");
-  const out = path.resolve(flag("--out", path.join(process.cwd(), "vault.zip")));
+  const vaultName = safeVaultName(flag("--name", "vault"));
+  const out = path.resolve(flag("--out", path.join(process.cwd(), `${vaultName}.zip`)));
   if (!bucket) die("--bucket is required");
   const { accessKeyId, secretAccessKey } = await loadCreds();
 
@@ -126,18 +117,15 @@ async function main() {
   const settings = { ...DEFAULT_SETTINGS, bucket, region, accessKeyId, secretAccessKey, prefix };
   const dataJson = JSON.stringify({ settings }, null, 2) + "\n";
 
-  // 3. stage: empty vault/ + a top-level README (README stays OUTSIDE vault/ so it never syncs)
+  // 3. stage the vault ONLY — a single top folder named after the vault, no instructions inside
   const stage = await fs.mkdtemp(path.join(os.tmpdir(), "vault-zip-"));
-  const pluginDir = path.join(stage, "vault/.obsidian/plugins", PLUGIN_ID);
+  const obsidianDir = path.join(stage, vaultName, ".obsidian");
+  const pluginDir = path.join(obsidianDir, "plugins", PLUGIN_ID);
   await fs.mkdir(pluginDir, { recursive: true });
   await fs.writeFile(path.join(pluginDir, "main.js"), mainJs);
   await fs.writeFile(path.join(pluginDir, "manifest.json"), manifestJson);
   await fs.writeFile(path.join(pluginDir, "data.json"), dataJson);
-  await fs.writeFile(
-    path.join(stage, "vault/.obsidian/community-plugins.json"),
-    JSON.stringify([PLUGIN_ID]) + "\n",
-  );
-  await fs.writeFile(path.join(stage, "README-SETUP.md"), setupReadme());
+  await fs.writeFile(path.join(obsidianDir, "community-plugins.json"), JSON.stringify([PLUGIN_ID]) + "\n");
 
   // 4. zip ("." includes dotfiles/dot-dirs, unlike a shell glob)
   await fs.rm(out, { force: true });
@@ -145,7 +133,7 @@ async function main() {
   await fs.rm(stage, { recursive: true, force: true });
 
   const kb = Math.round((await fs.stat(out)).size / 1024);
-  console.log(`\n✓ wrote ${out} (${kb} KB)`);
+  console.log(`\n✓ wrote ${out} (${kb} KB) — extracts to ${vaultName}/`);
   console.log(`  bucket=${bucket} region=${region} prefix=${prefix || "(none)"} maxDownloadMB=${settings.maxDownloadMB}`);
   console.log(`  accessKeyId=${accessKeyId.slice(0, 4)}… (secret embedded, ${secretAccessKey.length} chars)`);
   console.log("  deviceId + state: cleared → fresh identity and full pull on first run");

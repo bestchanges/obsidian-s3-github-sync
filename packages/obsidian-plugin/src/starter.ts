@@ -1,15 +1,17 @@
 import { strToU8, zipSync } from "fflate";
 
 /**
- * Packages a "starter vault" zip in-memory (works on desktop AND mobile — no filesystem/CLI needed)
+ * Packages a starter-vault zip in-memory (works on desktop AND mobile — no filesystem/CLI needed)
  * and hands it to the OS: the native share sheet on mobile, a browser download on desktop.
  *
- * The zip is an empty Obsidian vault holding only this plugin + a preconfigured data.json, so the
- * new device turns on community plugins and immediately syncs the whole vault. Setup instructions
- * live at the zip root, OUTSIDE `vault/`, so they never sync up to S3.
+ * The zip contains ONLY the vault — a single top folder named after the vault, holding just this
+ * plugin + a preconfigured data.json. "Extract here" on the target device yields a ready-to-open
+ * vault. No instructions ride inside (those are delivered out of band), so nothing stray syncs up.
  */
 
 export interface StarterInput {
+  /** vault folder name — the zip's single top-level directory (matches the source vault) */
+  vaultName: string;
   pluginId: string;
   mainJs: Uint8Array;
   manifestJson: string;
@@ -17,29 +19,20 @@ export interface StarterInput {
   dataJson: string;
 }
 
-const README = [
-  "# S3 Vault Sync — set up this vault on a new device",
-  "",
-  "1. In Obsidian, choose \"Open folder as vault\" and pick the `vault/` folder next to this file.",
-  "2. Settings → Community plugins → \"Turn on community plugins\" (accept the trust prompt).",
-  "3. \"S3 Vault Sync\" is already enabled — it starts pulling the whole vault from S3.",
-  "",
-  "Notes",
-  "- This device starts with a 10 MB download cap: bigger files stay in the cloud to keep the local",
-  "  vault small. Change it under the plugin settings → \"Max download size (MB)\" (0 = no limit).",
-  "- A unique device id is generated automatically the first time the plugin loads.",
-  "- This bundle carries your S3 access key. Delete it once the device is set up.",
-  "",
-].join("\n");
+/** Keep the vault name usable as a zip path segment (no separators / control chars). */
+export function safeVaultName(name: string): string {
+  const cleaned = name.replace(/[\\/\x00-\x1f]+/g, " ").trim();
+  return cleaned || "vault";
+}
 
-/** Build the starter-vault zip bytes. */
+/** Build the starter-vault zip bytes. Extracts to `<vaultName>/` — the vault itself, nothing else. */
 export function buildStarterZip(input: StarterInput): Uint8Array {
-  const pluginDir = `vault/.obsidian/plugins/${input.pluginId}`;
+  const root = safeVaultName(input.vaultName);
+  const pluginDir = `${root}/.obsidian/plugins/${input.pluginId}`;
   return zipSync(
     {
-      "README-SETUP.md": strToU8(README),
       // pre-enable the plugin so it loads the moment community plugins are turned on
-      "vault/.obsidian/community-plugins.json": strToU8(JSON.stringify([input.pluginId]) + "\n"),
+      [`${root}/.obsidian/community-plugins.json`]: strToU8(JSON.stringify([input.pluginId]) + "\n"),
       [`${pluginDir}/main.js`]: input.mainJs,
       [`${pluginDir}/manifest.json`]: strToU8(input.manifestJson),
       [`${pluginDir}/data.json`]: strToU8(input.dataJson),

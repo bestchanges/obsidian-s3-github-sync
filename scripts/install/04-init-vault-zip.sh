@@ -38,8 +38,8 @@ PREFIX="$(vault_prefix "$USER_NS" "$VAULT")"
 
 step "Device zip for '$VAULT'  (prefix $PREFIX)"
 node "$REPO_DIR/scripts/make-starter-vault.mjs" \
-  --bucket "$BUCKET" --region "$REGION" --prefix "$PREFIX" \
+  --name "$VAULT" --bucket "$BUCKET" --region "$REGION" --prefix "$PREFIX" \
   --creds-file "$CREDS" --out "$OUT"
 
 step "Done"
-log "Carry $OUT to a device → unzip → open vault/ → turn on community plugins."
+log "Carry $OUT to a device → extract here → open the $VAULT/ folder as a vault → turn on community plugins."

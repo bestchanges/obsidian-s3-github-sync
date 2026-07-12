@@ -47,6 +47,10 @@ cp .env.shadow .env      # then edit .env
 Add a second vault for the same user: just `03` (optional) + `04` with a new `--vault`.
 Every script takes `--dry-run` (print, don't mutate) and `--yes` (skip confirmations).
 
+**On the target device:** the `<vault>.zip` contains only the vault — a single folder named after
+the vault. Extract it in place, open that `<vault>/` folder as an Obsidian vault, turn on community
+plugins, and it starts pulling the whole vault. (No instructions ship inside the zip.)
+
 ## Where the secret goes
 
 - `02` writes the plugin access key to `scripts/install/.secrets/<user>.json` (gitignored, `chmod 600`).
