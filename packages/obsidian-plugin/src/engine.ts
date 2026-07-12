@@ -71,11 +71,39 @@ export interface EngineOptions {
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
+type Deferred = { resolve: () => void; reject: (err: unknown) => void };
+
+/** One serialized reconcile cycle, built from a trigger (poll / edit / manual / startup / resync)
+ * and run under the engine lock. Concurrent requests coalesce into a single queued cycle via
+ * mergeReq(), so triggers can never run over each other or corrupt the shared state (§2.3). */
+interface CycleReq {
+  /** resync: forget the cursor + drop all file state before pulling (a full superset reconcile) */
+  resetCursor: boolean;
+  /** re-scan every local file (offline catch-up, §2.4); implies walking the config dir too */
+  scanOffline: boolean;
+  /** re-scan just the config dir (cheap; catches in-session .obsidian edits + deletions) */
+  scanConfig: boolean;
+  /** ignore echo suppression on pull — restore even files THIS device once wrote */
+  fullPull: boolean;
+  /** short human label for notifications */
+  label: string;
+  /** emit started/done notices even when the cycle transferred nothing */
+  announce: boolean;
+  /** show those notices even without verbose mode (user-initiated actions: manual sync, resync) */
+  force: boolean;
+}
+
 export class SyncEngine {
   /** paths currently being written by sync itself — vault events for them are echoes (§2.3) */
   readonly applying = new Set<string>();
   private dirty = new Set<string>();
+  // Serialization: one cycle runs at a time. Concurrent requests (poll / edit save / manual /
+  // resync) coalesce into a single queued slot instead of overlapping — which used to let a resync
+  // wipe the state mid-cycle while its own sync no-op'd. `running` holds the lock; `queuedReq` is
+  // the coalesced follow-up; `queuedWaiters` are the callers awaiting it.
   private running = false;
+  private queuedReq: CycleReq | null = null;
+  private queuedWaiters: Deferred[] = [];
   // per-cycle activity counters (for the verbose summary)
   private pulled = 0;
   private pushed = 0;
@@ -165,8 +193,9 @@ export class SyncEngine {
    * runs each poll to catch in-session settings changes (installing a plugin, tweaking appearance)
    * AND deletions — mid-session, absence IS a reliable delete signal (unlike startup, where a stale
    * or copied state could masquerade as deletions). Skips entirely if the config dir is unreadable,
-   * so a transient list failure can't mass-tombstone. push() re-stats before tombstoning anyway. */
-  async scanConfigDir(): Promise<void> {
+   * so a transient list failure can't mass-tombstone. push() re-stats before tombstoning anyway.
+   * Runs inside the cycle lock (never standalone), so it can't race a concurrent pull/push. */
+  private async scanConfigDir(): Promise<void> {
     const configFiles = await this.listConfigFiles();
     if (!configFiles) return; // unreadable → don't infer changes or deletions this cycle
     const present = new Set<string>();
@@ -183,8 +212,9 @@ export class SyncEngine {
     }
   }
 
-  /** Detect files edited while Obsidian was closed (§2.4): mtime pre-filter, hash decides. */
-  async scanOffline(): Promise<void> {
+  /** Detect files edited while Obsidian was closed (§2.4): mtime pre-filter, hash decides.
+   * Runs inside the cycle lock (via a scanOffline request), so it can't race a concurrent sync. */
+  private async scanOffline(): Promise<void> {
     const known = new Set<string>();
     for (const file of this.vault.getFiles()) {
       if (this.isExcluded(file.path)) continue;
@@ -229,42 +259,136 @@ export class SyncEngine {
   }
 
   /** User-triggered full reconcile: forget the cursor, re-pull the entire S3 state, re-scan all
-   * local files. Overlaps union-merge (nothing lost). The escape hatch for stale/foreign state. */
+   * local files. Overlaps union-merge (nothing lost). The escape hatch for stale/foreign state.
+   * Serialized like every other cycle — hitting "Resync" mid-sync now queues behind the running
+   * cycle instead of resetting the state out from under it and then no-op'ing on the lock. */
   async resyncEverything(): Promise<void> {
-    this.state.lastSyncedRev = 0;
-    this.state.files = {};
-    this.dirty.clear();
-    await this.scanOffline(); // re-mark every local file dirty (empty state → all are "new")
-    this.notify("Resync: reconciling the whole vault with S3…", true);
-    await this.sync(true); // full pull: ignore echo suppression so THIS device's own files restore too
-    await this.opts.onStateChanged(this.state); // force-persist the reset even if S3 was empty
-    this.notify("Resync complete", true);
+    await this.request({
+      resetCursor: true,
+      scanOffline: true,
+      scanConfig: false,
+      fullPull: true, // ignore echo suppression so THIS device's own files restore too
+      label: "resync",
+      announce: true,
+      force: true, // a resync is a deliberate user action — always surface start/done
+    });
   }
 
   // ------------------------------------------------------------- sync cycle
-  /** One full cycle: pull remote changes (merge conflicts), then push dirty set. */
-  async sync(fullPull = false): Promise<void> {
-    if (this.running) return;
-    this.running = true;
-    this.pulled = this.pushed = this.merged = this.skipped = 0;
-    const rev0 = this.state.lastSyncedRev;
-    try {
-      await this.pull(fullPull);
-      await this.push();
-      const activity = this.pulled + this.pushed + this.merged;
-      // Persist only when state actually changed — no-op polls (the common case) skip the write.
-      if (activity > 0 || this.state.lastSyncedRev !== rev0) {
-        await this.opts.onStateChanged(this.state);
+  /** Request one reconcile cycle. Serialized: if a cycle is already running the request coalesces
+   * into a single queued follow-up (so polls/edits can't pile up) and resolves when that cycle
+   * completes. `fullPull` ignores echo suppression; `scanConfig`/`scanOffline` pick the pre-scan;
+   * `announce`/`label` drive the queued/started/done notices. */
+  async sync(
+    opts: {
+      fullPull?: boolean;
+      scanConfig?: boolean;
+      scanOffline?: boolean;
+      label?: string;
+      announce?: boolean;
+    } = {},
+  ): Promise<void> {
+    await this.request({
+      resetCursor: false,
+      scanOffline: opts.scanOffline ?? false,
+      scanConfig: opts.scanConfig ?? false,
+      fullPull: opts.fullPull ?? false,
+      label: opts.label ?? "sync",
+      announce: opts.announce ?? false,
+      force: false,
+    });
+  }
+
+  /** Enqueue a cycle behind the running one (coalescing), or start the loop if the engine is idle.
+   * Returns a promise that settles when a cycle covering this request finishes. */
+  private request(req: CycleReq): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const waiter: Deferred = { resolve, reject };
+      if (this.running) {
+        const firstToQueue = this.queuedReq === null;
+        this.queuedReq = this.mergeReq(this.queuedReq, req);
+        this.queuedWaiters.push(waiter);
+        // Announce the wait once per queued batch (or whenever a resync joins) — coalesced polls
+        // during one long cycle don't each fire a notice.
+        if (firstToQueue || req.resetCursor) {
+          this.notify(`Sync: queued (${req.label}) — a cycle is already running`, req.force);
+        }
+      } else {
+        this.running = true;
+        void this.runLoop(req, [waiter]);
       }
-      if (activity > 0 || this.skipped > 0) {
-        this.notify(
-          `Sync: ↓${this.pulled} ↑${this.pushed}` +
-            (this.merged ? ` (${this.merged} merged)` : "") +
-            (this.skipped ? ` · ${this.skipped} kept in cloud (over size limit)` : ""),
-        );
+    });
+  }
+
+  /** Fold a new request into the queued one: resync wins, flags OR together, the cycle announces
+   * (it waited, so it's worth reporting) and inherits any force from a user-initiated request. */
+  private mergeReq(base: CycleReq | null, add: CycleReq): CycleReq {
+    const resetCursor = (base?.resetCursor ?? false) || add.resetCursor;
+    return {
+      resetCursor,
+      scanOffline: (base?.scanOffline ?? false) || add.scanOffline || resetCursor,
+      scanConfig: (base?.scanConfig ?? false) || add.scanConfig,
+      fullPull: (base?.fullPull ?? false) || add.fullPull || resetCursor,
+      label: add.resetCursor && !base?.resetCursor ? add.label : base?.label ?? add.label,
+      announce: true,
+      force: (base?.force ?? false) || add.force,
+    };
+  }
+
+  /** Drain cycles one at a time until the queue empties, then release the lock. Each cycle settles
+   * its own waiters (resolve on success, reject on failure) without stalling the ones behind it. */
+  private async runLoop(firstReq: CycleReq, firstWaiters: Deferred[]): Promise<void> {
+    let req: CycleReq | null = firstReq;
+    let waiters = firstWaiters;
+    try {
+      while (req) {
+        try {
+          await this.runCycle(req);
+          for (const w of waiters) w.resolve();
+        } catch (err) {
+          for (const w of waiters) w.reject(err);
+        }
+        req = this.queuedReq;
+        waiters = this.queuedWaiters;
+        this.queuedReq = null;
+        this.queuedWaiters = [];
       }
     } finally {
       this.running = false;
+    }
+  }
+
+  /** One reconcile pass: optional pre-scan, then pull remote changes (merge conflicts) and push the
+   * dirty set. Only ever invoked by runLoop (single-flight), so it owns the shared state alone. */
+  private async runCycle(req: CycleReq): Promise<void> {
+    this.pulled = this.pushed = this.merged = this.skipped = 0;
+    const rev0 = this.state.lastSyncedRev;
+    if (req.announce) this.notify(`Sync: started (${req.label})`, req.force);
+
+    if (req.resetCursor) {
+      this.state.lastSyncedRev = 0;
+      this.state.files = {};
+      this.dirty.clear();
+    }
+    if (req.scanOffline) await this.scanOffline();
+    else if (req.scanConfig) await this.scanConfigDir();
+
+    await this.pull(req.fullPull);
+    await this.push();
+
+    const activity = this.pulled + this.pushed + this.merged;
+    // Persist when state changed — and always after a resync, so the reset sticks even if S3 was
+    // empty (activity 0, rev unchanged at 0). No-op polls (the common case) still skip the write.
+    if (req.resetCursor || activity > 0 || this.state.lastSyncedRev !== rev0) {
+      await this.opts.onStateChanged(this.state);
+    }
+    if (req.announce || activity > 0 || this.skipped > 0) {
+      this.notify(
+        `Sync: ${req.announce ? `done (${req.label}) ` : ""}↓${this.pulled} ↑${this.pushed}` +
+          (this.merged ? ` (${this.merged} merged)` : "") +
+          (this.skipped ? ` · ${this.skipped} kept in cloud (over size limit)` : ""),
+        req.force,
+      );
     }
   }
 

@@ -286,8 +286,7 @@ export default class S3SyncPlugin extends Plugin {
     if (this.foreignStateDetected) {
       new Notice(`S3 Vault Sync: new device "${this.settings.deviceId}" — running a full resync`);
     }
-    await this.engine.scanOffline(); // offline catch-up (§2.4)
-    await this.runSync("startup");
+    await this.runSync("startup"); // offline catch-up (§2.4) + first sync, serialized in one cycle
     this.startPolling();
   }
 
@@ -308,14 +307,20 @@ export default class S3SyncPlugin extends Plugin {
   private syncFailures = 0;
   private async runSync(reason: string): Promise<void> {
     if (!this.engine) return;
+    // The engine serializes the cycle and runs the pre-scan inside its lock. Startup does a full
+    // offline catch-up (which also walks the config dir); poll/manual do the cheap config rescan;
+    // "debounced-edit" fires after every keystroke burst, so it skips the config walk entirely.
+    // "manual" announces (started/done) so a verbose user sees their explicit Sync take effect.
+    const opts =
+      reason === "startup"
+        ? { scanOffline: true, label: "startup" }
+        : reason === "manual"
+          ? { scanConfig: true, label: "manual sync", announce: true }
+          : reason === "poll"
+            ? { scanConfig: true, label: "poll" }
+            : { label: "edit save" };
     try {
-      // Config dir emits no vault events, so scan it here — but only on the low-frequency triggers.
-      // "debounced-edit" fires after every note edit (non-config), so scanning then would re-walk
-      // the whole config dir on each keystroke burst for nothing.
-      if (reason === "poll" || reason === "startup" || reason === "manual") {
-        await this.engine.scanConfigDir();
-      }
-      await this.engine.sync();
+      await this.engine.sync(opts);
       this.syncFailures = 0;
     } catch (err) {
       this.syncFailures += 1;
