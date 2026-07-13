@@ -52,9 +52,12 @@ class FakeStorage implements StorageAdapter {
   };
 }
 
-function makeLogger(enabled = true) {
+/** rotateBytes defaults to the real 512 KB cap; the rotation tests inject a tiny cap so they trip
+ * rotation with a small line. Tripping it with a ~600 KB line (as before) made the logger's console
+ * mirror emit a ~600 KB stdout line, which deadlocked vitest's worker pipe on CI runners. */
+function makeLogger(enabled = true, rotateBytes?: number) {
   const { files, adapter } = makeDisk();
-  const logger = new SyncLogger({ adapter, logPath: LOG_PATH, enabled: () => enabled });
+  const logger = new SyncLogger({ adapter, logPath: LOG_PATH, enabled: () => enabled, rotateBytes });
   return { files, logger };
 }
 
@@ -82,8 +85,8 @@ describe("SyncLogger", () => {
   });
 
   it("rotates the active file to .1 once it exceeds the cap, then starts fresh", async () => {
-    const { files, logger } = makeLogger();
-    logger.info("x".repeat(600 * 1024)); // one line over the 512 KB cap
+    const { files, logger } = makeLogger(true, 256); // tiny cap so a small line trips rotation
+    logger.info("x".repeat(512)); // one line over the test cap
     await logger.flush();
     expect(files.has(BACKUP)).toBe(true);
     expect(files.has(LOG_PATH)).toBe(false); // rolled away, no fresh active yet
@@ -95,8 +98,8 @@ describe("SyncLogger", () => {
   });
 
   it("tail() concatenates backup + active, newest content last", async () => {
-    const { logger } = makeLogger();
-    logger.info("x".repeat(600 * 1024));
+    const { logger } = makeLogger(true, 256); // tiny cap so a small line trips rotation
+    logger.info("x".repeat(512));
     await logger.flush(); // rotates → backup
     logger.info("newest-line");
     await logger.flush();

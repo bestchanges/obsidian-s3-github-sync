@@ -31,6 +31,10 @@ export interface SyncLoggerOptions {
   logPath: string;
   /** gate — logging no-ops entirely when this returns false (the settings toggle) */
   enabled: () => boolean;
+  /** active-file rotation threshold in bytes; defaults to ROTATE_BYTES (512 KB). Injectable so
+   * tests can trip rotation with a tiny line instead of a multi-hundred-KB one — the console mirror
+   * (below) would otherwise emit that giant line to stdout and deadlock vitest's pipe on CI. */
+  rotateBytes?: number;
 }
 
 /** Persistent, best-effort logger for the plugin. Writes timestamped lines to a rotating on-disk
@@ -44,6 +48,7 @@ export class SyncLogger {
   private readonly logPath: string;
   private readonly backupPath: string;
   private readonly enabled: () => boolean;
+  private readonly rotateBytes: number;
 
   private pending: string[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -60,6 +65,7 @@ export class SyncLogger {
     this.logPath = opts.logPath;
     this.backupPath = opts.logPath + ".1";
     this.enabled = opts.enabled;
+    this.rotateBytes = opts.rotateBytes ?? ROTATE_BYTES;
   }
 
   /** Level-dispatch entry point — matches EngineOptions.log so the engine can log directly. */
@@ -128,7 +134,7 @@ export class SyncLogger {
 
   private async rotateIfNeeded(): Promise<void> {
     const st = await this.adapter.stat(this.logPath);
-    if (!st || st.size <= ROTATE_BYTES) return;
+    if (!st || st.size <= this.rotateBytes) return;
     try {
       if (await this.adapter.exists(this.backupPath)) await this.adapter.remove(this.backupPath);
       await this.adapter.rename(this.logPath, this.backupPath);
