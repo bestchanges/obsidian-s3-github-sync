@@ -132,9 +132,13 @@ in `x-amz-meta-revision`, then `pruneDeltas` deletes folded deltas older than `R
 ## 2.6 Union merge (`merge.ts`)
 
 `unionMerge(base, ours, theirs)` → `{ text, hadConflicts }`. Fast-paths equal/one-sided cases, then
-`node-diff3` with `excludeFalseConflicts`. Conflict regions emit **ours-lines then theirs-lines, no
-markers** — nothing lost. This is the single implementation both legs import; divergent merge output
-would echo back through sync as phantom changes.
+`node-diff3` with `excludeFalseConflicts`. Each conflict region combines its two sides with a **2-way
+LCS union** (`diffComm`): lines common to both sides survive **once**, only genuinely differing lines
+stack (ours-only then theirs-only), **no markers** — nothing lost. This matters most on the
+empty/unusable-base path, where diff3 collapses the whole overlap into one giant conflict region;
+blind concatenation there duplicated the entire block, the dedup keeps it single. This is the single
+implementation both legs import; divergent merge output would echo back through sync as phantom
+changes, so both `diff3Merge` and `diffComm` must stay pure and deterministic.
 
 ## 2.7 Hash & codec
 

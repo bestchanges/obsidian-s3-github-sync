@@ -74,3 +74,49 @@ describe("unionMerge conflict fixtures", () => {
     }
   });
 });
+
+/** Conflict-region dedup (§1.5): within a conflict the two sides are combined by a 2-way LCS
+ * union, so lines common to both survive once instead of the whole region being duplicated —
+ * the note-block-duplication complaint. Nothing is lost; only genuinely differing lines stack. */
+describe("unionMerge conflict-region dedup", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => `| item ${i} | val |`);
+
+  it("empty base with near-identical sides keeps the shared block ONCE (was fully duplicated)", () => {
+    const ours = ["# Note", ...rows, "ours tail"].join("\n");
+    const theirs = ["# Note", ...rows, "theirs tail"].join("\n");
+    const r = unionMerge("", ours, theirs);
+    // each shared line appears exactly once; only the divergent tail lines are both kept
+    for (const row of rows) expect(r.text.split(row).length - 1).toBe(1);
+    expect(r.text).toContain("ours tail");
+    expect(r.text).toContain("theirs tail");
+    expect(r.text.split("\n").length).toBe(rows.length + 3); // header + 12 rows + 2 tails
+    expect(r.hadConflicts).toBe(true);
+  });
+
+  it("dedups shared context WITHIN a coarse conflict region (stale/empty base)", () => {
+    const shared = ["a", "b", "c", "d", "e", "f"];
+    const ours = ["OURS", ...shared].join("\n");
+    const theirs = ["THEIRS", ...shared].join("\n");
+    const r = unionMerge("", ours, theirs);
+    for (const line of shared) expect(r.text.split(new RegExp(`^${line}$`, "gm")).length - 1).toBe(1);
+    expect(r.text).toContain("OURS");
+    expect(r.text).toContain("THEIRS");
+  });
+
+  it("still keeps BOTH sides of a genuine same-line conflict (nothing lost)", () => {
+    const base = "title\noriginal\nfooter\n";
+    const ours = "title\nours version\nfooter\n";
+    const theirs = "title\ntheirs version\nfooter\n";
+    const r = unionMerge(base, ours, theirs);
+    expect(r.text).toContain("ours version");
+    expect(r.text).toContain("theirs version");
+    expect(r.hadConflicts).toBe(true);
+  });
+
+  it("dedup path stays deterministic across repeated runs (cross-leg parity)", () => {
+    const ours = ["# Note", ...rows, "ours tail"].join("\n");
+    const theirs = ["# Note", ...rows, "theirs tail"].join("\n");
+    const first = unionMerge("", ours, theirs).text;
+    for (let i = 0; i < 5; i++) expect(unionMerge("", ours, theirs).text).toBe(first);
+  });
+});
