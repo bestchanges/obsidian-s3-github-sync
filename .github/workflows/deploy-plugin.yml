@@ -44,6 +44,7 @@ jobs:
       - run: npm ci
 
       - name: Run tests
+        timeout-minutes: 6 # tests run in ~1s; a stuck run fails fast with logs, not a silent wedge
         run: npm test
 
       - name: Typecheck
