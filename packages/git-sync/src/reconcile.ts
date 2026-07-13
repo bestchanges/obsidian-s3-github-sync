@@ -20,6 +20,12 @@ const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
 function isTextPath(p: string): boolean {
   return TEXT_EXTS.has(p.split(".").pop()?.toLowerCase() ?? "");
 }
+/** Config-dir files (.obsidian/**): resolved by freshest-wins, NOT union-merge, in lockstep with the
+ * plugin (engine.ts usesFreshestWins). Line-merging JSON/config duplicates lines; freshest-wins takes
+ * the whole newer side and converges. Note: the repo mirrors the vault, so ".obsidian" is the dir. */
+function isConfigPath(p: string): boolean {
+  return p.startsWith(".obsidian/");
+}
 /** Union-merge only when BOTH sides are text-classified and within the size cap; otherwise the two
  * versions are raw bytes we can't three-way merge, so fall back to last-writer-wins. */
 function isTextMergeable(p: string, aLen: number, bLen: number): boolean {
@@ -96,16 +102,24 @@ export async function reconcileFile(
     if (remoteContent === null) {
       return buildUpload(local); // our edit wins over their delete (un-tombstones)
     }
-    if (isTextMergeable(p, local.byteLength, remoteContent.byteLength)) {
-      // three-way union merge on decoded text
-      const merged = unionMerge(await io.mergeBase(p), decodeText(local), decodeText(remoteContent));
-      if (merged.hadConflicts) io.log(`union-merged conflict: ${p}`);
-      if (merged.text !== decodeText(local)) await io.writeLocal(p, encodeText(merged.text));
-      return merged.text !== decodeText(remoteContent) ? buildUpload(encodeText(merged.text)) : null;
+    // Config files (.obsidian/**) and binary/oversized content resolve by FRESHEST-WINS, in lockstep
+    // with the plugin (engine.ts resolveFreshestWins): union-merging JSON duplicates lines and
+    // binaries can't three-way merge, while a keep-local rule ping-pongs between divergent copies.
+    // Newer author date wins; no bytes are synthesized, so the two legs stay convergent.
+    if (isConfigPath(p) || !isTextMergeable(p, local.byteLength, remoteContent.byteLength)) {
+      if (contentHash(local) === contentHash(remoteContent)) return null; // already equal
+      const remoteMtime = (inS3 as FileEntry).mtime;
+      if (remoteMtime > (await io.authorDate(p))) {
+        await io.writeLocal(p, remoteContent); // remote is newer → take it, nothing to push up
+        return null;
+      }
+      return buildUpload(local); // git side is newer (or a tie) → keep it and re-push
     }
-    // binary or oversized: can't three-way merge → last-writer-wins, keep git's version and re-push
-    // (mirrors the plugin's keep-local LWW so neither side silently loses an edit).
-    return contentHash(local) !== contentHash(remoteContent) ? buildUpload(local) : null;
+    // text note within the size cap → three-way union merge
+    const merged = unionMerge(await io.mergeBase(p), decodeText(local), decodeText(remoteContent));
+    if (merged.hadConflicts) io.log(`union-merged conflict: ${p}`);
+    if (merged.text !== decodeText(local)) await io.writeLocal(p, encodeText(merged.text));
+    return merged.text !== decodeText(remoteContent) ? buildUpload(encodeText(merged.text)) : null;
   }
 
   return null;

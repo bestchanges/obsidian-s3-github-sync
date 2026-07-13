@@ -146,6 +146,11 @@ blind concatenation there duplicated the entire block, the dedup keeps it single
 implementation both legs import; divergent merge output would echo back through sync as phantom
 changes, so both `diff3Merge` and `diffComm` must stay pure and deterministic.
 
+Union merge is applied only to **text notes** within the size cap. **Config files** (`.obsidian/**`)
+and **binary/oversized** content resolve by **freshest-wins** instead (§4.8, §5.4) — line-merging
+JSON stacked its lines into duplicated keys — and that choice, too, is duplicated byte-for-byte
+across both legs.
+
 ## 2.7 Hash & codec
 
 - `contentHash` — `spark-md5` over bytes, `"md5:<hex>"`. Pure JS → identical on mobile, desktop, CI.
@@ -220,10 +225,13 @@ resets per-cycle counters, and persists state only when something changed or the
 - **pull** — `listDeltasSince(lastSyncedRev)`. Warm path applies `changedEntries` (excluding this
   device unless `fullPull`); cold path (`hasGap` or behind snapshot) diffs the snapshot. For each
   changed path not excluded/unsafe → `applyRemote`. Advances `lastSyncedRev` to the target.
-- **push** — hashes each dirty file; **hash unchanged → dropped** (mtime-only touch, no traffic).
-  Uploads changed files, then one `appendDelta` written `by: deviceId`. On a lost CAS race it applies
-  the winner's foreign entries before retrying. Tombstones are emitted for dirty paths whose file is
-  gone. Clears the dirty set.
+- **push** — snapshots and **drains** the dirty set up front (so an edit that lands mid-cycle
+  re-populates `dirty` and is pushed next cycle instead of being wiped by a blanket clear — the fix
+  for edits lost during a slow push); then hashes each drained file; **hash unchanged → dropped**
+  (mtime-only touch, no traffic). Uploads changed files, then one `appendDelta` written
+  `by: deviceId`. On a lost CAS race it applies the winner's foreign entries before retrying.
+  Tombstones are emitted for dirty paths whose file is gone. On failure the drained paths are
+  requeued for the next cycle.
 
 Echo suppression is **disabled during a full resync** (`excludeBy = undefined`) so a device can
 restore files *it* originally wrote but has since lost locally — the fix for "resync pulled 0 files".
@@ -299,9 +307,28 @@ as usual (the forced copy goes stale until the command is re-run), never deleted
 ## 4.8 Conflict handling & mtime alignment (`applyRemote`)
 
 `applyRemote` per path: identical hash → just record; clean local (or absent) → take remote (subject
-to the download cap); local also changed → **conflict**. Conflicts on binary files or content
-`> LWW_SIZE_LIMIT` (5 MB) are **last-writer-wins (keep local, re-push)**; text conflicts within the
-limit union-merge against the versioned base (fetched via the recorded `s3VersionId`).
+to the download cap); local also changed → **conflict**. Conflict strategy depends on the path
+(`usesFreshestWins`):
+
+- **Text notes** within `LWW_SIZE_LIMIT` (5 MB) → three-way **union-merge** against the versioned
+  base (fetched via the recorded `s3VersionId`). The merged bytes are written and left **dirty** so
+  `push` uploads them; the engine does **not** `record()` the merged hash here — doing so would make
+  `push`'s mtime-only-touch guard (`st.hash === hash`) treat the merge as a no-op and silently drop
+  the upload, stranding the resolved conflict on this device (the bug that lost mobile-side merges).
+- **Config files** (`.obsidian/**`) and **binary / oversized** content → **freshest-wins**
+  (`resolveFreshestWins`): whichever side has the newer `mtime` takes the whole file — remote newer →
+  download + record; local newer (or a tie) → keep local + re-push. Line-merging JSON duplicated its
+  lines; freshest-wins avoids that **and converges**, where the previous keep-local rule ping-ponged
+  a fresh delta every poll between two divergent copies. No bytes are synthesized, so both legs stay
+  convergent even under clock skew.
+
+> [!note] Resync is authoritative for config (`takeConfigFromRemote`)
+> On a **full-pull reconcile** (`resyncEverything`), config-dir collisions are taken from S3 **as-is**
+> instead of freshest-wins. This is the **heal path** for a device whose `.obsidian/*.json` a prior
+> bad merge corrupted locally: the corrupted copy carries a *newer* mtime and would otherwise win
+> freshest-wins and re-propagate the corruption, so a resync forces the correct S3 copy back down.
+> Notes still union-merge on resync (lossless). Bootstrap (first-run) already takes every collision
+> from remote, so it covers config too.
 
 > [!note] First-run bootstrap (`EngineOptions.firstRun`)
 > On a device that has **never synced** (no persisted state file, and not a copied/foreign state),
@@ -432,11 +459,14 @@ it is unit-tested without a real repo/S3/filesystem (`test/reconcile.test.ts`). 
 - git-only upsert → PUT to S3 if the content hash differs from remote (idempotence); git-only delete
   → tombstone if remote still lives.
 - S3-only → write into the working tree, or `rm` on a tombstone.
-- both → resolve: delete-vs-edit → edit wins; else, **if the path is text-mergeable** (extension in
-  `TEXT_EXTS` and both sides ≤ `LWW_SIZE_LIMIT` 5 MB), three-way `unionMerge` with
-  `base = git show <lastSyncedCommit>:<path>` (warm) or empty (cold), writing the result to the tree
-  **and** queuing the S3 PUT; otherwise (binary/oversized) **last-writer-wins** — keep git's bytes and
-  re-push (mirrors the plugin's keep-local LWW so neither side loses an edit).
+- both → resolve: delete-vs-edit → edit wins; else classify like the plugin (§4.8, kept in lockstep):
+  - **config (`.obsidian/**`) or binary/oversized** → **freshest-wins**: compare `io.authorDate` (git
+    side) against the S3 entry's `mtime`; remote newer → write remote to the tree, no push; git newer
+    (or a tie) → keep git's bytes and re-push. Mirrors the plugin's `resolveFreshestWins` so JSON
+    isn't line-merged into duplicated keys and neither side ping-pongs.
+  - **text note within `LWW_SIZE_LIMIT`** → three-way `unionMerge` with
+    `base = git show <lastSyncedCommit>:<path>` (warm) or empty (cold), writing the result to the tree
+    **and** queuing the S3 PUT.
 
 > [!important] Content is handled as **raw bytes** end to end
 > Local reads/writes and S3 get/put move `Uint8Array`; text is decoded (`decodeText`) only inside the
