@@ -243,6 +243,14 @@ push). Events don't fire while the app is closed, so `scanOffline` on startup di
 stored state: an mtime pre-filter picks candidates, the hash decides. New files join the dirty set;
 missing files are treated as offline deletes — **except** the mass-missing guard:
 
+> [!note] Startup runs the pull before the scan
+> On mobile the offline scan takes minutes (it walks the whole vault + `.obsidian`), so startup
+> does a bare remote **pull first** and runs `scanOffline` **afterwards, in the background** — cloud
+> changes land in seconds instead of queueing behind the scan. This is safe because `applyRemote`
+> re-hashes each local file, so an offline edit that *also* changed remotely still conflict-merges
+> during the pull; only **pure-local** offline edits/deletes (invisible to the pull) wait for the
+> scan to push them up.
+
 > [!important] Mass-missing guard (offline-delete safety)
 > If ≥ `MASS_MISSING_MIN` (10) tracked files are missing **and** they exceed
 > `MASS_MISSING_FRACTION` (50%) of tracked files, that is almost certainly a stale/copied/moved
@@ -362,8 +370,9 @@ new edit.
 - **Commands**: `Sync now`, `Resync everything from S3`, `Pause/resume sync`,
   `Export setup vault (for a new device)`,
   `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only).
-- **Polling**: `LIST` every `pollIntervalSec` (default 15). Startup runs `scanOffline` → sync → start
-  polling once the vault index is ready.
+- **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup
+  runs in two phases (§4.4): a bare remote **pull** first (fast — cloud changes land in seconds),
+  then it starts polling, then the full **`scanOffline`** catch-up in the background.
 
 ## 4.10 Starter-vault export (`starter.ts`)
 
