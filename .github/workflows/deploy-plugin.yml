@@ -32,6 +32,7 @@ concurrency:
 jobs:
   build-and-dispatch:
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # a wedged step fails fast instead of hanging the deploy
     steps:
       - uses: actions/checkout@v4
 
@@ -42,10 +43,11 @@ jobs:
 
       - run: npm ci
 
-      - name: Verify (tests + typecheck)
-        run: |
-          npm test
-          npm run typecheck
+      - name: Run tests
+        run: npm test
+
+      - name: Typecheck
+        run: npm run typecheck
 
       - name: Build plugin
         run: PLUGIN_SOURCEMAP=false npm run build:plugin
