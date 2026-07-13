@@ -41,8 +41,9 @@ class MemStorage implements StorageAdapter {
 }
 
 /** Vault backed by an on-disk map. getFiles() omits the config dir (like the real Obsidian API), so
- * the engine only sees ".obsidian" content by walking it — mirrored here by list()/stat(). */
-function makeVault(disk: Map<string, Uint8Array>): any {
+ * the engine only sees ".obsidian" content by walking it — mirrored here by list()/stat(). The local
+ * mtime is configurable so tests can control the freshest-wins outcome for config files. */
+function makeVault(disk: Map<string, Uint8Array>, localMtimeMs = 1): any {
   return {
     configDir: ".obsidian",
     getFiles: () => [],
@@ -51,7 +52,7 @@ function makeVault(disk: Map<string, Uint8Array>): any {
         dir === ".obsidian"
           ? { files: [...disk.keys()].filter((p) => p.startsWith(".obsidian/")), folders: [] }
           : { files: [], folders: [] },
-      stat: async (p: string) => (disk.has(p) ? { type: "file", mtime: 1 } : null),
+      stat: async (p: string) => (disk.has(p) ? { type: "file", mtime: localMtimeMs } : null),
       readBinary: async (p: string) => {
         const b = disk.get(p) ?? new Uint8Array(0);
         return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
@@ -77,9 +78,14 @@ function remoteEntry(bytes: Uint8Array): SnapshotEntry {
   } as SnapshotEntry;
 }
 
-function makeEngine(storage: MemStorage, disk: Map<string, Uint8Array>, firstRun: boolean) {
+function makeEngine(
+  storage: MemStorage,
+  disk: Map<string, Uint8Array>,
+  firstRun: boolean,
+  localMtimeMs = 1,
+) {
   const state: SyncState = { lastSyncedRev: 0, files: {} };
-  const engine = new SyncEngine(makeVault(disk), storage as unknown as StorageAdapter, state, {
+  const engine = new SyncEngine(makeVault(disk, localMtimeMs), storage as unknown as StorageAdapter, state, {
     deviceId: "dev-test",
     selfDir: ".obsidian/plugins/vault-s3-sync",
     excludedFolders: [],
@@ -124,15 +130,30 @@ describe("SyncEngine first-run bootstrap", () => {
     expect(storage.puts).toEqual([]);
   });
 
-  it("without the bootstrap flag, the same collision union-merges and corrupts the file (the old bug)", async () => {
-    const { engine, state } = makeEngine(storage, disk, /* firstRun */ false);
+  it("without the bootstrap flag, a newer-mtime default WINS freshest-wins and is pushed (the hazard bootstrap guards)", async () => {
+    // Config files no longer union-merge (that duplicated JSON lines) — they resolve by freshest-
+    // wins. A freshly-generated default has a *newer* mtime than the canonical remote, so without
+    // the bootstrap guard freshest-wins keeps the local default and pushes it, clobbering the
+    // canonical settings everywhere. This is exactly why the first-run guard still exists.
+    const localNewer = Date.parse("2027-01-01T00:00:00.000Z");
+    const { engine } = makeEngine(storage, disk, /* firstRun */ false, localNewer);
     await engine.sync({ scanOffline: true });
 
-    // The canonical file is union-merged with Obsidian's default — no longer byte-identical to
-    // remote, i.e. corrupted locally. (It isn't re-pushed this cycle because the merged hash is
-    // recorded as current; the corruption reaches S3 on the next local edit.)
-    const merged = decodeText(disk.get(APP_JSON)!);
-    expect(merged).not.toBe(decodeText(REMOTE_APP));
-    expect(state.files[APP_JSON]?.hash).toBe(contentHash(merged));
+    // Local default kept (not overwritten by canonical remote)...
+    expect(decodeText(disk.get(APP_JSON)!)).toBe(decodeText(DEFAULT_APP));
+    // ...and pushed up — the corruption vector the bootstrap flag prevents.
+    expect(storage.puts).toContain(`files/${APP_JSON}`);
+  });
+
+  it("WITH the bootstrap flag, the same newer-mtime default is discarded for the canonical remote", async () => {
+    const localNewer = Date.parse("2027-01-01T00:00:00.000Z");
+    const { engine, state } = makeEngine(storage, disk, /* firstRun */ true, localNewer);
+    await engine.sync({ scanOffline: true });
+
+    // Bootstrap overrides freshest-wins: canonical remote wins despite the local default's newer
+    // mtime, and nothing is pushed.
+    expect(decodeText(disk.get(APP_JSON)!)).toBe(decodeText(REMOTE_APP));
+    expect(state.files[APP_JSON]?.hash).toBe(contentHash(REMOTE_APP));
+    expect(storage.puts).toEqual([]);
   });
 });

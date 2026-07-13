@@ -78,15 +78,49 @@ describe("reconcileFile binary safety", () => {
     expect(action).toBeNull();
   });
 
-  it("binary conflict (both changed): last-writer-wins keeps git's bytes and re-pushes", async () => {
+  it("binary conflict (both changed): freshest-wins keeps git's bytes on an mtime tie and re-pushes", async () => {
     const gitBytes = new Uint8Array([0xff, 0x01, 0x80, 0x02]);
     const s3Bytes = new Uint8Array([0xff, 0x09, 0x80, 0x0a]);
-    const entry = remoteEntry(s3Bytes);
+    const entry = remoteEntry(s3Bytes); // mtime == the IO's authorDate → tie → git side keeps
     const { io, writes } = makeIO({ local: { "x.bin": gitBytes }, remote: { "x.bin": s3Bytes } });
 
     const action = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
-    expect([...asUpload(action).content]).toEqual([...gitBytes]); // git wins, byte-clean
+    expect([...asUpload(action).content]).toEqual([...gitBytes]); // git wins the tie, byte-clean
     expect(writes.has("x.bin")).toBe(false); // working tree already has git's bytes
+  });
+
+  it("binary conflict: a strictly-newer S3 mtime wins freshest-wins → take remote, no push", async () => {
+    const gitBytes = new Uint8Array([0xff, 0x01, 0x80, 0x02]);
+    const s3Bytes = new Uint8Array([0xff, 0x09, 0x80, 0x0a]);
+    const entry = { ...remoteEntry(s3Bytes), mtime: "2027-01-01T00:00:00.000Z" } as SnapshotEntry;
+    const { io, writes } = makeIO({ local: { "x.bin": gitBytes }, remote: { "x.bin": s3Bytes } });
+
+    const action = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
+    expect(action).toBeNull(); // remote newer → nothing pushed up
+    expect([...writes.get("x.bin")!]).toEqual([...s3Bytes]); // working tree updated to S3's bytes
+  });
+
+  it("config JSON conflict resolves by freshest-wins, NOT union-merge (no line duplication)", async () => {
+    // A line-based union merge of divergent JSON stacks both sides → duplicated keys. Freshest-wins
+    // takes the whole newer side instead. Here S3 is newer, so its content wins verbatim.
+    const gitJson = encodeText('{"theme":"light"}\n');
+    const s3Json = encodeText('{"theme":"dark"}\n');
+    const entry = { ...remoteEntry(s3Json), mtime: "2027-01-01T00:00:00.000Z" } as SnapshotEntry;
+    const { io, writes } = makeIO({
+      local: { ".obsidian/appearance.json": gitJson },
+      remote: { ".obsidian/appearance.json": s3Json },
+      base: { ".obsidian/appearance.json": '{"theme":"system"}\n' },
+    });
+
+    const action = await reconcileFile(
+      ".obsidian/appearance.json",
+      "upsert",
+      entry,
+      { files: { ".obsidian/appearance.json": entry } },
+      io,
+    );
+    expect(action).toBeNull(); // remote newer → take it, nothing pushed
+    expect(decodeText(writes.get(".obsidian/appearance.json")!)).toBe(decodeText(s3Json)); // verbatim, not merged
   });
 
   it("text conflict (both changed): still three-way union-merges", async () => {

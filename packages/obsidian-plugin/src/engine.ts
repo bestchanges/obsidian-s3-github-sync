@@ -130,6 +130,12 @@ export class SyncEngine {
    * union-merging (kills the fresh-device default-config corruption). Cleared after the first pull.
    * See EngineOptions.firstRun and applyRemote(). */
   private bootstrap: boolean;
+  /** During a full-pull reconcile (resync), config-dir files (.obsidian/**) are taken from S3
+   * AS-IS instead of freshest-wins — on a resync S3 is authoritative for config. This is also the
+   * HEAL path for config a prior bad merge corrupted locally: the corrupted copy has a newer mtime
+   * and would otherwise win freshest-wins and propagate the corruption everywhere; forcing
+   * remote-wins for config on resync overwrites it with the correct S3 version. Notes still merge. */
+  private takeConfigFromRemote = false;
   // Serialization: one cycle runs at a time. Concurrent requests (poll / edit save / manual /
   // resync) coalesce into a single queued slot instead of overlapping — which used to let a resync
   // wipe the state mid-cycle while its own sync no-op'd. `running` holds the lock; `queuedReq` is
@@ -431,6 +437,11 @@ export class SyncEngine {
     const rev0 = this.state.lastSyncedRev;
     if (req.announce) this.notify(`Sync: started (${req.label})`, req.force);
 
+    // On a full-pull reconcile (resync) S3 is authoritative for config: take .obsidian/** from
+    // remote as-is rather than freshest-wins, so a locally-corrupted config with a newer mtime can't
+    // win and re-propagate. Ordinary cycles leave freshest-wins in charge.
+    this.takeConfigFromRemote = req.fullPull;
+
     if (req.resetCursor) {
       this.state.lastSyncedRev = 0;
       this.state.files = {};
@@ -536,7 +547,11 @@ export class SyncEngine {
     // into the canonical file would corrupt it and push the corruption everywhere, so treat every
     // collision as clean and take remote as-is. Local-only files (absent from remote) never reach
     // here, so genuine new content the user added before first sync still uploads normally.
-    const localDirty = !this.bootstrap && localBuf !== null && (!st || localHash !== st.hash);
+    const localDirty =
+      !this.bootstrap &&
+      !(this.takeConfigFromRemote && this.isConfigPath(path)) &&
+      localBuf !== null &&
+      (!st || localHash !== st.hash);
     if (!localDirty) {
       // Per-device download cap: oversized remote files stay in the cloud on this device to save
       // space. Leave local as-is and DON'T record — the file just isn't present here, so it's not
@@ -560,10 +575,14 @@ export class SyncEngine {
       return;
     }
 
-    // CONFLICT: changed locally AND remotely → union merge with versioned base (§1.5)
-    if (!this.isTextPath(path) || localBuf!.byteLength > LWW_SIZE_LIMIT) {
-      // last-writer-wins for binary/huge: keep local, re-push (never silently lose local edits)
-      this.dirty.add(path);
+    // CONFLICT: changed locally AND remotely.
+    // Config files (.obsidian/**) and binary/oversized content don't line-merge meaningfully —
+    // a line merge duplicates JSON lines and corrupts binaries — so resolve those by FRESHEST-WINS
+    // (the newer mtime takes the whole file). Freshest-wins also CONVERGES, unlike the old
+    // keep-local rule, which ping-pongs a fresh delta every poll while two devices hold divergent
+    // copies. Text notes within the size cap still three-way union-merge (lossless).
+    if (this.usesFreshestWins(path, localBuf!.byteLength)) {
+      await this.resolveFreshestWins(path, remote);
       return;
     }
     const baseObj = st?.s3VersionId
@@ -580,7 +599,10 @@ export class SyncEngine {
       decodeText(remoteObj.body),
     );
     await this.write(path, encodeText(merged.text), new Date().toISOString());
-    this.record(path, { ...remote, hash: contentHash(merged.text) });
+    // Do NOT record() the merged hash here: that would make push()'s mtime-only-touch guard
+    // (st.hash === hash) treat the merge as a no-op and DROP the upload, stranding the resolved
+    // conflict on this device forever. Leave the file dirty with its prior state so push() sees the
+    // change, uploads it, and records the true state (with the real s3VersionId from the PUT).
     this.dirty.add(path); // merged result must go back to S3
     this.merged++;
     if (merged.hadConflicts) {
@@ -588,6 +610,36 @@ export class SyncEngine {
       new Notice(`Sync: union-merged conflict in ${path}`);
     } else {
       this.opts.log("info", `merged ${path}`);
+    }
+  }
+
+  /** Which conflict strategy a path uses: config-dir files and binary/oversized content resolve by
+   * freshest-wins (see resolveFreshestWins); everything else three-way union-merges. */
+  private usesFreshestWins(path: string, localSize: number): boolean {
+    return this.isConfigPath(path) || !this.isTextPath(path) || localSize > LWW_SIZE_LIMIT;
+  }
+
+  /** Resolve a conflict by taking whichever side has the newer mtime — no bytes are synthesized, so
+   * both sync legs stay convergent even if clock skew makes them pick different sides on one pass.
+   * Remote newer → download and record it; local newer (or a tie) → keep local and re-push. */
+  private async resolveFreshestWins(path: string, remote: FileEntry & SnapshotEntry): Promise<void> {
+    const stat = await this.vault.adapter.stat(path);
+    const localMtime = stat ? new Date(stat.mtime).toISOString() : "";
+    if (remote.mtime > localMtime) {
+      const obj = await this.storage.get(`files/${path}`);
+      if (!obj) {
+        this.dirty.add(path); // remote vanished mid-resolve — keep local, re-push
+        return;
+      }
+      await this.write(path, obj.body, remote.mtime);
+      this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
+      this.pulled++;
+      this.merged++;
+      this.opts.log("info", `freshest-wins → remote ${path}`);
+    } else {
+      this.dirty.add(path); // local is newer (or tie) → keep it and push it up
+      this.merged++;
+      this.opts.log("info", `freshest-wins → local ${path}`);
     }
   }
 
@@ -660,60 +712,68 @@ export class SyncEngine {
   }
 
   private async push(): Promise<void> {
-    const paths = [...this.dirty].filter((p) => !this.isExcluded(p));
+    // Snapshot the dirty set and DRAIN it now. Vault events call markDirty() synchronously, so an
+    // edit saved DURING this (possibly multi-second) cycle then re-populates this.dirty and is
+    // pushed next cycle — the old blanket this.dirty.clear() at the end silently wiped such edits.
+    const snapshot = [...this.dirty];
+    const paths = snapshot.filter((p) => !this.isExcluded(p));
+    for (const p of snapshot) this.dirty.delete(p);
     if (paths.length === 0) return;
 
-    const files: Record<string, DeltaEntry> = {};
-    const newStates = new Map<string, FileState | null>();
+    try {
+      const files: Record<string, DeltaEntry> = {};
+      const newStates = new Map<string, FileState | null>();
 
-    await mapPool(paths, this.opts.concurrency, async (path) => {
-      // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
-      // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
-      const stat = await this.vault.adapter.stat(path);
-      if (!stat || stat.type !== "file") {
-        if (this.state.files[path]) {
-          files[path] = { deleted: true }; // deleted locally → tombstone
-          newStates.set(path, null);
-        }
-        return;
-      }
-      const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
-      const hash = contentHash(buf);
-      const st = this.state.files[path];
-      const mtime = new Date(stat.mtime).toISOString();
-      if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
-      const res = await this.storage.put(`files/${path}`, buf);
-      const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
-      files[path] = entry;
-      newStates.set(path, { hash, s3VersionId: res.versionId, mtime });
-    });
-
-    if (Object.keys(files).length === 0) {
-      this.dirty.clear();
-      return;
-    }
-
-    const result = await appendDelta(
-      this.storage,
-      this.state.lastSyncedRev + 1,
-      (rev): Delta => ({ rev, by: this.opts.deviceId, at: new Date().toISOString(), files }),
-      async (winner) => {
-        // lost the CAS race — apply the winner's entries before retrying (§1.3)
-        for (const [path, entry] of Object.entries(winner.files)) {
-          if (winner.by !== this.opts.deviceId && !(path in files)) {
-            await this.applyRemote(path, { ...entry, rev: winner.rev, by: winner.by });
+      await mapPool(paths, this.opts.concurrency, async (path) => {
+        // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
+        // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
+        const stat = await this.vault.adapter.stat(path);
+        if (!stat || stat.type !== "file") {
+          if (this.state.files[path]) {
+            files[path] = { deleted: true }; // deleted locally → tombstone
+            newStates.set(path, null);
           }
+          return;
         }
-      },
-    );
+        const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
+        const hash = contentHash(buf);
+        const st = this.state.files[path];
+        const mtime = new Date(stat.mtime).toISOString();
+        if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
+        const res = await this.storage.put(`files/${path}`, buf);
+        const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
+        files[path] = entry;
+        newStates.set(path, { hash, s3VersionId: res.versionId, mtime });
+      });
 
-    for (const [path, st] of newStates) {
-      if (st === null) delete this.state.files[path];
-      else this.state.files[path] = st;
+      if (Object.keys(files).length === 0) return;
+
+      const result = await appendDelta(
+        this.storage,
+        this.state.lastSyncedRev + 1,
+        (rev): Delta => ({ rev, by: this.opts.deviceId, at: new Date().toISOString(), files }),
+        async (winner) => {
+          // lost the CAS race — apply the winner's entries before retrying (§1.3)
+          for (const [path, entry] of Object.entries(winner.files)) {
+            if (winner.by !== this.opts.deviceId && !(path in files)) {
+              await this.applyRemote(path, { ...entry, rev: winner.rev, by: winner.by });
+            }
+          }
+        },
+      );
+
+      for (const [path, st] of newStates) {
+        if (st === null) delete this.state.files[path];
+        else this.state.files[path] = st;
+      }
+      this.state.lastSyncedRev = result.rev;
+      this.pushed += Object.keys(files).length;
+    } catch (err) {
+      // Push failed — requeue the paths we drained so the next cycle retries them (§2.6). Edits
+      // that arrived mid-cycle are already back in this.dirty; re-adding is a harmless Set no-op.
+      for (const p of paths) this.dirty.add(p);
+      throw err;
     }
-    this.state.lastSyncedRev = result.rev;
-    this.pushed += Object.keys(files).length;
-    this.dirty.clear();
   }
 
   // ------------------------------------------------------------- helpers
