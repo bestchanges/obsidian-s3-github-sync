@@ -82,10 +82,11 @@ with the **minor** bumped, patch → 0, e.g. `0.5.2 → 0.6.0`), bumps `manifest
 `versions.json` and commits that back to `main`, publishes a GitHub Release tagged `<version>` (tag =
 `manifest.version`, no `v` prefix) with `main.js` / `manifest.json` / `versions.json` attached, then
 fires a `repository_dispatch` at the vault repo to install it. So: **just merge — no manual bump.**
-Every merge ships a release; if you don't want that for a given change, hold it out of `main`. A red
-build (tests/typecheck) blocks the release. To re-deploy an existing tag to the vault without bumping,
-run the workflow via **workflow_dispatch** with that `tag`. Requires repo var `VAULT_REPO` + secret
-`VAULT_DEPLOY_TOKEN` (SETUP.md).
+Only merges that touch what ships (`packages/obsidian-plugin/**`, `packages/core/**`, or the
+workflow itself) cut a release — docs/git-sync/infra-only merges don't. A red build (tests/typecheck)
+blocks the release. To re-deploy an existing tag to the vault without bumping, run the workflow via
+**workflow_dispatch** with that `tag`. Requires repo var `VAULT_REPO` + secret `VAULT_DEPLOY_TOKEN`
+(SETUP.md).
 
 The workflow only ever bumps the **minor**. To change **`minAppVersion`**, edit it in
 `packages/obsidian-plugin/manifest.json` and merge — the auto-bump carries it into the new

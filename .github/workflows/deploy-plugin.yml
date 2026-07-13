@@ -29,6 +29,14 @@ name: Release plugin on merge to main
 on:
   push:
     branches: [main]
+    # Only cut a release when something that actually ships in the bundle changed. A merge that
+    # touches only git-sync, docs, or other infra doesn't rebuild the plugin, so it shouldn't bump
+    # the version or redeploy to the vault. The workflow file itself is included so changes to the
+    # release pipeline are exercised. (paths applies to push only, not workflow_dispatch.)
+    paths:
+      - "packages/obsidian-plugin/**"
+      - "packages/core/**"
+      - ".github/workflows/deploy-plugin.yml"
   workflow_dispatch:
     inputs:
       tag:
