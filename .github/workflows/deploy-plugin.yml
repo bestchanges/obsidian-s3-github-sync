@@ -44,14 +44,8 @@ jobs:
       - run: npm ci
 
       - name: Run tests
-        timeout-minutes: 6 # tests run in ~1s; a stuck run fails fast with logs, not a silent wedge
-        run: |
-          node --version
-          npx vitest --version || true
-          # Hard SIGKILL cap so a wedged vitest can't hang the runner past the diagnostic window,
-          # and verbose output shows exactly which test (if any) stalls vs. a clean-but-stuck exit.
-          timeout --signal=SIGKILL 150 npx vitest run --reporter=verbose --no-file-parallelism
-          echo "tests exited $?"
+        timeout-minutes: 6 # tests run in ~1s; a stuck run fails fast instead of silently wedging
+        run: npm test
 
       - name: Typecheck
         run: npm run typecheck
