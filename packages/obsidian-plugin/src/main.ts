@@ -1,6 +1,7 @@
 import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
+import { SyncLogger } from "./logger";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
 
@@ -27,6 +28,10 @@ interface Settings {
    * refused with a notice. Edits are still tracked (marked dirty) and flush once resumed. Use it to
    * finish configuring plugins on a new device before the first sync, or to pause temporarily. */
   syncPaused: boolean;
+  /** Write a persistent, browsable log to disk and ship this device's recent tail to S3 (readable
+   * from any device's settings). Off by default: no disk writes, no PUTs, and no note paths leave
+   * the device until enabled. Toggle it on to investigate a sync issue. */
+  loggingEnabled: boolean;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -44,6 +49,7 @@ const DEFAULT_SETTINGS: Settings = {
   mobileConcurrency: 8,
   desktopConcurrency: 50,
   syncPaused: false,
+  loggingEnabled: false,
 };
 
 interface PersistedData {
@@ -84,6 +90,7 @@ const PUSH_DEBOUNCE_MS = 5_000; // §2.2
 
 export default class S3SyncPlugin extends Plugin {
   settings: Settings = DEFAULT_SETTINGS;
+  logger!: SyncLogger;
   private syncState: SyncState = { lastSyncedRev: 0, files: {} };
   private engine: SyncEngine | null = null;
   private pushTimer: number | null = null;
@@ -97,6 +104,11 @@ export default class S3SyncPlugin extends Plugin {
   async onload(): Promise<void> {
     const data = ((await this.loadData()) ?? {}) as LegacyData;
     this.settings = { ...DEFAULT_SETTINGS, ...data.settings };
+    this.logger = new SyncLogger({
+      adapter: this.app.vault.adapter,
+      logPath: this.logPath(),
+      enabled: () => this.settings.loggingEnabled,
+    });
     this.syncState = await this.loadState(data.syncState);
     await this.ensureDeviceIdentity();
 
@@ -150,6 +162,7 @@ export default class S3SyncPlugin extends Plugin {
   onunload(): void {
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     if (this.pollTimer) window.clearInterval(this.pollTimer);
+    void this.logger?.flush(); // best-effort: land any buffered lines before teardown
   }
 
   configured(): boolean {
@@ -253,7 +266,7 @@ export default class S3SyncPlugin extends Plugin {
       if (how === "shared") new Notice(`${vaultName}.zip ready — choose where to send it.`);
       else if (how === "downloaded") new Notice(`Saved ${vaultName}.zip to your downloads.`);
     } catch (err) {
-      console.error("[s3-sync] starter export failed", err);
+      this.logger.error("starter export failed", err);
       new Notice(`Setup vault export failed: ${String(err)}`);
     }
   }
@@ -263,6 +276,7 @@ export default class S3SyncPlugin extends Plugin {
   async setSyncPaused(paused: boolean): Promise<void> {
     this.settings.syncPaused = paused;
     await this.persistSettings();
+    this.logger.info(paused ? "sync paused by user" : "sync resumed by user");
     if (paused) {
       new Notice("S3 Vault Sync paused — no syncing until you resume.");
     } else {
@@ -281,12 +295,15 @@ export default class S3SyncPlugin extends Plugin {
       new Notice("S3 Vault Sync is paused — resume it in settings before resyncing.");
       return;
     }
+    this.logger.info("manual resync started");
     try {
       await this.engine.resyncEverything();
+      this.logger.info("manual resync finished");
     } catch (err) {
-      console.error("[s3-sync] resync failed", err);
+      this.logger.error("resync failed", err);
       new Notice(`S3 resync failed: ${String(err)}`);
     }
+    void this.logger.uploadIfDirty();
   }
 
   /** Collect the link/embed targets of a note as Obsidian linkpaths. Uses BOTH the resolved-links
@@ -325,7 +342,7 @@ export default class S3SyncPlugin extends Plugin {
       if (r.notFound.length) parts.push(`${r.notFound.length} not found in cloud`);
       new Notice(`S3 Vault Sync: ${parts.join(", ")}.`);
     } catch (err) {
-      console.error("[s3-sync] force download failed", err);
+      this.logger.error("force download failed", err);
       new Notice(`S3 Vault Sync: force download failed — ${String(err)}`);
     }
   }
@@ -333,21 +350,25 @@ export default class S3SyncPlugin extends Plugin {
   rebuildEngine(): void {
     if (!this.configured()) {
       this.engine = null;
+      this.logger.setRemote(null, this.settings.deviceId);
       return;
     }
     const isMobile = (this.app as unknown as { isMobile?: boolean }).isMobile === true;
+    const storage = new S3FetchAdapter({
+      bucket: this.settings.bucket,
+      region: this.settings.region,
+      accessKeyId: this.settings.accessKeyId,
+      secretAccessKey: this.settings.secretAccessKey,
+      prefix: this.settings.prefix,
+    });
+    this.logger.setRemote(storage, this.settings.deviceId);
     this.engine = new SyncEngine(
       this.app.vault,
-      new S3FetchAdapter({
-        bucket: this.settings.bucket,
-        region: this.settings.region,
-        accessKeyId: this.settings.accessKeyId,
-        secretAccessKey: this.settings.secretAccessKey,
-        prefix: this.settings.prefix,
-      }),
+      storage,
       this.syncState,
       {
         deviceId: this.settings.deviceId,
+        log: (level, msg) => this.logger.log(level, msg),
         selfDir: this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync",
         excludedFolders: this.settings.excludedFolders,
         maxDownloadBytes: this.settings.maxDownloadMB > 0
@@ -368,11 +389,13 @@ export default class S3SyncPlugin extends Plugin {
 
   private async startup(): Promise<void> {
     this.rebuildEngine();
+    this.logger.info(`startup: device "${this.settings.deviceId}", ${this.app.vault.getName()}`);
     if (!this.engine) {
       new Notice("S3 Vault Sync: not configured (see settings)");
       return;
     }
     if (this.foreignStateDetected) {
+      this.logger.info(`foreign state detected — new device "${this.settings.deviceId}", full resync`);
       new Notice(`S3 Vault Sync: new device "${this.settings.deviceId}" — running a full resync`);
     }
     if (this.settings.syncPaused) {
@@ -422,16 +445,22 @@ export default class S3SyncPlugin extends Plugin {
       this.syncFailures = 0;
     } catch (err) {
       this.syncFailures += 1;
-      console.error(`[s3-sync] ${reason} failed`, err);
+      this.logger.error(`${reason} failed`, err);
       if (this.syncFailures === 1 || this.syncFailures % 10 === 0) {
         new Notice(`S3 sync failed (${reason}) — will keep retrying. ${String(err)}`);
       }
       // dirty set is preserved; next poll retries (§2.6)
     }
+    // Ship this device's log tail (no-op unless logging is on and there's new content).
+    void this.logger.uploadIfDirty();
   }
 
   private statePath(): string {
     return normalizePath(`${this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync"}/state.json.gz`);
+  }
+
+  private logPath(): string {
+    return normalizePath(`${this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync"}/sync.log`);
   }
 
   /** Load per-device sync state from its gzipped file; migrate an older embedded state once. */
@@ -444,7 +473,7 @@ export default class S3SyncPlugin extends Plugin {
         return deserializeState(decodeJsonGz<CompactState>(buf));
       }
     } catch (err) {
-      console.error("[s3-sync] state file unreadable — starting fresh (a resync will rebuild it)", err);
+      this.logger.error("state file unreadable — starting fresh (a resync will rebuild it)", err);
     }
     if (legacy && (legacy.lastSyncedRev || Object.keys(legacy.files ?? {}).length)) {
       await this.writeStateFile(legacy); // one-time migration out of data.json
@@ -560,5 +589,100 @@ class S3SyncSettingTab extends PluginSettingTab {
       )
       .addButton((b) =>
         b.setButtonText("Export setup vault").setCta().onClick(() => void this.plugin.exportStarterVault()));
+
+    this.renderLogsSection(containerEl, s, save);
+  }
+
+  /** "Logs" section: on/off toggle, a per-device picker (this device + everything shipped to S3),
+   * a read-only viewer (newest line first), and refresh / copy / clear actions. */
+  private renderLogsSection(
+    containerEl: HTMLElement,
+    s: Settings,
+    save: () => Promise<void>,
+  ): void {
+    const { logger } = this.plugin;
+    containerEl.createEl("h3", { text: "Logs" });
+
+    new Setting(containerEl)
+      .setName("Enable logging")
+      .setDesc(
+        "Write a persistent log to disk and ship this device's recent activity to S3 so it's " +
+          "readable from any device below. Off by default. Log lines include note paths (never " +
+          "credentials) and are stored in your bucket.",
+      )
+      .addToggle((t) =>
+        t.setValue(s.loggingEnabled).onChange(async (v) => {
+          s.loggingEnabled = v;
+          await save();
+        }));
+
+    // "" selects this device (read fresh from disk); any other value is a remote deviceId.
+    let selected = "";
+    const viewer = containerEl.createEl("textarea", { cls: "s3-sync-log-viewer" });
+    viewer.readOnly = true;
+    Object.assign(viewer.style, {
+      width: "100%",
+      height: "16em",
+      fontFamily: "monospace",
+      fontSize: "12px",
+      whiteSpace: "pre",
+      overflow: "auto",
+    });
+
+    // Newest first: the on-disk file is chronological (append order); the viewer reverses it.
+    const newestFirst = (text: string): string =>
+      text.split("\n").filter((l) => l.length > 0).reverse().join("\n");
+
+    const loadView = async (): Promise<void> => {
+      viewer.value = "Loading…";
+      const text = selected === "" ? await logger.tail() : await logger.readRemote(selected);
+      viewer.value = newestFirst(text) || "(empty)";
+      viewer.scrollTop = 0;
+    };
+
+    const picker = new Setting(containerEl).setName("Show log from");
+    const rebuildPicker = async (): Promise<void> => {
+      const devices = await logger.listRemoteDevices();
+      picker.clear();
+      picker.addDropdown((d) => {
+        d.addOption("", `This device (${s.deviceId})`);
+        for (const { deviceId } of devices) {
+          if (deviceId === s.deviceId) continue; // already covered by "This device"
+          d.addOption(deviceId, deviceId);
+        }
+        d.setValue(selected).onChange((v) => {
+          selected = v;
+          void loadView();
+        });
+      });
+    };
+
+    new Setting(containerEl)
+      .addButton((b) =>
+        b.setButtonText("Refresh").onClick(async () => {
+          await logger.flush();
+          await rebuildPicker();
+          await loadView();
+        }))
+      .addButton((b) =>
+        b.setButtonText("Copy").onClick(async () => {
+          try {
+            await navigator.clipboard.writeText(viewer.value);
+            new Notice("Log copied to clipboard.");
+          } catch {
+            new Notice("Couldn't copy — select the text and copy manually.");
+          }
+        }))
+      .addButton((b) =>
+        b.setButtonText("Clear logs").setWarning().onClick(async () => {
+          await logger.clear();
+          selected = "";
+          await rebuildPicker();
+          await loadView();
+          new Notice("Logs cleared on this device.");
+        }));
+
+    void rebuildPicker();
+    void loadView();
   }
 }

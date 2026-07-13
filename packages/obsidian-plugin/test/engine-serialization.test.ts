@@ -66,6 +66,7 @@ function makeEngine(state: SyncState, storage: GatedStorage) {
     concurrency: 4,
     maxDownloadBytes: 0,
     verbose: true, // fire notices for non-forced (poll/edit) cycles too, so we can assert them
+    log: () => {},
     onStateChanged: async (s) => {
       persisted.push(s);
     },
