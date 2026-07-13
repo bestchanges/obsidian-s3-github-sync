@@ -29,6 +29,9 @@ const ALWAYS_EXCLUDED = [".sync/", ".git/", ".github/", ".sync-tool/", ".trash/"
 /** git-side-only metadata: must never be synced as vault content — a vault that lacks these
  * would otherwise tombstone them out of S3 (and thus out of the repo). Matched by basename. */
 const GIT_META_FILES = new Set([".gitignore", ".gitattributes", ".gitmodules", ".s3syncignore"]);
+/** Basenames inside this plugin's own install dir that are per-device and must never sync: its creds
+ * and its on-disk log (+ rotation backup). Matched by full path against selfDir in isExcluded(). */
+const SELF_DIR_EXCLUDED = new Set(["data.json", "sync.log", "sync.log.1"]);
 /** Per-device files that must never sync anywhere: OS cruft, Obsidian's workspace UI state, and
  * this plugin's own gzipped cursor. Enforced here (not only via .gitignore) so they can't leak on
  * either leg. NOTE: this plugin's data.json (its creds) is per-device too but is excluded by full
@@ -80,6 +83,10 @@ export interface EngineOptions {
   maxDownloadBytes: number;
   /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
   verbose: boolean;
+  /** Persistent logger sink — the plugin routes this to disk + S3 (SyncLogger). Every Notice the
+   * engine raises is also logged here, plus per-cycle summaries and conflict warnings, so mobile
+   * (no DevTools) still has a trail. */
+  log: (level: "info" | "warn" | "error", msg: string) => void;
   /** First-ever sync on this device: the local state has never been persisted, so files that
    * collide with remote are Obsidian's just-generated config defaults (or a copied scratch state),
    * NOT genuine edits. When true the first pull takes remote as-is on any collision instead of
@@ -139,9 +146,11 @@ export class SyncEngine {
   // cycle it queued has run. Only forced cycles set it; ordinary cycles leave it untouched.
   private forceResult: ForceDownloadResult | null = null;
 
-  /** show a Notice; gated by verbose unless force=true (errors/conflicts/user actions) */
+  /** show a Notice; gated by verbose unless force=true (errors/conflicts/user actions). Always
+   * logged (a Notice is transient; the log persists). */
   private notify(msg: string, force = false): void {
     if (force || this.opts.verbose) new Notice(msg);
+    this.opts.log("info", msg);
   }
 
   /** Per-device download gate: 0 = unlimited. Unknown size → allow (correctness over space). */
@@ -163,7 +172,10 @@ export class SyncEngine {
   isExcluded(path: string): boolean {
     const base = path.split("/").pop() ?? "";
     if (GIT_META_FILES.has(base) || isPerDeviceFile(path)) return true;
-    if (path === `${this.opts.selfDir}/data.json`) return true; // our creds — per-device
+    // Per-device files inside our own install dir: creds (data.json) and the on-disk log + its
+    // rotation backup. The plugin dir otherwise syncs (self-deploy channel), so these must be held
+    // back by full path or they'd propagate as ordinary vault content.
+    if (SELF_DIR_EXCLUDED.has(base) && path === `${this.opts.selfDir}/${base}`) return true;
     const folders = [...ALWAYS_EXCLUDED, ...this.opts.excludedFolders.map((f) => f.replace(/\/?$/, "/"))];
     return folders.some((f) => path.startsWith(f));
   }
@@ -571,7 +583,12 @@ export class SyncEngine {
     this.record(path, { ...remote, hash: contentHash(merged.text) });
     this.dirty.add(path); // merged result must go back to S3
     this.merged++;
-    if (merged.hadConflicts) this.notify(`Sync: union-merged conflict in ${path}`, true);
+    if (merged.hadConflicts) {
+      this.opts.log("warn", `union-merged conflict in ${path}`);
+      new Notice(`Sync: union-merged conflict in ${path}`);
+    } else {
+      this.opts.log("info", `merged ${path}`);
+    }
   }
 
   /** Fetch the given candidates from S3 ignoring the size cap (§4.7.1). Resolves each

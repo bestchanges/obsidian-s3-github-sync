@@ -72,6 +72,7 @@ function makeEngine(storage: MemStorage, written: Map<string, Uint8Array>, maxDo
     concurrency: 4,
     maxDownloadBytes, // cap is deliberately small; forceDownload must ignore it
     verbose: false,
+    log: () => {},
     onStateChanged: async () => {},
   });
   return { engine, state };

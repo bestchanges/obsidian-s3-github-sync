@@ -57,6 +57,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/engine.ts` | `SyncEngine`: pull/push, merge, exclusions, offline scan, download cap, resync. |
 | `packages/obsidian-plugin/src/main.ts` | Plugin lifecycle, persistence, device identity, settings UI, commands. |
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
+| `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
 | `templates/s3-sync.yml` | The Actions workflow the content repo installs. |
 
@@ -74,7 +75,12 @@ s3://<bucket>/<prefix>/
   snapshot.json.gz            ← folded state, written only by git-sync
   deltas/<pad10(rev)>.json.gz ← append-only journal, one object per write
   files/<vault-path>          ← file contents, mirrors vault structure
+  _logs/<deviceId>.log        ← plugin diagnostic log, one per device (side-channel, §4.11)
 ```
+
+The `_logs/` prefix is a **side-channel outside the delta journal**: nothing reads it as vault
+content, so it is invisible to both sync legs (never union-merged, never mirrored into the GitHub
+repo). Only the plugin writes/reads it, and only when logging is enabled (§4.11).
 
 `<prefix>` is optional (e.g. `vaults3sync/`) so several vaults can share a bucket — the plugin's
 `prefix` setting and git-sync's `PREFIX` env must match (§7, §8). Bucket has **S3 Versioning ON**
@@ -252,8 +258,9 @@ the POC, which excluded `.obsidian` wholesale. Only a small **per-device denylis
 - `GIT_META_FILES` by basename: `.gitignore`, `.gitattributes`, `.gitmodules`, `.s3syncignore`
   (a vault lacking these must not tombstone them out of the repo);
 - `isPerDeviceFile(path)`: basename `.DS_Store` or `state.json.gz`, or `.obsidian/workspace*.json`;
-- **this plugin's own** `data.json` (`<selfDir>/data.json`) — it holds the AWS creds and is
-  per-device. Matched by full path so **other** plugins' `data.json` still syncs;
+- **this plugin's own** per-device files under `<selfDir>` — `data.json` (AWS creds), `sync.log`, and
+  `sync.log.1` (the diagnostic log + its rotation backup, §4.11). Matched by the full `<selfDir>/…`
+  path (basename set `SELF_DIR_EXCLUDED`) so **other** plugins' `data.json`/`sync.log` still sync;
 - `ALWAYS_EXCLUDED` prefixes: `.sync/`, `.git/`, `.github/`, `.sync-tool/`, `.trash/`;
 - user-configured `excludedFolders` (local-only until re-enabled; re-enabling is a scoped first-run
   union merge).
@@ -347,6 +354,36 @@ the zip **root**, outside `vault/`, so they never sync to S3. `deliverFile` adap
 > It must, so the new device can connect. The button description and bundled README warn to transfer
 > it privately and delete it after setup.
 
+## 4.11 Diagnostic logging (`logger.ts`)
+
+Because mobile Obsidian has **no developer console**, field issues (duplication, conflicts, silent
+no-ops) were previously un-debuggable. `SyncLogger` gives a persistent, browsable trail. It is
+**off by default** — the `loggingEnabled` setting (per-device `data.json`) gates it, so with logging
+off there are no disk writes, no S3 PUTs, and no note paths leave the device.
+
+- **On disk.** Timestamped lines (`<ISO> LEVEL message`, levels `INFO/WARN/ERROR`) are buffered and
+  flushed on a ~1 s debounce to `<selfDir>/sync.log`. When the active file passes **512 KB** it rolls
+  to `sync.log.1` (one backup kept) and a fresh active file starts. Both are per-device and excluded
+  from sync (§4.6). Every op is wrapped — **logging never throws into the sync path**. Lines also
+  mirror to the console so desktop DevTools still works.
+- **Sources.** The engine receives a `log(level, msg)` callback via `EngineOptions`: every `Notice`
+  it raises is also logged, plus per-cycle transfer summaries and `WARN` on union-merge conflicts.
+  `main.ts` logs lifecycle events (startup, pause/resume, foreign-state resync, manual resync) and
+  routes its former `console.error` sites through `logger.error`.
+- **S3 shipping.** After each sync cycle (piggybacking the poll cadence, no extra timer),
+  `uploadIfDirty()` PUTs this device's recent tail (~256 KB) to `_logs/<deviceId>.log` — but only
+  when logging is on and there is new content since the last upload. This is a side-channel outside
+  the journal (§2.1), so logs never union-merge and never reach the GitHub repo.
+- **Settings viewer.** A "Logs" section offers the on/off toggle, a **per-device picker** (This
+  device — read fresh from disk — plus every device found under `_logs/`, newest first), a read-only
+  monospace viewer showing the tail **newest line first**, and Refresh / Copy / **Clear logs**. Clear
+  wipes this device's local files and its own `_logs/<deviceId>.log`; other devices' remote logs are
+  untouched.
+
+> [!note] Privacy
+> Log lines contain **note paths** (never credentials). Shipping to `_logs/` exposes those paths to
+> anyone who can read the bucket — the same audience that already holds the entire vault (§10).
+
 ---
 
 # 5. git-sync — `packages/git-sync`
@@ -432,6 +469,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | other plugins' `data.json` | syncs | syncs | distribute plugin settings |
 | `community-plugins.json`, `core-plugins.json` | syncs | syncs | auto-enable plugins everywhere |
 | `vault-s3-sync/data.json` | excluded | excluded | our AWS creds, per-device |
+| `vault-s3-sync/sync.log`, `sync.log.1` | excluded | excluded | per-device diagnostic log (§4.11) |
 | `state.json.gz` | excluded | excluded | per-device sync cursor |
 | `.obsidian/workspace*.json` | excluded | excluded | per-device UI layout |
 | `.DS_Store` | excluded | excluded | OS cruft |
@@ -460,6 +498,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `maxDownloadMB` | **10** | 0 = no limit |
 | `verbose` | false | notice on every active cycle |
 | `mobileConcurrency` / `desktopConcurrency` | 8 / 50 | transfer parallelism |
+| `loggingEnabled` | **false** | disk + S3 diagnostic log (§4.11) |
 
 ## 7.2 git-sync env (set by the workflow)
 
@@ -544,6 +583,10 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Delta retention | 30 days | `RETENTION_DAYS` |
 | `applying` echo window | 500 ms | engine.ts |
 | CAS attempts | 100 | `appendDelta` |
+| Log rotation cap | 512 KB active → `.1` backup | `ROTATE_BYTES` (logger.ts) |
+| Log S3 upload tail | 256 KB | `UPLOAD_BYTES` (logger.ts) |
+| Log flush debounce | 1 s | `FLUSH_DEBOUNCE_MS` (logger.ts) |
+| Log S3 namespace | `_logs/<deviceId>.log` | `LOG_PREFIX` (logger.ts) |
 
 ---
 

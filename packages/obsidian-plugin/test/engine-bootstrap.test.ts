@@ -86,6 +86,7 @@ function makeEngine(storage: MemStorage, disk: Map<string, Uint8Array>, firstRun
     concurrency: 4,
     maxDownloadBytes: 0,
     verbose: false,
+    log: () => {},
     firstRun,
     onStateChanged: async () => {},
   });
