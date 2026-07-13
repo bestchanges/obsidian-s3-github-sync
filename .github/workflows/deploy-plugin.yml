@@ -1,84 +1,157 @@
-# Builds the Obsidian plugin and ships it to the vault content repo.
+# Cuts a new Obsidian-plugin release on every merge to main and ships it to the vault content repo.
 #
-# On a published release (tag == manifest.version, no "v" prefix) this workflow:
-#   1. installs, tests, typechecks, and builds the plugin (the CI gate before any deploy);
-#   2. (re)uploads the built main.js / manifest.json / versions.json to the release assets, so the
-#      release always carries a reproducible CI build (this is also the BRAT channel);
-#   3. fires a repository_dispatch at the vault repo, whose install-plugin.yml pulls those assets into
+# On a push to main this workflow:
+#   1. installs, tests, typechecks, and builds the plugin (the CI gate — a red build blocks release);
+#   2. computes the next version = the highest existing release tag / committed manifest version with
+#      the MINOR bumped and patch reset (e.g. 0.5.2 → 0.6.0), and bumps manifest.json / package.json /
+#      versions.json to it;
+#   3. commits that bump back to main (best-effort: a protected branch just skips the commit — the
+#      release TAGS, not the committed manifest, are what the next bump is computed from);
+#   4. creates a GitHub Release tagged <version> (tag == manifest.version, no "v" prefix) with the
+#      built main.js / manifest.json / versions.json attached — a reproducible CI build, also the
+#      BRAT channel;
+#   5. fires a repository_dispatch at the vault repo, whose install-plugin.yml pulls those assets into
 #      .obsidian/plugins/ and pushes — the vault's own s3-sync then propagates them to S3 + devices.
 #
-# One-time setup (see the PR description / SETUP.md):
+# workflow_dispatch(tag) re-deploys an EXISTING release to the vault without bumping (recovery path):
+# it just re-fires the dispatch for that tag; the release already carries its built assets.
+#
+# The bump commit is pushed with the default GITHUB_TOKEN, whose pushes do NOT trigger new workflow
+# runs, so this can't loop; the "[skip ci]" marker is a belt-and-suspenders guard if a PAT is ever
+# swapped in.
+#
+# One-time setup (see SETUP.md):
 #   - repo VARIABLE  VAULT_REPO          = owner/name of the vault content repo (e.g. bestchanges/gsd2)
 #   - repo SECRET    VAULT_DEPLOY_TOKEN  = a fine-grained PAT scoped to that repo with
 #                                          "Contents: Read and write" (needed to send it a dispatch)
-name: Deploy plugin to vault repo
+name: Release plugin on merge to main
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to (re)deploy (e.g. 0.5.0)"
+        description: "Existing release tag to re-deploy to the vault (e.g. 0.6.0)"
         required: true
 
 permissions:
-  contents: write # upload the built files to the release assets
+  contents: write # push the version-bump commit, create the release, upload assets
 
 concurrency:
-  group: deploy-plugin
+  group: release-plugin # serialize releases so back-to-back merges tag in order, never in parallel
   cancel-in-progress: false
 
 jobs:
-  build-and-dispatch:
+  release:
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # a wedged step fails fast instead of hanging the deploy
+    timeout-minutes: 15 # a wedged step fails fast instead of hanging the release
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history + tags: needed to compute the next version and to push the bump
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
-      - run: npm ci
+      # ---- decide mode + target version ---------------------------------------------------------
+      - name: Resolve version
+        id: v
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+        run: |
+          if [ -n "$DISPATCH_TAG" ]; then
+            # Manual re-deploy of an existing tag — no build, no bump, just re-dispatch below.
+            echo "mode=redeploy" >> "$GITHUB_OUTPUT"
+            echo "version=$DISPATCH_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --tags --quiet
+          # next = max(existing semver tags, committed manifest.version) with MINOR bumped, patch → 0.
+          # Deriving from tags (not just the checked-out manifest) keeps queued back-to-back releases
+          # monotonic even if a PR was branched before an earlier auto-bump landed.
+          TAGS="$(git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
+          MANIFEST="$(node -p "require('./packages/obsidian-plugin/manifest.json').version")"
+          NEXT="$(printf '%s\n%s\n' "$TAGS" "$MANIFEST" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+                    | sort -V | tail -1 | awk -F. '{print $1"."$2+1".0"}')"
+          if git rev-parse -q --verify "refs/tags/$NEXT" >/dev/null; then
+            echo "::error::Computed tag $NEXT already exists — aborting to avoid clobbering a release."
+            exit 1
+          fi
+          echo "mode=release" >> "$GITHUB_OUTPUT"
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+
+      # ---- build + release (release mode only) --------------------------------------------------
+      - name: Install
+        if: steps.v.outputs.mode == 'release'
+        run: npm ci
 
       - name: Run tests
+        if: steps.v.outputs.mode == 'release'
         timeout-minutes: 6 # tests run in ~1s; a stuck run fails fast instead of silently wedging
         run: npm test
 
       - name: Typecheck
+        if: steps.v.outputs.mode == 'release'
         run: npm run typecheck
 
+      - name: Bump version
+        if: steps.v.outputs.mode == 'release'
+        run: npm run bump:plugin -- "${{ steps.v.outputs.version }}"
+
       - name: Build plugin
+        if: steps.v.outputs.mode == 'release'
         run: PLUGIN_SOURCEMAP=false npm run build:plugin
 
-      - name: Resolve tag and verify it matches manifest.version
-        id: v
-        env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      - name: Verify built version matches target
+        if: steps.v.outputs.mode == 'release'
         run: |
-          VERSION="$(node -p "require('./packages/obsidian-plugin/manifest.json').version")"
-          if [ "$TAG" != "$VERSION" ]; then
-            echo "::error::Release tag ($TAG) != manifest.version ($VERSION). The tag must equal the plugin version with no 'v' prefix."
+          BUILT="$(node -p "require('./packages/obsidian-plugin/dist/manifest.json').version")"
+          if [ "$BUILT" != "${{ steps.v.outputs.version }}" ]; then
+            echo "::error::Built manifest version ($BUILT) != target (${{ steps.v.outputs.version }})."
             exit 1
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Upload the CI build to the release assets
+      - name: Commit version bump back to main
+        if: steps.v.outputs.mode == 'release'
+        continue-on-error: true # protected main simply skips this; tags stay the source of truth
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/obsidian-plugin/manifest.json \
+                  packages/obsidian-plugin/package.json \
+                  packages/obsidian-plugin/versions.json
+          if git diff --cached --quiet; then
+            echo "no version files changed — nothing to commit"
+          else
+            git commit -m "chore(release): ${{ steps.v.outputs.version }} [skip ci]"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+      - name: Create the release
+        if: steps.v.outputs.mode == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ steps.v.outputs.tag }}" \
+          # Tag the commit that triggered this run (github.sha): it is always on the remote, whether
+          # or not the best-effort bump-commit push above succeeded. The attached assets carry the
+          # bumped version regardless — that is what BRAT and the vault deploy consume.
+          gh release create "${{ steps.v.outputs.version }}" \
             packages/obsidian-plugin/dist/main.js \
             packages/obsidian-plugin/dist/manifest.json \
             packages/obsidian-plugin/dist/versions.json \
-            --clobber --repo "${{ github.repository }}"
+            --title "${{ steps.v.outputs.version }}" \
+            --generate-notes \
+            --target "${{ github.sha }}" \
+            --repo "${{ github.repository }}"
 
+      # ---- deploy to the vault repo (both modes) ------------------------------------------------
       - name: Trigger install on the vault repo
         env:
           GH_TOKEN: ${{ secrets.VAULT_DEPLOY_TOKEN }}
-          TAG: ${{ steps.v.outputs.tag }}
+          TAG: ${{ steps.v.outputs.version }}
           TOOL_REPO: ${{ github.repository }}
           VAULT_REPO: ${{ vars.VAULT_REPO }}
         run: |

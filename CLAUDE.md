@@ -76,13 +76,25 @@ bundle without the inline sourcemap.
 
 ### Release process
 
-1. **Bump the version** (semver): `npm run bump:plugin -- 0.2.0`. If `minAppVersion` needs to change,
-   edit `packages/obsidian-plugin/manifest.json` first, then bump (the new `versions.json` entry
-   picks it up).
-2. **Verify:** `npm test && npm run typecheck`.
-3. **Build the package:** `npm run build:plugin` → check the printed version and `dist/` output.
-4. **Commit** the bumped `manifest.json` / `package.json` / `versions.json` (`dist/` is gitignored).
-5. **Ship** by whichever channel:
+**Automated (default):** every **merge to `main`** cuts the next release. `.github/workflows/deploy-plugin.yml`
+tests/typechecks/builds, computes the next version (highest existing release tag / manifest version
+with the **minor** bumped, patch → 0, e.g. `0.5.2 → 0.6.0`), bumps `manifest.json` / `package.json` /
+`versions.json` and commits that back to `main`, publishes a GitHub Release tagged `<version>` (tag =
+`manifest.version`, no `v` prefix) with `main.js` / `manifest.json` / `versions.json` attached, then
+fires a `repository_dispatch` at the vault repo to install it. So: **just merge — no manual bump.**
+Every merge ships a release; if you don't want that for a given change, hold it out of `main`. A red
+build (tests/typecheck) blocks the release. To re-deploy an existing tag to the vault without bumping,
+run the workflow via **workflow_dispatch** with that `tag`. Requires repo var `VAULT_REPO` + secret
+`VAULT_DEPLOY_TOKEN` (SETUP.md).
+
+The workflow only ever bumps the **minor**. To change **`minAppVersion`**, edit it in
+`packages/obsidian-plugin/manifest.json` and merge — the auto-bump carries it into the new
+`versions.json` entry. For a **major** release (or any non-minor jump), cut it by hand: create the
+GitHub Release + tag (`<version>`, no `v` prefix) with the built `main.js` / `manifest.json` /
+`versions.json` attached, which the vault deploy picks up; later merges resume minor-bumping from
+that tag.
+
+Distribution channels the release feeds:
    - **Self-sync (default):** copy `dist/main.js` + `dist/manifest.json` into **one** synced vault's
      `.obsidian/plugins/vault-s3-sync/`, let a sync cycle run; other devices pick it up. Reload
      Obsidian (or toggle the plugin off/on) on each device so the new `main.js` is loaded — a running
