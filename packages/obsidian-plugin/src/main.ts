@@ -401,8 +401,17 @@ export default class S3SyncPlugin extends Plugin {
     if (this.settings.syncPaused) {
       new Notice("S3 Vault Sync is paused — resume it in settings when you're ready to sync.");
     }
-    await this.runSync("startup"); // offline catch-up (§2.4) + first sync, serialized in one cycle
-    this.startPolling(); // ticks no-op while paused; resuming restarts an immediate sync
+    // Startup order (§2.4): pull from S3 FIRST so remote changes land in seconds, THEN scan local
+    // files for offline edits/deletes. On mobile the offline scan takes minutes (it walks the whole
+    // vault + .obsidian, hashing candidates), so running it first — as one combined cycle used to —
+    // strands the cloud pull behind it, the opposite of what someone opening the app wants. It's
+    // safe to pull first: applyRemote re-hashes each local file, so an offline edit that ALSO changed
+    // remotely still conflict-merges in the pull; only PURE-local offline edits/deletes (which the
+    // pull can't see) wait for the scan below.
+    if (!this.settings.syncPaused) new Notice("S3 Vault Sync: syncing from cloud…");
+    await this.runSync("startup-pull"); // fast: pull remote deltas, announce started/done
+    this.startPolling(); // poll loop live now — the app is responsive without waiting on the scan
+    void this.runSync("startup-scan"); // offline catch-up (§2.4) in the background; pushes local edits
   }
 
   startPolling(): void {
@@ -428,18 +437,22 @@ export default class S3SyncPlugin extends Plugin {
       if (reason === "manual") new Notice("S3 Vault Sync is paused — resume it in settings to sync.");
       return;
     }
-    // The engine serializes the cycle and runs the pre-scan inside its lock. Startup does a full
-    // offline catch-up (which also walks the config dir); poll/manual do the cheap config rescan;
-    // "debounced-edit" fires after every keystroke burst, so it skips the config walk entirely.
-    // "manual" announces (started/done) so a verbose user sees their explicit Sync take effect.
+    // The engine serializes the cycle and runs the pre-scan inside its lock. Startup is split into
+    // two cycles: "startup-pull" is a bare remote pull (no scan) so cloud changes land fast, then
+    // "startup-scan" does the full offline catch-up (which also walks the config dir) in the
+    // background. poll/manual do the cheap config rescan; "debounced-edit" fires after every keystroke
+    // burst, so it skips the config walk entirely. Both startup phases and "manual" announce
+    // (started/done) so the log shows the cycle even when it transferred nothing.
     const opts =
-      reason === "startup"
-        ? { scanOffline: true, label: "startup" }
-        : reason === "manual"
-          ? { scanConfig: true, label: "manual sync", announce: true }
-          : reason === "poll"
-            ? { scanConfig: true, label: "poll" }
-            : { label: "edit save" };
+      reason === "startup-pull"
+        ? { label: "startup (cloud pull)", announce: true }
+        : reason === "startup-scan"
+          ? { scanOffline: true, label: "startup (offline scan)", announce: true }
+          : reason === "manual"
+            ? { scanConfig: true, label: "manual sync", announce: true }
+            : reason === "poll"
+              ? { scanConfig: true, label: "poll" }
+              : { label: "edit save" };
     try {
       await this.engine.sync(opts);
       this.syncFailures = 0;
