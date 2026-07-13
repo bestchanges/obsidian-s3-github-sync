@@ -1,0 +1,89 @@
+# Builds the Obsidian plugin and ships it to the vault content repo.
+#
+# On a published release (tag == manifest.version, no "v" prefix) this workflow:
+#   1. installs, tests, typechecks, and builds the plugin (the CI gate before any deploy);
+#   2. (re)uploads the built main.js / manifest.json / versions.json to the release assets, so the
+#      release always carries a reproducible CI build (this is also the BRAT channel);
+#   3. fires a repository_dispatch at the vault repo, whose install-plugin.yml pulls those assets into
+#      .obsidian/plugins/ and pushes — the vault's own s3-sync then propagates them to S3 + devices.
+#
+# One-time setup (see the PR description / SETUP.md):
+#   - repo VARIABLE  VAULT_REPO          = owner/name of the vault content repo (e.g. bestchanges/gsd2)
+#   - repo SECRET    VAULT_DEPLOY_TOKEN  = a fine-grained PAT scoped to that repo with
+#                                          "Contents: Read and write" (needed to send it a dispatch)
+name: Deploy plugin to vault repo
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)deploy (e.g. 0.5.0)"
+        required: true
+
+permissions:
+  contents: write # upload the built files to the release assets
+
+concurrency:
+  group: deploy-plugin
+  cancel-in-progress: false
+
+jobs:
+  build-and-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Verify (tests + typecheck)
+        run: |
+          npm test
+          npm run typecheck
+
+      - name: Build plugin
+        run: PLUGIN_SOURCEMAP=false npm run build:plugin
+
+      - name: Resolve tag and verify it matches manifest.version
+        id: v
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          VERSION="$(node -p "require('./packages/obsidian-plugin/manifest.json').version")"
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "::error::Release tag ($TAG) != manifest.version ($VERSION). The tag must equal the plugin version with no 'v' prefix."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the CI build to the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.v.outputs.tag }}" \
+            packages/obsidian-plugin/dist/main.js \
+            packages/obsidian-plugin/dist/manifest.json \
+            packages/obsidian-plugin/dist/versions.json \
+            --clobber --repo "${{ github.repository }}"
+
+      - name: Trigger install on the vault repo
+        env:
+          GH_TOKEN: ${{ secrets.VAULT_DEPLOY_TOKEN }}
+          TAG: ${{ steps.v.outputs.tag }}
+          TOOL_REPO: ${{ github.repository }}
+          VAULT_REPO: ${{ vars.VAULT_REPO }}
+        run: |
+          if [ -z "$VAULT_REPO" ]; then
+            echo "::error::Set the VAULT_REPO repository variable (owner/name of the vault content repo)."
+            exit 1
+          fi
+          jq -n --arg tag "$TAG" --arg tool "$TOOL_REPO" \
+            '{event_type: "deploy-plugin", client_payload: {tag: $tag, tool_repo: $tool}}' \
+          | gh api "repos/$VAULT_REPO/dispatches" --method POST --input -
+          echo "Dispatched deploy-plugin ($TAG) → $VAULT_REPO"
