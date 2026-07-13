@@ -92,13 +92,15 @@ describe("regression: single-device table triplication via stale merge base", ()
     return { io, remote, getWritten: () => written };
   }
 
-  it("stale cursor base duplicates the table (documents the old bug)", async () => {
-    const git = fakeGit({ CURSOR: { "n.md": C_MINUS1 }, SYNC: { "n.md": C0 } }, null); // no bot commit → falls to cursor
+  it("defense-in-depth: even a STALE base no longer duplicates (conflict-region dedup)", async () => {
+    // No bot commit → resolver falls back to the stale CURSOR base (the pre-fix failure input).
+    // The merge-base fix is the primary guard; unionMerge's conflict-region dedup is the safety net,
+    // so this once-corrupting input now yields a single clean table instead of a duplicated one.
+    const git = fakeGit({ CURSOR: { "n.md": C_MINUS1 }, SYNC: { "n.md": C0 } }, null);
     const base = await makeMergeBaseResolver(git, "CURSOR");
-    const { io, remote } = runReconcile(base);
-    const action = await reconcileFile("n.md", "upsert", remote, { files: { "n.md": remote } }, io);
-    const merged = decodeText((action as { content: Uint8Array }).content);
-    expect(tableCount(merged)).toBe(2); // the corruption
+    const { io, remote, getWritten } = runReconcile(base);
+    await reconcileFile("n.md", "upsert", remote, { files: { "n.md": remote } }, io);
+    expect(tableCount(getWritten()!)).toBe(1); // no duplication despite the stale base
   });
 
   it("fixed base (git-sync's own sync commit) merges cleanly — no duplication, no bad re-upload", async () => {
