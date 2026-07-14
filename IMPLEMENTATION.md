@@ -416,6 +416,14 @@ off there are no disk writes, no S3 PUTs, and no note paths leave the device.
   it raises is also logged, plus per-cycle transfer summaries and `WARN` on union-merge conflicts.
   `main.ts` logs lifecycle events (startup, pause/resume, foreign-state resync, manual resync) and
   routes its former `console.error` sites through `logger.error`.
+- **Per-file detail (log-only).** Beyond the count summary, each cycle logs **which** files moved,
+  one greppable line per file, arrow-tagged to match the summary: `↓ pulled <path>` / `↓ deleted
+  <path>` (removed locally by a remote tombstone) / `↑ pushed <path>` / `↑ deleted <path>`
+  (tombstoned in the cloud) / `⇅ merged <path>` (union-merge or freshest-wins; a merged file is
+  listed once, not re-listed as a push). This detail goes **only to the log**, never a `Notice` — a
+  transient toast can't hold a file list. Each direction is capped at **20 paths** per cycle
+  (`LOG_LIST_CAP`), the excess collapsing to `… and N more`, so a resync/first-sync moving thousands
+  of files can't flood the 512 KB rotating file or the S3 tail; the summary counts stay exact.
 - **S3 shipping.** After each sync cycle (piggybacking the poll cadence, no extra timer),
   `uploadIfDirty()` PUTs this device's recent tail (~256 KB) to `_logs/<deviceId>.log` — but only
   when logging is on and there is new content since the last upload. This is a side-channel outside
