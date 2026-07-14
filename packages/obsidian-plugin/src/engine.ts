@@ -47,6 +47,10 @@ const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
  * above the fraction we treat it as a state mismatch and RESTORE from S3 instead of tombstoning. */
 const MASS_MISSING_MIN = 10;
 const MASS_MISSING_FRACTION = 0.5;
+/** Per-cycle log detail cap: how many file paths we list PER DIRECTION before collapsing the rest to
+ * "…and N more". A resync/first-sync moves thousands of files; without a cap one cycle would flood
+ * the 512 KB rotating log and the S3 tail. The counts in the summary Notice are always exact. */
+const LOG_LIST_CAP = 20;
 
 export interface FileState {
   hash: string;
@@ -148,6 +152,17 @@ export class SyncEngine {
   private pushed = 0;
   private merged = 0;
   private skipped = 0; // remote files left in the cloud this cycle (over the download cap)
+  // per-cycle WHICH-files detail, for the persistent log only (never the transient Notice). Reset at
+  // the start of every cycle; emitted (capped) by logCycleDetail() at the end. `mergedPaths` doubles
+  // as the guard that keeps a merged file — which is also re-pushed — from being listed twice.
+  private detail = {
+    pulled: [] as string[], // remote content written locally
+    pushed: [] as string[], // local content uploaded to S3
+    deletedLocal: [] as string[], // removed here because a remote tombstone said so
+    deletedRemote: [] as string[], // deleted here → tombstoned in the cloud
+    mergedPaths: [] as string[], // conflict-resolved (union-merge or freshest-wins)
+  };
+  private mergedSet = new Set<string>(); // paths already recorded as merged this cycle
   // Result of the most recent forced-download cycle, read back by forceDownloadPaths() after the
   // cycle it queued has run. Only forced cycles set it; ordinary cycles leave it untouched.
   private forceResult: ForceDownloadResult | null = null;
@@ -157,6 +172,31 @@ export class SyncEngine {
   private notify(msg: string, force = false): void {
     if (force || this.opts.verbose) new Notice(msg);
     this.opts.log("info", msg);
+  }
+
+  /** Record a conflict-resolved path once (union-merge or freshest-wins). Idempotent per cycle, and
+   * the mergedSet lets push() list the file as "merged" rather than re-listing it as "pushed". */
+  private recordMerged(path: string): void {
+    if (this.mergedSet.has(path)) return;
+    this.mergedSet.add(path);
+    this.detail.mergedPaths.push(path);
+  }
+
+  /** Emit the per-cycle file lists to the persistent log (disk + S3), one greppable line per file,
+   * capped at LOG_LIST_CAP per direction. Log-only — never a Notice; the arrow prefixes mirror the
+   * summary Notice (↓ pulled / ↑ pushed / ⇅ merged) so both read alike. */
+  private logCycleDetail(): void {
+    this.logGroup("↓ pulled", this.detail.pulled);
+    this.logGroup("↓ deleted", this.detail.deletedLocal);
+    this.logGroup("↑ pushed", this.detail.pushed);
+    this.logGroup("↑ deleted", this.detail.deletedRemote);
+    this.logGroup("⇅ merged", this.detail.mergedPaths);
+  }
+
+  private logGroup(verb: string, paths: string[]): void {
+    for (const p of paths.slice(0, LOG_LIST_CAP)) this.opts.log("info", `${verb} ${p}`);
+    const more = paths.length - LOG_LIST_CAP;
+    if (more > 0) this.opts.log("info", `${verb} …and ${more} more`);
   }
 
   /** Per-device download gate: 0 = unlimited. Unknown size → allow (correctness over space). */
@@ -434,6 +474,8 @@ export class SyncEngine {
    * dirty set. Only ever invoked by runLoop (single-flight), so it owns the shared state alone. */
   private async runCycle(req: CycleReq): Promise<void> {
     this.pulled = this.pushed = this.merged = this.skipped = 0;
+    this.detail = { pulled: [], pushed: [], deletedLocal: [], deletedRemote: [], mergedPaths: [] };
+    this.mergedSet.clear();
     const rev0 = this.state.lastSyncedRev;
     if (req.announce) this.notify(`Sync: started (${req.label})`, req.force);
 
@@ -471,6 +513,8 @@ export class SyncEngine {
         req.force,
       );
     }
+    // The summary Notice above is a transient count; the persistent log gets the actual file list.
+    this.logCycleDetail();
   }
 
   private async pull(fullPull = false): Promise<void> {
@@ -528,6 +572,7 @@ export class SyncEngine {
         }
         await this.withApplying(path, () => this.vault.adapter.remove(path));
         this.pulled++;
+        this.detail.deletedLocal.push(path);
       }
       delete this.state.files[path];
       this.dirty.delete(path);
@@ -572,6 +617,7 @@ export class SyncEngine {
       await this.write(path, obj.body, remote.mtime);
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
       this.pulled++;
+      this.detail.pulled.push(path);
       return;
     }
 
@@ -605,11 +651,12 @@ export class SyncEngine {
     // change, uploads it, and records the true state (with the real s3VersionId from the PUT).
     this.dirty.add(path); // merged result must go back to S3
     this.merged++;
+    this.recordMerged(path); // listed in the cycle's log summary; push() won't re-list it as pushed
     if (merged.hadConflicts) {
+      // A real conflict is worth surfacing on its own (distinct severity + a Notice), beyond the
+      // per-cycle merged list — so keep this immediate warning too.
       this.opts.log("warn", `union-merged conflict in ${path}`);
       new Notice(`Sync: union-merged conflict in ${path}`);
-    } else {
-      this.opts.log("info", `merged ${path}`);
     }
   }
 
@@ -635,11 +682,11 @@ export class SyncEngine {
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
       this.pulled++;
       this.merged++;
-      this.opts.log("info", `freshest-wins → remote ${path}`);
+      this.recordMerged(path);
     } else {
       this.dirty.add(path); // local is newer (or tie) → keep it and push it up
       this.merged++;
-      this.opts.log("info", `freshest-wins → local ${path}`);
+      this.recordMerged(path);
     }
   }
 
@@ -686,6 +733,7 @@ export class SyncEngine {
       await this.write(path, obj.body, remote.mtime);
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
       this.pulled++;
+      this.detail.pulled.push(path);
       result.downloaded++;
     });
     return result;
@@ -732,6 +780,7 @@ export class SyncEngine {
           if (this.state.files[path]) {
             files[path] = { deleted: true }; // deleted locally → tombstone
             newStates.set(path, null);
+            this.detail.deletedRemote.push(path);
           }
           return;
         }
@@ -744,6 +793,9 @@ export class SyncEngine {
         const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
         files[path] = entry;
         newStates.set(path, { hash, s3VersionId: res.versionId, mtime });
+        // A conflict-resolved file is re-pushed here too — it's already in the merged list, so don't
+        // list it a second time as a plain push.
+        if (!this.mergedSet.has(path)) this.detail.pushed.push(path);
       });
 
       if (Object.keys(files).length === 0) return;
