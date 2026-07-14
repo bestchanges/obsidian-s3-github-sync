@@ -429,8 +429,14 @@ manifest hashes reconstruct everything.
 ## 5.2 Change detection
 
 - **Git side**: if `lastSyncedCommit` is an ancestor of `HEAD` (warm), `git diff --name-status`
-  (renames become delete+add); else (history rewritten / first run) fall back to `ls-files` full
-  diff. Ignored paths and unsafe paths are dropped.
+  from the **diff base** (renames become delete+add); else (history rewritten / first run) fall back
+  to `ls-files` full diff. Ignored paths and unsafe paths are dropped.
+  The diff base is git-sync's **own last sync commit** when it sits at/after the cursor
+  (`resolveDiffBase`, `merge-base.ts`), not `lastSyncedCommit` itself: the cursor is the pre-commit
+  HEAD, so diffing from it would re-report the last sync commit's own S3-applied writes as git
+  edits — harmless for files still live in S3 (hash idempotence) but fatal for a path the vault has
+  since renamed/deleted, where the false "edit" would beat the tombstone (edit-wins) and resurrect
+  the old file with stale content.
 - **S3 side**: always `readSnapshot` ⊕ `listDeltasSince` (Actions bandwidth is free → uniform
   warm/cold). Entries with `rev > lastSyncedRev` and `by != "git-sync"` become `s3Changed`.
 
@@ -465,8 +471,9 @@ it is unit-tested without a real repo/S3/filesystem (`test/reconcile.test.ts`). 
     (or a tie) → keep git's bytes and re-push. Mirrors the plugin's `resolveFreshestWins` so JSON
     isn't line-merged into duplicated keys and neither side ping-pongs.
   - **text note within `LWW_SIZE_LIMIT`** → three-way `unionMerge` with
-    `base = git show <lastSyncedCommit>:<path>` (warm) or empty (cold), writing the result to the tree
-    **and** queuing the S3 PUT.
+    `base = git show <last own sync commit>:<path>` (falling back to the warm cursor, then empty —
+    `makeMergeBaseResolver`, `merge-base.ts`), writing the result to the tree **and** queuing the
+    S3 PUT.
 
 > [!important] Content is handled as **raw bytes** end to end
 > Local reads/writes and S3 get/put move `Uint8Array`; text is decoded (`decodeText`) only inside the
@@ -481,6 +488,13 @@ folds all new deltas into the snapshot (CAS) and prunes deltas older than `RETEN
 write `.sync/state.json` with the new rev and the **pre-commit** `HEAD`, `git add -A`, and if
 anything is staged, commit `s3-sync: rev <N> [skip ci]` as `s3-sync-bot` and push. `[skip ci]` + the
 bot author are the git-side half of echo suppression (the push doesn't re-trigger the workflow).
+
+`lastSyncedRev` advances only over revisions this run actually **reconciled** — the fold read at
+the start — never to the rev of its own delta or the compacted snapshot. Deltas that landed mid-run
+(or won a CAS race against git-sync's append) were not applied to the tree, so the cursor must not
+skip them: git-sync's own entries are echo-suppressed by `by` next run, while foreign ones get
+picked up then. (The old `max(own rev, snapshot rev)` cursor silently dropped such vault edits from
+git until the same file was next touched.)
 
 ## 5.6 Prefix
 

@@ -25,7 +25,7 @@ import {
 import { Git } from "./git";
 import { S3SdkAdapter } from "./s3-adapter";
 import { reconcileFile, ReconcileIO, UploadAction } from "./reconcile";
-import { makeMergeBaseResolver } from "./merge-base";
+import { makeMergeBaseResolver, resolveDiffBase } from "./merge-base";
 
 const WRITER_ID = "git-sync";
 const STATE_PATH = ".sync/state.json";
@@ -102,8 +102,12 @@ async function main(): Promise<void> {
   const warmGit =
     state.lastSyncedCommit !== null && (await git.isAncestor(state.lastSyncedCommit, head));
   if (warmGit) {
+    // Diff from git-sync's own last sync commit, NOT the cursor: the cursor is the pre-commit HEAD,
+    // so it predates that commit's own S3-applied writes — which would re-surface here as git
+    // "edits" and resurrect any path the vault has since tombstoned (see resolveDiffBase).
+    const diffBase = await resolveDiffBase(git, state.lastSyncedCommit!);
     gitChanged = new Map(
-      (await git.diffNameStatus(state.lastSyncedCommit!, head)).map((c) => [
+      (await git.diffNameStatus(diffBase, head)).map((c) => [
         c.path,
         c.status === "D" ? "delete" : "upsert",
       ]),
@@ -202,7 +206,6 @@ async function main(): Promise<void> {
   });
 
   // ---- push to S3: files, then one delta (§1.3) ---------------------------
-  let newRev = remote.revision;
   if (uploads.size > 0) {
     const files: Record<string, DeltaEntry> = {};
     await mapPool([...uploads.entries()], CONCURRENCY, async ([p, u]) => {
@@ -219,8 +222,7 @@ async function main(): Promise<void> {
       (rev): Delta => ({ rev, by: WRITER_ID, at: new Date().toISOString(), files }),
       (winner) => log(`lost CAS race to ${winner.by}@${winner.rev}; retrying`),
     );
-    newRev = result.rev;
-    log(`appended delta rev=${newRev} (${uploads.size} entries)`);
+    log(`appended delta rev=${result.rev} (${uploads.size} entries)`);
   }
 
   // ---- compaction (§3.3 step 8) -------------------------------------------
@@ -231,11 +233,16 @@ async function main(): Promise<void> {
     const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
     const pruned = await pruneDeltas(storage, newSnapshot.revision, cutoff, CONCURRENCY);
     log(`compacted snapshot to rev=${newSnapshot.revision}, pruned ${pruned} deltas`);
-    newRev = Math.max(newRev, newSnapshot.revision);
   }
 
   // ---- commit + push git side (§3.3 steps 6+9) ----------------------------
-  const finalRev = Math.max(newRev, remote.revision);
+  // The cursor advances only over revisions this run actually reconciled: the fold read at the
+  // start. Anything beyond it was NOT applied to the tree this run — our own delta is echo-
+  // suppressed next run by `by`, but a foreign delta that landed mid-run (folded into the snapshot
+  // above) or won a CAS race against ours must still be seen. The old cursor (max of own delta rev
+  // and snapshot rev) skipped past such deltas, silently dropping those vault edits from git until
+  // the same file was next touched.
+  const finalRev = remote.revision;
   await fs.mkdir(path.join(repoDir, ".sync"), { recursive: true });
   await fs.writeFile(
     path.join(repoDir, STATE_PATH),
@@ -243,10 +250,10 @@ async function main(): Promise<void> {
   );
   await git.stageAll();
   if (await git.hasStagedChanges()) {
-    // NOTE: lastSyncedCommit intentionally points at the PRE-commit HEAD. The next run
-    // will therefore see this sync commit's own files in its diff — but they hash-equal
-    // the S3 state, so the idempotence check skips them, and the by=git-sync delta is
-    // echo-suppressed. One commit, no state-commit regress.
+    // NOTE: lastSyncedCommit intentionally points at the PRE-commit HEAD — the post-commit
+    // sha can't be written into a file that is part of that same commit. The next run keeps
+    // this sync commit's own writes out of its diff by anchoring at the commit itself
+    // (resolveDiffBase), not at this cursor. One commit, no state-commit regress.
     await git.commit(`s3-sync: rev ${finalRev} [skip ci]`);
     await git.push();
     log(`committed + pushed (${(await git.headSha()).slice(0, 8)})`);

@@ -26,6 +26,29 @@ export interface MergeBaseGit {
   showAt(commit: string, path: string): Promise<string | null>;
 }
 
+export interface DiffBaseGit {
+  /** SHA of the most recent commit by `author` reachable from HEAD, or null. */
+  lastCommitBy(author: string): Promise<string | null>;
+  isAncestor(maybeAncestor: string, of: string): Promise<boolean>;
+}
+
+/**
+ * Resolve the base commit for the git-side change diff (warm path). Same stale-cursor hazard as the
+ * merge base above, but with a worse failure mode: diffing from `cursor` (the pre-commit HEAD)
+ * re-reports the last run's OWN sync commit's writes as git edits. For files still live in S3 the
+ * hash-idempotence check drops them — but for a file the vault renamed/deleted since, the false
+ * "edit" beats the S3 tombstone (delete-vs-edit: edit wins) and git-sync RESURRECTS the old path
+ * with stale content (the rename-resurrection bug). Anchoring the diff at git-sync's own last sync
+ * commit removes the false upsert at the source: that commit's tree IS the state S3 already has, so
+ * only human commits after it can be genuine git-side changes. The ancestry guard keeps the cursor
+ * when the bot commit predates it (last run committed nothing) — using an older base would re-widen
+ * the diff over already-synced human commits and reopen the same hole.
+ */
+export async function resolveDiffBase(git: DiffBaseGit, cursor: string): Promise<string> {
+  const lastSync = await git.lastCommitBy(SYNC_BOT_AUTHOR);
+  return lastSync && (await git.isAncestor(cursor, lastSync)) ? lastSync : cursor;
+}
+
 /**
  * Resolve, once per run, the per-path merge-base function for reconcileFile. Prefers git-sync's own
  * last sync commit; falls back to `fallbackCommit` (the last-synced cursor, only when it is a valid
