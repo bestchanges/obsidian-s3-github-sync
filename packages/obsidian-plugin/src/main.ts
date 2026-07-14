@@ -3,6 +3,7 @@ import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
+import { mobileModelFromUA } from "./device-id";
 import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
 
 interface Settings {
@@ -40,7 +41,7 @@ const DEFAULT_SETTINGS: Settings = {
   accessKeyId: "",
   secretAccessKey: "",
   prefix: "",
-  deviceId: "", // minted on first load from the machine label + a random suffix
+  deviceId: "", // minted on first load: <device label> + a stable suffix (mobile: localStorage anchor)
   machineFingerprint: "",
   pollIntervalSec: 15,
   excludedFolders: [],
@@ -87,6 +88,11 @@ function deserializeState(c: CompactState): SyncState {
 }
 
 const PUSH_DEBOUNCE_MS = 5_000; // §2.2
+
+/** localStorage key holding this device's stable anchor (§4.2). Namespaced by plugin id; per-device
+ * and never written to data.json, so it survives OS/WebView/app updates and isn't copied with the
+ * bundle. */
+const DEVICE_ANCHOR_KEY = "vault-s3-sync:device-anchor";
 
 export default class S3SyncPlugin extends Plugin {
   settings: Settings = DEFAULT_SETTINGS;
@@ -169,26 +175,47 @@ export default class S3SyncPlugin extends Plugin {
     return !!(this.settings.bucket && this.settings.accessKeyId && this.settings.secretAccessKey);
   }
 
-  // -------------------------------------------------- device identity (§2 discussion)
-  /** A fingerprint of the physical machine — recomputed at runtime, never read from data.json,
-   * so a copied bundle can't fake it. Desktop uses the OS hostname; mobile falls back to the UA. */
+  // -------------------------------------------------- device identity (§4.2)
+  /** A stable, per-device token minted once and kept in this device's localStorage — never written to
+   * data.json, so it isn't copied with the bundle AND doesn't fluctuate when the OS/WebView/app
+   * updates (unlike the User-Agent, which embeds version numbers). It's cleared only by an app
+   * reinstall / cache wipe, which correctly reads as a new device. Anchors both the mobile
+   * fingerprint and the deviceId suffix. */
+  private deviceAnchor(): string {
+    try {
+      let anchor = window.localStorage.getItem(DEVICE_ANCHOR_KEY) || "";
+      if (!anchor) {
+        anchor = Math.random().toString(36).slice(2, 10);
+        window.localStorage.setItem(DEVICE_ANCHOR_KEY, anchor);
+      }
+      return anchor;
+    } catch {
+      // No localStorage → derive a stable-ish token from the model so we at least don't fluctuate on
+      // version bumps (weaker copy detection, but the phantom-resync bug stays fixed).
+      return this.slug(mobileModelFromUA(navigator.userAgent || ""));
+    }
+  }
+
+  /** A fingerprint of the physical device — recomputed at runtime, never read from data.json, so a
+   * copied bundle can't fake it. Desktop uses the OS hostname; mobile uses the localStorage anchor
+   * (the UA is version-tainted and was minting phantom new devices — §4.2). */
   private computeFingerprint(): string {
     const req = (window as unknown as { require?: (m: string) => { hostname(): string } }).require;
     if (!Platform.isMobile && req) {
       try {
         return "host:" + req("os").hostname();
       } catch {
-        /* fall through to UA */
+        /* fall through to the anchor */
       }
     }
-    return "ua:" + (navigator.userAgent || "unknown");
+    return "anchor:" + this.deviceAnchor();
   }
 
   private slug(s: string): string {
     return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "device";
   }
 
-  /** Human-readable device label: hostname on desktop, model-ish token on mobile. */
+  /** Human-readable device label: hostname on desktop, phone model on mobile (§4.2). */
   private deviceLabel(): string {
     const req = (window as unknown as { require?: (m: string) => { hostname(): string } }).require;
     if (!Platform.isMobile && req) {
@@ -199,13 +226,17 @@ export default class S3SyncPlugin extends Plugin {
         /* fall through */
       }
     }
-    const m = (navigator.userAgent || "").match(/iPhone|iPad|Android|Macintosh|Windows|Linux/i);
-    return this.slug(m ? m[0] : "device");
+    return this.slug(mobileModelFromUA(navigator.userAgent || ""));
   }
 
-  /** Label + first-run random suffix → unique by design, even across identical hardware. */
+  /** `<label>-<suffix>`, unique by design even across identical hardware. On mobile the suffix is the
+   * stable device anchor, so the id reads `<phone-model>-<anchor>` and survives updates; on desktop
+   * it's a random nibble to disambiguate identical hostnames. */
   private mintDeviceId(): string {
-    return `${this.deviceLabel()}-${Math.random().toString(36).slice(2, 6)}`;
+    const suffix = Platform.isMobile
+      ? this.deviceAnchor().slice(0, 4)
+      : Math.random().toString(36).slice(2, 6);
+    return `${this.deviceLabel()}-${suffix}`;
   }
 
   /** Mint an id on first run; if the stored fingerprint says this data.json came from a different
@@ -217,8 +248,11 @@ export default class S3SyncPlugin extends Plugin {
       this.settings.deviceId = this.mintDeviceId();
       this.settings.machineFingerprint = fp;
       changed = true;
-    } else if (!this.settings.machineFingerprint) {
-      this.settings.machineFingerprint = fp; // upgrade from a build without fingerprints
+    } else if (!this.settings.machineFingerprint || this.settings.machineFingerprint.startsWith("ua:")) {
+      // Upgrade in place: from a build with no fingerprint, or the old fluctuating `ua:` scheme that
+      // caused this very bug. Adopt the stable fingerprint and keep the id — no phantom foreign-state
+      // resync on the upgrade itself. Copy detection resumes normally afterward.
+      this.settings.machineFingerprint = fp;
       changed = true;
     } else if (this.settings.machineFingerprint !== fp) {
       this.settings.deviceId = this.mintDeviceId();

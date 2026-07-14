@@ -206,12 +206,22 @@ Data is stored in **two** places, a deliberate change from the POC (which kept e
 Each device needs a unique, stable writer id for echo suppression, and copying a configured
 `data.json` to a new device must not make two devices share an id.
 
-- **`deviceId`** — minted on first load as `<label>-<rand4>`. The label is a slug of the desktop
-  hostname or a mobile model token; the random suffix guarantees uniqueness even across identical
-  hardware.
-- **`machineFingerprint`** — recomputed every load (`host:<hostname>` on desktop, `ua:<userAgent>`
+- **`deviceId`** — minted on first load as `<label>-<suffix>`. The label is a slug of the desktop
+  hostname or the **phone model** (`mobileModelFromUA`, e.g. `sm-g991b` / `iphone` — version numbers
+  stripped). The suffix is the stable **device anchor** on mobile and a random nibble on desktop; it
+  guarantees uniqueness even across identical hardware.
+- **device anchor (mobile)** — a random token minted once and kept in this device's
+  **`localStorage`** (`DEVICE_ANCHOR_KEY`), **never written to `data.json`**. Because it isn't part of
+  the bundle it can't be copied to another device, and because it isn't derived from the User-Agent it
+  **doesn't fluctuate** when the OS / WebView / app updates. (Earlier builds fingerprinted the raw
+  `ua:<userAgent>`, whose embedded version numbers changed on their own and minted phantom "new
+  devices" → spurious foreign-state resyncs.) An app reinstall / cache-wipe clears it, which correctly
+  reads as a new device.
+- **`machineFingerprint`** — recomputed every load (`host:<hostname>` on desktop, `anchor:<anchor>`
   on mobile) and **never trusted from disk**. On load:
   - no `deviceId` → mint one, record the fingerprint;
+  - legacy fingerprint (empty, or the old `ua:` scheme) → adopt the stable fingerprint in place and
+    keep the id — a one-time upgrade migration, **no** foreign-state resync;
   - fingerprint present but different → the `data.json` was **copied from another machine**:
     mint a fresh `deviceId`, reset the sync cursor to 0, and flag a **foreign-state full resync** on
     startup (so the copied device rebuilds its own state and pulls the whole vault instead of
@@ -530,8 +540,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `bucket` / `region` | — / `us-east-1` | S3 target |
 | `accessKeyId` / `secretAccessKey` | — | IAM user creds (SigV4) |
 | `prefix` | `""` | must equal git-sync `PREFIX` |
-| `deviceId` | minted `<label>-<rand4>` | writer id; auto |
-| `machineFingerprint` | recomputed | copy detection; never trusted from disk |
+| `deviceId` | minted `<label>-<suffix>` | writer id; auto (mobile suffix = localStorage anchor) |
+| `machineFingerprint` | recomputed | copy detection; never trusted from disk (mobile: `anchor:`, not the UA) |
 | `pollIntervalSec` | 15 | min 5 |
 | `excludedFolders` | `[]` | local-only until re-enabled |
 | `maxDownloadMB` | **10** | 0 = no limit |
@@ -637,7 +647,7 @@ implementation added or diverged as follows:
 | Area | POC design | Implemented |
 |---|---|---|
 | Plugin persistence | all state in `data.json` (`saveData`) | **split**: `data.json` = settings only; `state.json.gz` = gzipped compact state, change-gated writes |
-| Device id | `device:<name>`, manually set | **auto** `<label>-<rand4>` + machine fingerprint; copy detection → auto full resync |
+| Device id | `device:<name>`, manually set | **auto** `<label>-<suffix>` + machine fingerprint (mobile = localStorage anchor, update-proof); copy detection → auto full resync |
 | `.obsidian` | excluded wholesale | **synced** (app/plugins/settings) minus a per-device denylist |
 | Exclusions | `.gitignore` + `.s3syncignore` | + `GIT_META_FILES`, per-device denylist, both legs in **lockstep** |
 | Large files | LWW over 5 MB (merge only) | + **25 MB** git guard (S3-only) + **per-device download cap** (default 10 MB) |
