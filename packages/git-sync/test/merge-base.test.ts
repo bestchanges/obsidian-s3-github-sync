@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { contentHash, decodeText, encodeText, SnapshotEntry } from "@vault-sync/core";
-import { makeMergeBaseResolver, MergeBaseGit, SYNC_BOT_AUTHOR } from "../src/merge-base";
+import {
+  DiffBaseGit,
+  makeMergeBaseResolver,
+  MergeBaseGit,
+  resolveDiffBase,
+  SYNC_BOT_AUTHOR,
+} from "../src/merge-base";
 import { reconcileFile, ReconcileIO } from "../src/reconcile";
 
 /** Fake Git backed by an in-memory commit→(path→content) map. `lastBot` names git-sync's most
@@ -54,6 +60,99 @@ describe("makeMergeBaseResolver", () => {
     await base("a.md");
     await base("b.md");
     expect(git.calls.filter((c) => c.startsWith("lastCommitBy")).length).toBe(1);
+  });
+});
+
+/** Fake ancestry: a linear history given oldest-first; isAncestor = "at or before". `lastBot` is
+ * what lastCommitBy(SYNC_BOT_AUTHOR) returns (most recent bot commit reachable from HEAD). */
+function fakeAncestry(order: string[], lastBot: string | null): DiffBaseGit {
+  return {
+    async lastCommitBy(author) {
+      return author === SYNC_BOT_AUTHOR ? lastBot : null;
+    },
+    async isAncestor(a, b) {
+      return order.includes(a) && order.indexOf(a) <= order.indexOf(b);
+    },
+  };
+}
+
+describe("resolveDiffBase", () => {
+  it("advances the base to git-sync's own sync commit when it follows the cursor", async () => {
+    // history: CURSOR (pre-commit HEAD) → SYNC (last run's own commit) → HEAD
+    const git = fakeAncestry(["CURSOR", "SYNC", "HEAD"], "SYNC");
+    expect(await resolveDiffBase(git, "CURSOR")).toBe("SYNC");
+  });
+
+  it("keeps the cursor when no sync commit exists (repo never synced-committed)", async () => {
+    const git = fakeAncestry(["CURSOR", "HEAD"], null);
+    expect(await resolveDiffBase(git, "CURSOR")).toBe("CURSOR");
+  });
+
+  it("keeps the cursor when the last sync commit predates it (last run committed nothing)", async () => {
+    // OLD_SYNC's writes were already covered by the cursor; re-basing on it would re-widen the
+    // diff over synced human commits and reopen the resurrection hole for them.
+    const git = fakeAncestry(["OLD_SYNC", "HUMAN", "CURSOR", "HEAD"], "OLD_SYNC");
+    expect(await resolveDiffBase(git, "CURSOR")).toBe("CURSOR");
+  });
+
+  it("accepts the cursor itself being the sync commit (no commits since)", async () => {
+    const git = fakeAncestry(["SYNC"], "SYNC");
+    expect(await resolveDiffBase(git, "SYNC")).toBe("SYNC");
+  });
+});
+
+// The rename-resurrection regression. Timeline (one vault device + git-sync):
+//   1. run N's own sync commit writes note.md into git (applying the device's S3 edit);
+//      state.lastSyncedCommit stays at the PRE-commit HEAD.
+//   2. the device renames the note: one delta tombstones note.md and adds renamed.md.
+//   3. run N+1 diffs its git side. With the stale cursor base, its own commit's write shows up as
+//      inGit="upsert"; combined with the S3 tombstone, delete-vs-edit "edit wins" re-uploads the
+//      old path with stale content — the old file reappears on every device.
+// resolveDiffBase anchors the diff at the sync commit, so note.md is not in gitChanged at all and
+// the tombstone applies cleanly (S3→git delete).
+describe("regression: rename resurrection via stale diff base", () => {
+  const CONTENT = "# note\n";
+  const tombstone: SnapshotEntry = { deleted: true, rev: 244, by: "obsidian" } as SnapshotEntry;
+
+  function io(removed: string[]): ReconcileIO {
+    return {
+      readLocal: async () => encodeText(CONTENT), // old path still in the working tree
+      fetchRemote: async () => null, // tombstoned — no live remote content
+      writeLocal: async () => {},
+      removeLocal: async (p) => void removed.push(p),
+      mergeBase: async () => "",
+      authorDate: async () => "2026-07-13T10:44:26.000Z",
+      log: () => {},
+    };
+  }
+
+  it("stale base: own-commit write counts as a git edit and un-tombstones the old path (the bug)", async () => {
+    const removed: string[] = [];
+    const action = await reconcileFile(
+      "note.md",
+      "upsert", // what diffing from the pre-commit cursor reports
+      tombstone,
+      { files: { "note.md": tombstone } },
+      io(removed),
+    );
+    expect(action).not.toBeNull(); // resurrection: stale content re-uploaded
+    expect(removed).toEqual([]);
+  });
+
+  it("anchored base: the path is not a git change, so the tombstone deletes it from the tree", async () => {
+    const git = fakeAncestry(["CURSOR", "SYNC", "HEAD"], "SYNC");
+    const diffBase = await resolveDiffBase(git, "CURSOR");
+    expect(diffBase).toBe("SYNC"); // own writes fall out of the diff range…
+    const removed: string[] = [];
+    const action = await reconcileFile(
+      "note.md",
+      undefined, // …so reconcile sees the path as S3-only
+      tombstone,
+      { files: { "note.md": tombstone } },
+      io(removed),
+    );
+    expect(action).toBeNull(); // nothing pushed back
+    expect(removed).toEqual(["note.md"]); // tombstone wins: old path deleted from git
   });
 });
 
