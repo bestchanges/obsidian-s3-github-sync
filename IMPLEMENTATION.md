@@ -129,11 +129,17 @@ does so on the cold path.
 
 ## 2.5 Compaction & pruning (`writeSnapshot`, `pruneDeltas`)
 
-git-sync is the **only** snapshot writer. Each run it folds new deltas into `snapshot.json.gz`
+git-sync is the **only** snapshot writer. It folds new deltas into `snapshot.json.gz`
 (CAS via `If-Match` on the snapshot ETag, else `If-None-Match:*` on first write) with the revision
 in `x-amz-meta-revision`, then `pruneDeltas` deletes folded deltas older than `RETENTION_DAYS`
 (default 30). The snapshot carries its revision in object metadata so a client can detect
 "behind retention" with a single HEAD.
+
+Compaction is **age-gated** (`shouldCompact`, git-sync `compaction.ts`): it runs only when no
+snapshot exists yet or the current one is older than `SNAPSHOT_MAX_AGE_HOURS` (default 24; `0` =
+every run). Sync runs are far more frequent than that, and a fresher snapshot buys nothing —
+clients always fold `snapshot ⊕ newer deltas`, so a stale snapshot just means a few more ~300 B
+deltas to fold. Skipping compaction also skips pruning, which simply waits for the next rebuild.
 
 ## 2.6 Union merge (`merge.ts`)
 
@@ -442,8 +448,8 @@ off there are no disk writes, no S3 PUTs, and no note paths leave the device.
 
 # 5. git-sync — `packages/git-sync`
 
-Runs in GitHub Actions (`templates/s3-sync.yml`), triggered by push to `main`, a `*/15` cron
-(catches plugin-side changes + runs compaction), or manual dispatch. `concurrency: s3-sync,
+Runs in GitHub Actions (`templates/s3-sync.yml`), triggered by push to `main`, a 4-hourly cron
+(catches plugin-side changes; compaction is age-gated to ~daily, §2.5), or manual dispatch. `concurrency: s3-sync,
 cancel-in-progress: false` serializes runs; CAS guards cross-client races. Auth is **OIDC → IAM
 role** (no stored keys). It treats the *repo* as its "local vault" and `writer id = "git-sync"`.
 
@@ -510,8 +516,9 @@ it is unit-tested without a real repo/S3/filesystem (`test/reconcile.test.ts`). 
 
 ## 5.5 Write cycle, compaction, commit
 
-PUT changed files (recording `s3VersionId`), then one `appendDelta` `by: "git-sync"`. Compaction
-folds all new deltas into the snapshot (CAS) and prunes deltas older than `RETENTION_DAYS`. Finally
+PUT changed files (recording `s3VersionId`), then one `appendDelta` `by: "git-sync"`. Compaction —
+when the snapshot is past `SNAPSHOT_MAX_AGE_HOURS` (§2.5) — folds all new deltas into the snapshot
+(CAS) and prunes deltas older than `RETENTION_DAYS`. Finally
 write `.sync/state.json` with the new rev and the **pre-commit** `HEAD`, `git add -A`, and if
 anything is staged, commit `s3-sync: rev <N> [skip ci]` as `s3-sync-bot` and push. `[skip ci]` + the
 bot author are the git-side half of echo suppression (the push doesn't re-trigger the workflow).
@@ -580,6 +587,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `AWS_REGION` | region |
 | `REPO_DIR` | content repo working dir (`github.workspace`) |
 | `RETENTION_DAYS` | delta retention (default 30) |
+| `SNAPSHOT_MAX_AGE_HOURS` | rebuild snapshot at most this often (default 24, `0` = every run) |
 | `GIT_MAX_FILE_BYTES` | oversized cutoff (default 25 MB) |
 
 ## 7.3 Content-repo variables (GitHub Actions)
@@ -652,6 +660,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Mass-missing guard | ≥10 files **and** >50% | `MASS_MISSING_MIN` / `MASS_MISSING_FRACTION` |
 | Oversized git file | 25 MB | `GIT_MAX_FILE_BYTES` / `DEFAULT_MAX_GIT_FILE_BYTES` |
 | Delta retention | 30 days | `RETENTION_DAYS` |
+| Snapshot max age (compaction gate) | 24 h | `SNAPSHOT_MAX_AGE_HOURS` / `DEFAULT_SNAPSHOT_MAX_AGE_HOURS` (compaction.ts) |
 | `applying` echo window | 500 ms | engine.ts |
 | CAS attempts | 100 | `appendDelta` |
 | Log rotation cap | 512 KB active → `.1` backup | `ROTATE_BYTES` (logger.ts) |
@@ -681,6 +690,7 @@ implementation added or diverged as follows:
 | Snapshot `updatedBy` | in schema example | not stored (folded `Snapshot` has `schemaVersion/revision/updatedAt/files`) |
 | Tombstone GC | prune > 90 days | **not implemented** — tombstones persist in the snapshot; only deltas are pruned (30 days) |
 | Branch protection | bot bypass / auto-PR option | direct push by `s3-sync-bot` with `[skip ci]` |
+| Sync cadence | `*/15` cron, compaction every run | **4-hourly** cron; snapshot rebuild **age-gated** to ~daily (`SNAPSHOT_MAX_AGE_HOURS`) |
 
 > [!note] Known gap
 > The 90-day tombstone garbage-collection from the design is **not** implemented: `foldDeltas`

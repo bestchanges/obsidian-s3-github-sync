@@ -23,6 +23,7 @@ import {
   writeSnapshot,
 } from "@vault-sync/core";
 import { Git } from "./git";
+import { DEFAULT_SNAPSHOT_MAX_AGE_HOURS, shouldCompact } from "./compaction";
 import { S3SdkAdapter } from "./s3-adapter";
 import { reconcileFile, ReconcileIO, UploadAction } from "./reconcile";
 import { makeMergeBaseResolver, resolveDiffBase } from "./merge-base";
@@ -225,14 +226,23 @@ async function main(): Promise<void> {
     log(`appended delta rev=${result.rev} (${uploads.size} entries)`);
   }
 
-  // ---- compaction (§3.3 step 8) -------------------------------------------
+  // ---- compaction (§3.3 step 8), age-gated (§2.5) ---------------------------
+  const maxSnapshotAgeMs =
+    Number(process.env.SNAPSHOT_MAX_AGE_HOURS ?? DEFAULT_SNAPSHOT_MAX_AGE_HOURS) * 3_600_000;
   const allNewDeltas = await listDeltasSince(storage, snapshotRev, CONCURRENCY);
   if (allNewDeltas.length > 0) {
-    const newSnapshot = foldDeltas(snap?.snapshot ?? null, allNewDeltas);
-    await writeSnapshot(storage, newSnapshot, snap?.etag);
-    const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
-    const pruned = await pruneDeltas(storage, newSnapshot.revision, cutoff, CONCURRENCY);
-    log(`compacted snapshot to rev=${newSnapshot.revision}, pruned ${pruned} deltas`);
+    if (shouldCompact(snap?.snapshot ?? null, maxSnapshotAgeMs)) {
+      const newSnapshot = foldDeltas(snap?.snapshot ?? null, allNewDeltas);
+      await writeSnapshot(storage, newSnapshot, snap?.etag);
+      const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
+      const pruned = await pruneDeltas(storage, newSnapshot.revision, cutoff, CONCURRENCY);
+      log(`compacted snapshot to rev=${newSnapshot.revision}, pruned ${pruned} deltas`);
+    } else {
+      log(
+        `compaction skipped: snapshot rev=${snapshotRev} younger than ` +
+          `${maxSnapshotAgeMs / 3_600_000}h (${allNewDeltas.length} unfolded deltas)`,
+      );
+    }
   }
 
   // ---- commit + push git side (§3.3 steps 6+9) ----------------------------

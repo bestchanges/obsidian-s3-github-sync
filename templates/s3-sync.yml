@@ -8,7 +8,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: "*/15 * * * *" # catches S3-side (plugin) changes + runs compaction
+    - cron: "0 */4 * * *" # catches S3-side (plugin) changes; snapshot compaction is age-gated to ~daily
   workflow_dispatch:
 
 concurrency:
@@ -57,4 +57,5 @@ jobs:
           AWS_REGION: ${{ vars.S3_SYNC_REGION }}
           REPO_DIR: ${{ github.workspace }}
           RETENTION_DAYS: "30"
+          SNAPSHOT_MAX_AGE_HOURS: "24" # rebuild snapshot.json.gz at most this often (0 = every run)
         run: npx --prefix .sync-tool tsx .sync-tool/packages/git-sync/src/main.ts

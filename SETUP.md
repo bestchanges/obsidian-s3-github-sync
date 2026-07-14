@@ -112,7 +112,7 @@ Create a dedicated IAM user with the same S3 permissions JSON as above (bucket-s
 
 ## Smoke test
 
-1. Edit a note in Obsidian → within ~20 s: delta appears in S3 (`deltas/`), and on the next Actions run (≤15 min, or trigger manually) a `s3-sync: rev N [skip ci]` commit lands in the repo.
+1. Edit a note in Obsidian → within ~20 s: delta appears in S3 (`deltas/`), and on the next Actions run (≤4 h on the cron — trigger manually to see it now) a `s3-sync: rev N [skip ci]` commit lands in the repo.
 2. Edit a file on GitHub (web UI) → workflow runs on push → plugin picks it up within one poll interval.
 3. Edit the **same line** of the same note in both places between syncs → after both legs run, the file contains both versions of the line (union), no conflict markers, everywhere.
 
