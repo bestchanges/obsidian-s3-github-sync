@@ -176,8 +176,9 @@ for GRANT in "FunctionURLPublicAccess lambda:InvokeFunctionUrl" \
   elif [ "${DRY_RUN:-0}" = 1 ]; then
     log "[dry-run] would add public $ACTION permission"
   else
+    # ${COND[@]+…}: empty-array expansion trips `set -u` on macOS bash 3.2
     aws lambda add-permission --function-name "$FUNC" --statement-id "$SID" \
-      --action "$ACTION" --principal '*' "${COND[@]}" \
+      --action "$ACTION" --principal '*' ${COND[@]+"${COND[@]}"} \
       --region "$REGION" --no-cli-pager >/dev/null
     log "public $ACTION permission added"
   fi
