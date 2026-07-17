@@ -161,17 +161,24 @@ else
           --query FunctionUrl --output text 2>/dev/null || true)"
   log "created"
 fi
-if aws lambda get-policy --function-name "$FUNC" --region "$REGION" \
-     --query Policy --output text 2>/dev/null | grep -q FunctionURLPublicAccess; then
-  log "public invoke permission present"
-elif [ "${DRY_RUN:-0}" = 1 ]; then
-  log "[dry-run] would add public lambda:InvokeFunctionUrl permission"
-else
-  aws lambda add-permission --function-name "$FUNC" --statement-id FunctionURLPublicAccess \
-    --action lambda:InvokeFunctionUrl --principal '*' --function-url-auth-type NONE \
-    --region "$REGION" --no-cli-pager >/dev/null
-  log "public invoke permission added"
-fi
+# Since Oct 2025 public function URLs need BOTH grants (InvokeFunctionUrl alone → 403 Forbidden).
+# The FunctionUrlAuthType=NONE condition scopes them to URL invocations only.
+POLICY_DOC="$(aws lambda get-policy --function-name "$FUNC" --region "$REGION" \
+                --query Policy --output text 2>/dev/null || true)"
+for GRANT in "FunctionURLPublicAccess lambda:InvokeFunctionUrl" \
+             "FunctionURLPublicInvokeFunction lambda:InvokeFunction"; do
+  SID="${GRANT%% *}"; ACTION="${GRANT##* }"
+  if printf '%s' "$POLICY_DOC" | grep -q "\"$SID\""; then
+    log "public $ACTION permission present"
+  elif [ "${DRY_RUN:-0}" = 1 ]; then
+    log "[dry-run] would add public $ACTION permission (condition: FunctionUrlAuthType=NONE)"
+  else
+    aws lambda add-permission --function-name "$FUNC" --statement-id "$SID" \
+      --action "$ACTION" --principal '*' --function-url-auth-type NONE \
+      --region "$REGION" --no-cli-pager >/dev/null
+    log "public $ACTION permission added"
+  fi
+done
 
 # --- 6. record + summary ----------------------------------------------------------------------
 if [ "${DRY_RUN:-0}" != 1 ] && [ -n "$URL" ]; then
