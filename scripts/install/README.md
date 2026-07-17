@@ -1,13 +1,15 @@
 # Install scripts
 
-Provision a vault-sync setup from the command line. Four small, idempotent scripts, split so each
-concern runs on its own — and so the **GitHub leg is optional** (an S3-only vault needs just 01, 02, 04).
+Provision a vault-sync setup from the command line. Five small, idempotent scripts, split so each
+concern runs on its own — and so the **GitHub leg is optional** (an S3-only vault needs just 01, 02, 04)
+and the **MCP leg is optional** (05).
 
 ```
 01-create-bucket.sh      shared S3 bucket (versioning, block-public, SSE-S3, CORS)   ── once per bucket
 02-create-user.sh        per-user IAM plugin user + access key (S3 leg)              ── once per user
 03-create-vault-repo.sh  per-vault GitHub repo + OIDC Actions role (git leg)         ── per vault, OPTIONAL
 04-init-vault-zip.sh      per-vault <vault>.zip for a device                          ── per vault
+05-create-mcp-server.sh  per-vault remote MCP server (Lambda + Function URL)         ── per vault, OPTIONAL
 ```
 
 Layout on S3: `s3://<bucket>/<user>/vaults/<vault>/…` where **`user` is your AWS IAM username**
@@ -15,7 +17,7 @@ Layout on S3: `s3://<bucket>/<user>/vaults/<vault>/…` where **`user` is your A
 
 ## Prerequisites
 
-- CLI tools: `aws`, `gh`, `jq`, `zip`, `node` (git-sync/plugin build needs Node ≥ 20).
+- CLI tools: `aws`, `gh`, `jq`, `zip`, `node` (git-sync/plugin build needs Node ≥ 20), `openssl` (05).
 - `aws` authenticated (`aws configure` / `aws sso login`) as a user/role with the permissions below.
 - `gh` authenticated (`gh auth login`) — only for the GitHub leg (03).
 
@@ -44,6 +46,14 @@ cp .env.shadow .env      # then edit .env
 ./04-init-vault-zip.sh --vault work
 ```
 
+**Remote MCP server for a vault (optional — lets Claude read/write the vault over the internet):**
+```bash
+./05-create-mcp-server.sh --vault work   # role + Lambda + Function URL + bearer token
+```
+It prints the endpoint and a ready-to-paste `claude mcp add …` command. Re-running reconciles
+config and redeploys the current build; `--rotate-token` replaces the bearer token. Component
+design and details: [`packages/mcp-server/README.md`](../../packages/mcp-server/README.md).
+
 Add a second vault for the same user: just `03` (optional) + `04` with a new `--vault`.
 Every script takes `--dry-run` (print, don't mutate) and `--yes` (skip confirmations).
 
@@ -59,6 +69,9 @@ plugins, and it starts pulling the whole vault. (No instructions ship inside the
   zip as a credential: transfer it privately and delete it after the device is set up. `*.zip` is
   gitignored.
 - Rotate a key with `./02-create-user.sh --rotate` (deletes old keys, mints a new one), then re-run `04`.
+- `05` writes the MCP bearer token to `.secrets/mcp-<user>-<vault>.json` (gitignored, `chmod 600`),
+  never printed — the printed `claude mcp add` command reads it from the file via `jq`. Rotate with
+  `./05-create-mcp-server.sh --rotate-token` (old token stops working immediately).
 
 ## Required permissions
 
@@ -85,10 +98,21 @@ bucket + the `vault-*` name pattern if you want least privilege:
       "Resource": "arn:aws:iam::*:role/vault-sync-*" },
     { "Sid": "Oidc", "Effect": "Allow",
       "Action": ["iam:CreateOpenIDConnectProvider","iam:ListOpenIDConnectProviders"],
-      "Resource": "*" }
+      "Resource": "*" },
+    { "Sid": "McpRole", "Effect": "Allow",
+      "Action": ["iam:CreateRole","iam:GetRole","iam:TagRole","iam:PutRolePolicy",
+                 "iam:AttachRolePolicy","iam:PassRole"],
+      "Resource": "arn:aws:iam::*:role/vault-mcp-*" },
+    { "Sid": "McpLambda", "Effect": "Allow",
+      "Action": ["lambda:CreateFunction","lambda:GetFunction","lambda:UpdateFunctionCode",
+                 "lambda:UpdateFunctionConfiguration","lambda:CreateFunctionUrlConfig",
+                 "lambda:GetFunctionUrlConfig","lambda:AddPermission","lambda:GetPolicy"],
+      "Resource": "arn:aws:lambda:*:*:function:vault-mcp-*" }
   ]
 }
 ```
+
+> `McpRole` / `McpLambda` are only needed for the optional MCP leg (05).
 
 > The `Sid: Bucket` statement also needs `arn:aws:s3:::YOUR-BUCKET/*` if you extend it, but the
 > configuration calls here act on the bucket itself. `iam:CreateOpenIDConnectProvider` is only
@@ -101,6 +125,8 @@ bucket + the `vault-*` name pattern if you want least privilege:
 | plugin IAM user `vault-plugin-<user>` | objects under `s3://<bucket>/<user>/*` + scoped `ListBucket` |
 | Actions role `vault-sync-<user>` | same S3 scope; trusts `repo:<org>/<vault-repo>:*` via GitHub OIDC |
 | GitHub OIDC provider | account-wide, created once |
+| MCP execution role `vault-mcp-<user>` | same S3 scope + CloudWatch Logs; trusts `lambda.amazonaws.com` |
+| Lambda `vault-mcp-<user>-<vault>` + Function URL | one per vault; public URL, bearer auth enforced in-handler |
 
 ### GitHub — the `gh` account (leg 03 only)
 

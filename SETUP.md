@@ -110,6 +110,20 @@ First sync pulls the whole S3 state (seeded by step 4). If the vault already has
 
 Create a dedicated IAM user with the same S3 permissions JSON as above (bucket-scoped only) and one access key per device. The plugin stores the key in the plugin's `data.json` on that device.
 
+## 7. Remote MCP server (optional)
+
+Expose the vault to MCP clients (Claude Code / Desktop) over the internet — a single Lambda +
+Function URL, bearer-token auth, ~$0/month:
+
+```bash
+scripts/install/05-create-mcp-server.sh --vault <name>
+```
+
+It provisions role + function + URL + token idempotently and prints a ready-to-paste
+`claude mcp add …` command. Design: [MCP Server Design.md](MCP%20Server%20Design.md); component
+details: [packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
+[scripts/install/README.md](scripts/install/README.md).
+
 ## Smoke test
 
 1. Edit a note in Obsidian → within ~20 s: delta appears in S3 (`deltas/`), and on the next Actions run (≤4 h on the cron — trigger manually to see it now) a `s3-sync: rev N [skip ci]` commit lands in the repo.

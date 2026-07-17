@@ -12,6 +12,9 @@ two clients — a GitHub Actions **git-sync** job and an **Obsidian plugin** —
   reference (repo layout §1, protocol §2, adapters §3, plugin §4, git-sync §5, exclusion matrix §6,
   config §7, deployment/infra §8, failure/recovery §9, security §10, constants §11).
 - **Design rationale ("why"):** [System Design.md](System%20Design.md).
+- **MCP server (optional third client):** [MCP Server Design.md](MCP%20Server%20Design.md) — design;
+  [packages/mcp-server/README.md](packages/mcp-server/README.md) — component details;
+  installed via `scripts/install/05-create-mcp-server.sh`.
 - **Infra bootstrap (bucket, CORS, OIDC/IAM, workflow install):** [SETUP.md](SETUP.md).
 - **Top-level tour:** [README.md](README.md).
 
@@ -26,6 +29,7 @@ npm-workspaces monorepo: `packages/core` (pure protocol, no platform APIs), `pac
 npm test              # Vitest: core protocol/merge + plugin sync-serialization tests
 npm run typecheck     # tsc --noEmit across all three packages
 npm run build:plugin  # esbuild → packages/obsidian-plugin/dist/ (+ deployment zip)
+npm run build:mcp     # esbuild → packages/mcp-server/dist/ (Lambda bundle + zip)
 npm run bump:plugin -- <x.y.z>   # version bump across manifest/package/versions.json
 ```
 

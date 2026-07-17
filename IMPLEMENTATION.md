@@ -21,7 +21,9 @@ from the POC design. Section §12 maps design → implementation for anyone hold
 > git-sync. Sync traffic is proportional to *changed* files, never vault size. Conflicts resolve by
 > three-way **union merge** (one implementation, both legs). The plugin adds per-device identity,
 > a split settings/state persistence model, a per-device download cap, full `.obsidian` config sync
-> with a per-device denylist, and a one-click "starter vault" exporter.
+> with a per-device denylist, and a one-click "starter vault" exporter. An optional third client —
+> a stateless **MCP server** on AWS Lambda — exposes a vault to MCP clients over the internet
+> (design: [[MCP Server Design.md|MCP Server Design.md]], details: `packages/mcp-server/README.md`).
 
 ```mermaid
 flowchart LR
@@ -59,6 +61,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
+| `packages/mcp-server/` | Optional third client: remote MCP server on Lambda (stateless, bearer-auth POC). Module map + behavior: its `README.md`; rationale: [[MCP Server Design.md\|MCP Server Design.md]]. |
 | `templates/s3-sync.yml` | The Actions workflow the content repo installs. |
 
 Build/test: `npm test` (Vitest — protocol + merge fixtures), `npm run typecheck`,
@@ -610,6 +613,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
   `.github/workflows/s3-sync.yml`; it checks out the content repo (full history) **and** the tool
   repo into `.sync-tool/`, then runs `tsx packages/git-sync/src/main.ts`.
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
+- **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
+  role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`
+  per request, writes CAS-append `by: "mcp"`. See `packages/mcp-server/README.md`.
 - **Plugin distribution** — because `.obsidian` now syncs, a new `main.js` committed/synced into one
   vault propagates to all devices as ordinary vault content; the starter-vault export bootstraps a
   brand-new device.
