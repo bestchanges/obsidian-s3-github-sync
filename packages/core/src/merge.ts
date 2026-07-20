@@ -1,4 +1,5 @@
 import { diff3Merge, diffComm } from "node-diff3";
+import { mergeNoteWithFrontmatter } from "./frontmatter";
 
 /**
  * Three-way UNION merge — the single merge implementation for BOTH sync legs
@@ -11,6 +12,11 @@ import { diff3Merge, diffComm } from "node-diff3";
  * Identical output on both legs is required: divergent merge results would
  * echo back through sync as phantom changes. Both diff3Merge and diffComm are
  * pure and deterministic, so the two legs stay byte-identical.
+ *
+ * YAML frontmatter is a special case: line-stacking two edits of the same
+ * property duplicates the key and breaks Obsidian's parser, so when both sides
+ * carry a frontmatter block we merge it structurally (per-key) and union-merge
+ * only the body — see frontmatter.ts.
  */
 export interface UnionMergeResult {
   text: string;
@@ -33,6 +39,21 @@ function mergeConflictSides(a: string[], b: string[]): string[] {
 }
 
 export function unionMerge(base: string, ours: string, theirs: string): UnionMergeResult {
+  if (ours === theirs) return { text: ours, hadConflicts: false };
+  if (base === ours) return { text: theirs, hadConflicts: false };
+  if (base === theirs) return { text: ours, hadConflicts: false };
+
+  // Both sides changed. If both carry YAML frontmatter, merge it per-key so conflicting properties
+  // don't stack into duplicate keys; falls back to the plain line merge (text === null) otherwise.
+  const fm = mergeNoteWithFrontmatter(base, ours, theirs, unionMergeText);
+  if (fm.text !== null) return { text: fm.text, hadConflicts: fm.hadConflicts };
+
+  return unionMergeText(base, ours, theirs);
+}
+
+/** The plain line-based union merge (no frontmatter awareness). Used for note bodies and for notes
+ * that don't have frontmatter on both sides. */
+function unionMergeText(base: string, ours: string, theirs: string): UnionMergeResult {
   if (ours === theirs) return { text: ours, hadConflicts: false };
   if (base === ours) return { text: theirs, hadConflicts: false };
   if (base === theirs) return { text: ours, hadConflicts: false };
