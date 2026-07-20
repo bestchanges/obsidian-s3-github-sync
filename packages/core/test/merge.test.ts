@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { parse } from "yaml";
 import { unionMerge } from "../src/merge";
 
 /** THE critical suite (§5): both sync legs must produce these exact outputs. */
@@ -118,5 +119,77 @@ describe("unionMerge conflict-region dedup", () => {
     const theirs = ["# Note", ...rows, "theirs tail"].join("\n");
     const first = unionMerge("", ours, theirs).text;
     for (let i = 0; i < 5; i++) expect(unionMerge("", ours, theirs).text).toBe(first);
+  });
+});
+
+/** Frontmatter is merged PER-KEY so conflicting edits of the same property don't stack into a
+ * duplicate key (which breaks Obsidian's YAML parser). §2.6. */
+describe("unionMerge YAML frontmatter", () => {
+  const note = (fm: string, body: string) => `---\n${fm}\n---\n${body}`;
+
+  it("conflicting scalar property never duplicates the key (takes theirs/remote)", () => {
+    const base = note("updated: 2026-07-18\ntitle: Hi", "body");
+    const ours = note("updated: 2026-07-19\ntitle: Hi", "body");
+    const theirs = note("updated: 2026-07-20\ntitle: Hi", "body");
+    const r = unionMerge(base, ours, theirs);
+    expect(r.text.match(/^updated:/gm)?.length).toBe(1); // exactly one `updated:` key
+    expect(r.text).toContain("updated: 2026-07-20"); // remote/S3 side wins, deterministic
+    expect(r.hadConflicts).toBe(true);
+    expect(r.text).not.toContain("<<<<<<<");
+  });
+
+  it("non-overlapping property edits both survive", () => {
+    const base = note("a: 1\nb: 2", "body");
+    const ours = note("a: 10\nb: 2", "body");
+    const theirs = note("a: 1\nb: 20", "body");
+    const r = unionMerge(base, ours, theirs);
+    expect(r.text).toContain("a: 10");
+    expect(r.text).toContain("b: 20");
+    expect(r.hadConflicts).toBe(false);
+  });
+
+  it("list properties (tags) are unioned, not duplicated", () => {
+    const base = note("tags:\n  - x", "body");
+    const ours = note("tags:\n  - x\n  - ours", "body");
+    const theirs = note("tags:\n  - x\n  - theirs", "body");
+    const r = unionMerge(base, ours, theirs);
+    const parsed = parse(r.text.split("\n---\n")[0].replace(/^---\n/, ""));
+    expect(parsed.tags).toEqual(["x", "ours", "theirs"]);
+    expect(r.hadConflicts).toBe(false);
+  });
+
+  it("delete-vs-edit of a property keeps the edit (nothing silently lost)", () => {
+    const base = note("keep: yes\ndoomed: old", "body");
+    const ours = note("keep: yes", "body"); // ours deleted `doomed`
+    const theirs = note("keep: yes\ndoomed: new", "body"); // theirs edited it
+    const r = unionMerge(base, ours, theirs);
+    expect(r.text).toContain("doomed: new");
+  });
+
+  it("still union-merges the BODY under a frontmatter conflict", () => {
+    const base = note("v: 1", "title\noriginal\nfooter");
+    const ours = note("v: 2", "title\nours version\nfooter");
+    const theirs = note("v: 3", "title\ntheirs version\nfooter");
+    const r = unionMerge(base, ours, theirs);
+    expect(r.text).toContain("ours version");
+    expect(r.text).toContain("theirs version");
+    expect(r.text.match(/^v:/gm)?.length).toBe(1);
+  });
+
+  it("is deterministic across repeated runs (cross-leg parity)", () => {
+    const base = note("updated: 1\ntags:\n  - x", "body a\nbody b");
+    const ours = note("updated: 2\ntags:\n  - x\n  - o", "body a EDIT\nbody b");
+    const theirs = note("updated: 3\ntags:\n  - x\n  - t", "body a\nbody b EDIT");
+    const first = unionMerge(base, ours, theirs).text;
+    for (let i = 0; i < 5; i++) expect(unionMerge(base, ours, theirs).text).toBe(first);
+  });
+
+  it("falls back to line merge when only one side has frontmatter", () => {
+    const base = "plain\nbody";
+    const ours = note("a: 1", "plain\nbody"); // ours added frontmatter
+    const theirs = "plain\nbody EDIT"; // theirs edited body, no frontmatter
+    const r = unionMerge(base, ours, theirs);
+    // no crash, no structural merge assumptions — just a valid union of both sides
+    expect(r.text).toContain("body EDIT");
   });
 });

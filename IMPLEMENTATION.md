@@ -155,6 +155,16 @@ blind concatenation there duplicated the entire block, the dedup keeps it single
 implementation both legs import; divergent merge output would echo back through sync as phantom
 changes, so both `diff3Merge` and `diffComm` must stay pure and deterministic.
 
+**YAML frontmatter** (`frontmatter.ts`) is the same hazard one level down: line-stacking two edits of
+the same property yields a duplicated key (`updated: A` / `updated: B`) that breaks Obsidian's property
+parser. So when **both** sides of a note carry a frontmatter block, `unionMerge` splits it off and
+merges it **per-key** — one-sided edits apply; list props (`tags`, `aliases`) union; a delete-vs-edit
+keeps the edit; two differing scalars take **theirs** (the S3/remote value, so both legs converge on
+the hub instead of fighting) — then union-merges only the body. Key order and re-serialization are
+deterministic, and reserialization happens only on a genuine conflict (the equal/one-sided fast paths
+return a side verbatim), so both legs stay byte-identical. Notes without frontmatter on both sides, or
+with unparseable/non-mapping YAML, fall back to the plain line merge.
+
 Union merge is applied only to **text notes** within the size cap. **Config files** (`.obsidian/**`)
 and **binary/oversized** content resolve by **freshest-wins** instead (§4.8, §5.4) — line-merging
 JSON stacked its lines into duplicated keys — and that choice, too, is duplicated byte-for-byte
