@@ -4,6 +4,7 @@ import {
   encodeText,
   FileEntry,
   isTombstone,
+  remoteIsFresher,
   SnapshotEntry,
   unionMerge,
 } from "@vault-sync/core";
@@ -102,14 +103,32 @@ export async function reconcileFile(
     if (remoteContent === null) {
       return buildUpload(local); // our edit wins over their delete (un-tombstones)
     }
-    // Config files (.obsidian/**) and binary/oversized content resolve by FRESHEST-WINS, in lockstep
-    // with the plugin (engine.ts resolveFreshestWins): union-merging JSON duplicates lines and
-    // binaries can't three-way merge, while a keep-local rule ping-pongs between divergent copies.
-    // Newer author date wins; no bytes are synthesized, so the two legs stay convergent.
+    // Config files (.obsidian/**) and binary/oversized content resolve without a line merge (JSON
+    // duplicates lines, binaries can't three-way merge), in lockstep with the plugin (engine.ts).
     if (isConfigPath(p) || !isTextMergeable(p, local.byteLength, remoteContent.byteLength)) {
       if (contentHash(local) === contentHash(remoteContent)) return null; // already equal
+      // Base-aware fast-forward FIRST: if one side's content equals the base git and S3 last agreed
+      // on, that side didn't really change — it's a no-op re-push — so take the OTHER side outright,
+      // with NO timestamp race. This is what stops a stale re-upload of the OLD content from winning
+      // freshest-wins and reverting a genuine edit (the manifest 0.2.1→0.2.0 revert). Text only: the
+      // merge base is decoded text (reliable for JSON/JS/config, meaningless for binary).
+      if (isTextPath(p)) {
+        const base = await io.mergeBase(p);
+        if (base !== "") {
+          const localText = decodeText(local);
+          const remoteText = decodeText(remoteContent);
+          if (remoteText === base && localText !== base) return buildUpload(local); // remote unchanged → git wins
+          if (localText === base && remoteText !== base) {
+            await io.writeLocal(p, remoteContent); // git unchanged → S3 wins, nothing to push up
+            return null;
+          }
+        }
+      }
+      // Genuine divergence (both differ from base): FRESHEST-WINS. Newer author date wins, compared
+      // chronologically not lexicographically (remoteIsFresher); no bytes are synthesized, so the two
+      // legs stay convergent even if clock skew makes them pick different sides on one pass.
       const remoteMtime = (inS3 as FileEntry).mtime;
-      if (remoteMtime > (await io.authorDate(p))) {
+      if (remoteIsFresher(remoteMtime, await io.authorDate(p))) {
         await io.writeLocal(p, remoteContent); // remote is newer → take it, nothing to push up
         return null;
       }

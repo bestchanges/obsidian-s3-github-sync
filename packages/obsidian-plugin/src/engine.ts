@@ -14,6 +14,7 @@ import {
   loadRemoteState,
   mapPool,
   readSnapshot,
+  remoteIsFresher,
   SnapshotEntry,
   StorageAdapter,
   unionMerge,
@@ -628,6 +629,17 @@ export class SyncEngine {
     // keep-local rule, which ping-pongs a fresh delta every poll while two devices hold divergent
     // copies. Text notes within the size cap still three-way union-merge (lossless).
     if (this.usesFreshestWins(path, localBuf!.byteLength)) {
+      // Base-aware fast-forward before any mtime race: a remote whose content equals the base we
+      // last synced (st.hash) is a no-op re-push, NOT a competing edit — keep our genuine local edit
+      // and re-push it, so an older-content re-upload with a newer mtime can't revert it. (The mirror
+      // — local unchanged from base — already resolved above as !localDirty → take remote.) Text
+      // notes never reach here; their union merge collapses base==theirs to ours on its own.
+      if (st && remote.hash === st.hash) {
+        this.dirty.add(path); // keep local, re-push it
+        this.merged++;
+        this.recordMerged(path);
+        return;
+      }
       await this.resolveFreshestWins(path, remote);
       return;
     }
@@ -672,7 +684,9 @@ export class SyncEngine {
   private async resolveFreshestWins(path: string, remote: FileEntry & SnapshotEntry): Promise<void> {
     const stat = await this.vault.adapter.stat(path);
     const localMtime = stat ? new Date(stat.mtime).toISOString() : "";
-    if (remote.mtime > localMtime) {
+    // Chronological (parsed) compare, not lexicographic — the two legs emit mtimes in different ISO
+    // shapes/timezones and string order diverges from real time order (remoteIsFresher, §2.6).
+    if (remoteIsFresher(remote.mtime, localMtime)) {
       const obj = await this.storage.get(`files/${path}`);
       if (!obj) {
         this.dirty.add(path); // remote vanished mid-resolve — keep local, re-push
