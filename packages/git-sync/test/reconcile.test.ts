@@ -123,6 +123,56 @@ describe("reconcileFile binary safety", () => {
     expect(decodeText(writes.get(".obsidian/appearance.json")!)).toBe(decodeText(s3Json)); // verbatim, not merged
   });
 
+  // Base-aware fast-forward: a side whose content equals the last-agreed base didn't really change,
+  // so the other side wins outright — no mtime race. This is the direct fix for the manifest revert.
+  const MANIFEST = ".obsidian/plugins/calendar-tracker/manifest.json";
+  const v020 = encodeText('{"id":"calendar-tracker","version":"0.2.0"}\n');
+  const v021 = encodeText('{"id":"calendar-tracker","version":"0.2.1"}\n');
+
+  it("REGRESSION: a stale re-push of the OLD content (== base) does NOT revert git's newer edit", async () => {
+    // git has the new 0.2.1; S3 holds a re-uploaded OLD 0.2.0 (== base) with a STRICTLY NEWER mtime.
+    // Old freshest-wins took S3's 0.2.0 (the revert); base-ff keeps git's 0.2.1 regardless of mtime.
+    const entry = { ...remoteEntry(v020), mtime: "2099-01-01T00:00:00.000Z" } as SnapshotEntry;
+    const { io, writes } = makeIO({
+      local: { [MANIFEST]: v021 },
+      remote: { [MANIFEST]: v020 },
+      base: { [MANIFEST]: decodeText(v020) },
+    });
+
+    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    expect(decodeText(asUpload(action).content)).toBe(decodeText(v021)); // git's 0.2.1 re-pushed
+    expect(writes.has(MANIFEST)).toBe(false); // working tree NOT reverted to 0.2.0
+  });
+
+  it("base-ff mirror: git side unchanged from base → take remote's genuine edit, no push", async () => {
+    const entry = { ...remoteEntry(v021), mtime: "2020-01-01T00:00:00.000Z" } as SnapshotEntry; // even with OLDER mtime
+    const { io, writes } = makeIO({
+      local: { [MANIFEST]: v020 }, // == base, git didn't really change it
+      remote: { [MANIFEST]: v021 },
+      base: { [MANIFEST]: decodeText(v020) },
+    });
+
+    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    expect(action).toBeNull(); // nothing to push
+    expect(decodeText(writes.get(MANIFEST)!)).toBe(decodeText(v021)); // took remote's 0.2.1
+  });
+
+  it("genuine divergence (both differ from base) still resolves by freshest-wins", async () => {
+    // base 0.1.0, git 0.2.1, S3 0.2.0 with a newer mtime — a real concurrent conflict, NOT a no-op
+    // re-push, so base-ff doesn't apply and the mtime tiebreak governs (the residual semver case).
+    const v010 = encodeText('{"id":"calendar-tracker","version":"0.1.0"}\n');
+    const entry = { ...remoteEntry(v020), mtime: "2099-01-01T00:00:00.000Z" } as SnapshotEntry;
+    const { io, writes } = makeIO({
+      local: { [MANIFEST]: v021 },
+      remote: { [MANIFEST]: v020 },
+      base: { [MANIFEST]: decodeText(v010) },
+    });
+
+    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    expect(action).toBeNull(); // remote's newer mtime wins the true conflict
+    expect(decodeText(writes.get(MANIFEST)!)).toBe(decodeText(v020));
+  });
+
   it("text conflict (both changed): still three-way union-merges", async () => {
     const base = "line1\nline2\n";
     const local = "line1\nline2\nlocal-add\n";
