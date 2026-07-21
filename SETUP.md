@@ -124,6 +124,14 @@ It provisions role + function + URL + token idempotently and prints a ready-to-p
 details: [packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
 [scripts/install/README.md](scripts/install/README.md).
 
+## 8. Backups (recommended)
+
+The vault lives in S3, the GitHub repo, and every device — but all three are **one live-synced
+failure domain**, so none is a backup (a bad merge, mass delete, or leaked key propagates to all).
+Set up decoupled, versioned, off-account backups — external drive + Backblaze B2 + Google Drive via
+**restic**. Design, threat model, and runbook: **[BACKUP.md](BACKUP.md)**; tooling in
+`scripts/backup/` and `templates/s3-backup.yml`.
+
 ## Smoke test
 
 1. Edit a note in Obsidian → within ~20 s: delta appears in S3 (`deltas/`), and on the next Actions run (≤4 h on the cron — trigger manually to see it now) a `s3-sync: rev N [skip ci]` commit lands in the repo.
