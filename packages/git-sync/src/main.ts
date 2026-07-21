@@ -25,8 +25,9 @@ import {
 import { Git } from "./git";
 import { DEFAULT_SNAPSHOT_MAX_AGE_HOURS, shouldCompact } from "./compaction";
 import { S3SdkAdapter } from "./s3-adapter";
-import { reconcileFile, ReconcileIO, UploadAction } from "./reconcile";
+import { reconcileFile, ReconcileIO, ReconcileOutcome, UploadAction } from "./reconcile";
 import { makeMergeBaseResolver, resolveDiffBase } from "./merge-base";
+import { createLogger } from "./log";
 
 const WRITER_ID = "git-sync";
 const STATE_PATH = ".sync/state.json";
@@ -40,8 +41,64 @@ interface SyncStateFile {
   lastSyncedCommit: string | null;
 }
 
-function log(msg: string): void {
-  console.log(`[git-sync] ${msg}`);
+const logger = createLogger();
+
+/** Emit one greppable line per file, bucketed by what reconcile did, inside a collapsible Actions
+ * group, then a one-line summary. Arrow prefixes mirror the plugin's log (engine.ts): ↓ pulled from
+ * S3, ↑ pushed to S3, ⇅ merged, – skipped. Union-merge conflicts also warn (→ Actions annotation). */
+function logCycleDetail(
+  outcomes: Map<string, ReconcileOutcome>,
+  skipped: { p: string; reason: string }[],
+): void {
+  const counts = { pulled: 0, pulledNew: 0, pushed: 0, pushedNew: 0, deleted: 0, merged: 0, conflicts: 0 };
+  const lines: string[] = [];
+  const conflictPaths: string[] = [];
+
+  for (const [p, o] of outcomes) {
+    switch (o.kind) {
+      case "pulled":
+        counts.pulled++;
+        if (o.created) counts.pulledNew++;
+        lines.push(o.created ? `↓ new    ${p} (from S3)` : `↓ update ${p} (external edit)`);
+        break;
+      case "deletedLocal":
+        counts.deleted++;
+        lines.push(`↓ delete ${p} (external tombstone)`);
+        break;
+      case "pushed":
+        counts.pushed++;
+        if (o.created) counts.pushedNew++;
+        lines.push(o.created ? `↑ new    ${p} (to S3)` : `↑ update ${p} (to S3)`);
+        break;
+      case "tombstoned":
+        counts.deleted++;
+        lines.push(`↑ delete ${p} (tombstoned)`);
+        break;
+      case "merged":
+        counts.merged++;
+        if (o.conflicts) {
+          counts.conflicts++;
+          conflictPaths.push(p);
+        }
+        lines.push(`⇅ merged ${p} (union${o.conflicts ? ", conflicts" : ""})`);
+        break;
+    }
+  }
+  for (const { p, reason } of skipped) lines.push(`– skip   ${p} (${reason})`);
+
+  if (lines.length > 0) {
+    logger.group("sync detail");
+    for (const l of lines.sort()) logger.info(l);
+    logger.endGroup();
+  }
+  for (const p of conflictPaths) logger.warn(`union-merge conflict in ${p}`);
+
+  logger.info(
+    `summary: ${counts.pulled} pulled (${counts.pulledNew} new), ` +
+      `${counts.pushed} pushed (${counts.pushedNew} new), ` +
+      `${counts.deleted} deleted, ${counts.merged} merged (${counts.conflicts} conflicts), ` +
+      `${skipped.length} skipped`,
+  );
 }
 
 /** Reject anything that could escape the repo. */
@@ -68,7 +125,7 @@ async function main(): Promise<void> {
   try {
     state = JSON.parse(await fs.readFile(path.join(repoDir, STATE_PATH), "utf8")) as SyncStateFile;
   } catch {
-    log("no .sync/state.json — first run (full sync)");
+    logger.info("no .sync/state.json — first run (full sync)");
   }
 
   const head = await git.headSha();
@@ -114,7 +171,7 @@ async function main(): Promise<void> {
       ]),
     );
   } else {
-    if (state.lastSyncedCommit) log("history rewritten — falling back to full-state diff");
+    if (state.lastSyncedCommit) logger.warn("history rewritten — falling back to full-state diff");
     gitChanged = new Map((await git.trackedFiles()).map((p) => [p, "upsert"]));
   }
   for (const p of [...gitChanged.keys()]) {
@@ -128,23 +185,27 @@ async function main(): Promise<void> {
   const deltasAfterSnapshot = await listDeltasSince(storage, snapshotRev, CONCURRENCY);
   const remote = foldDeltas(snap?.snapshot ?? null, deltasAfterSnapshot);
 
+  // Per-cycle detail, aggregated for one greppable line per file in the "sync detail" group below.
+  // Mirrors the plugin's per-cycle `detail` buckets (engine.ts §logCycleDetail).
+  const skipped: { p: string; reason: string }[] = [];
+
   const s3Changed = new Map<string, SnapshotEntry>();
   for (const [p, entry] of Object.entries(remote.files)) {
     if (entry.rev > state.lastSyncedRev && entry.by !== WRITER_ID) s3Changed.set(p, entry);
   }
   for (const p of [...s3Changed.keys()]) {
     if (!isSafeRelPath(p)) {
-      log(`WARN: unsafe path from S3 skipped: ${p}`);
+      logger.warn(`unsafe path from S3 skipped: ${p}`);
       s3Changed.delete(p);
     } else if (ig.ignores(p)) {
-      log(`WARN: S3 delta under GitHub-only path skipped: ${p}`);
+      logger.warn(`S3 delta under GitHub-only path skipped: ${p}`);
       s3Changed.delete(p);
     }
   }
   // .gitignore'd paths from S3 stay S3-only (§3.4)
   const gitIgnored = await git.checkIgnore([...s3Changed.keys()]);
   for (const p of gitIgnored) {
-    log(`skip (.gitignore, stays S3-only): ${p}`);
+    skipped.push({ p, reason: ".gitignore, S3-only" });
     s3Changed.delete(p);
   }
   // Oversized files stay S3-only: never write them into the git tree (size is in the manifest,
@@ -153,12 +214,12 @@ async function main(): Promise<void> {
   for (const [p, entry] of [...s3Changed]) {
     const size = (entry as FileEntry & SnapshotEntry).size;
     if (!isTombstone(entry) && typeof size === "number" && size > maxGitFileBytes) {
-      log(`skip (${size}B > ${maxGitFileBytes}B, stays S3-only): ${p}`);
+      skipped.push({ p, reason: `${size}B > ${maxGitFileBytes}B, S3-only` });
       s3Changed.delete(p);
     }
   }
 
-  log(
+  logger.info(
     `HEAD=${head.slice(0, 8)} lastRev=${state.lastSyncedRev} remoteRev=${remote.revision} ` +
       `gitChanged=${gitChanged.size} s3Changed=${s3Changed.size}`,
   );
@@ -182,6 +243,14 @@ async function main(): Promise<void> {
         return null;
       }
     },
+    existsLocal: async (p) => {
+      try {
+        await fs.stat(path.join(repoDir, p));
+        return true;
+      } catch {
+        return false;
+      }
+    },
     fetchRemote: async (p, entry) => {
       const obj = await storage.get(`files/${p}`, {
         versionId: (entry as FileEntry & SnapshotEntry).s3VersionId,
@@ -198,13 +267,16 @@ async function main(): Promise<void> {
     },
     mergeBase,
     authorDate: (p) => git.authorDateIso(p),
-    log,
   };
 
+  const outcomes = new Map<string, ReconcileOutcome>();
   await mapPool([...allPaths], CONCURRENCY, async (p) => {
-    const action = await reconcileFile(p, gitChanged.get(p), s3Changed.get(p), remote, io);
+    const { action, outcome } = await reconcileFile(p, gitChanged.get(p), s3Changed.get(p), remote, io);
     if (action) uploads.set(p, action);
+    if (outcome.kind !== "noop") outcomes.set(p, outcome);
   });
+
+  logCycleDetail(outcomes, skipped);
 
   // ---- push to S3: files, then one delta (§1.3) ---------------------------
   if (uploads.size > 0) {
@@ -221,9 +293,9 @@ async function main(): Promise<void> {
       storage,
       remote.revision + 1,
       (rev): Delta => ({ rev, by: WRITER_ID, at: new Date().toISOString(), files }),
-      (winner) => log(`lost CAS race to ${winner.by}@${winner.rev}; retrying`),
+      (winner) => logger.warn(`lost CAS race to ${winner.by}@${winner.rev}; retrying`),
     );
-    log(`appended delta rev=${result.rev} (${uploads.size} entries)`);
+    logger.info(`appended delta rev=${result.rev} (${uploads.size} entries)`);
   }
 
   // ---- compaction (§3.3 step 8), age-gated (§2.5) ---------------------------
@@ -236,9 +308,9 @@ async function main(): Promise<void> {
       await writeSnapshot(storage, newSnapshot, snap?.etag);
       const cutoff = new Date(Date.now() - retentionDays * 86_400_000);
       const pruned = await pruneDeltas(storage, newSnapshot.revision, cutoff, CONCURRENCY);
-      log(`compacted snapshot to rev=${newSnapshot.revision}, pruned ${pruned} deltas`);
+      logger.info(`compacted snapshot to rev=${newSnapshot.revision}, pruned ${pruned} deltas`);
     } else {
-      log(
+      logger.debug(
         `compaction skipped: snapshot rev=${snapshotRev} younger than ` +
           `${maxSnapshotAgeMs / 3_600_000}h (${allNewDeltas.length} unfolded deltas)`,
       );
@@ -266,14 +338,14 @@ async function main(): Promise<void> {
     // (resolveDiffBase), not at this cursor. One commit, no state-commit regress.
     await git.commit(`s3-sync: rev ${finalRev} [skip ci]`);
     await git.push();
-    log(`committed + pushed (${(await git.headSha()).slice(0, 8)})`);
+    logger.info(`committed + pushed (${(await git.headSha()).slice(0, 8)})`);
   } else {
-    log("nothing to commit");
+    logger.info("nothing to commit");
   }
-  log("done");
+  logger.info("done");
 }
 
 main().catch((err) => {
-  console.error("[git-sync] FAILED:", err);
+  createLogger().error(`FAILED: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
   process.exit(1);
 });

@@ -58,4 +58,5 @@ jobs:
           REPO_DIR: ${{ github.workspace }}
           RETENTION_DAYS: "30"
           SNAPSHOT_MAX_AGE_HOURS: "24" # rebuild snapshot.json.gz at most this often (0 = every run)
+          LOG_LEVEL: "info" # debug|info|warn|error — bump to debug for per-file no-op/skip diagnostics
         run: npx --prefix .sync-tool tsx .sync-tool/packages/git-sync/src/main.ts
