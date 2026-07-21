@@ -15,12 +15,12 @@ function makeIO(seed: {
   const removes: string[] = [];
   const io: ReconcileIO = {
     readLocal: async (p) => local.get(p) ?? null,
+    existsLocal: async (p) => local.has(p),
     fetchRemote: async (p) => remote.get(p) ?? null,
     writeLocal: async (p, bytes) => void writes.set(p, bytes),
     removeLocal: async (p) => void removes.push(p),
     mergeBase: async (p) => base.get(p) ?? "",
     authorDate: async () => "2026-07-13T00:00:00.000Z",
-    log: () => {},
   };
   return { io, writes, removes };
 }
@@ -52,7 +52,7 @@ describe("reconcileFile binary safety", () => {
 
   it("git → S3: uploads a binary byte-for-byte, no corruption or inflation", async () => {
     const { io } = makeIO({ local: { "inbox/img.jpg": JPEG } });
-    const action = await reconcileFile("inbox/img.jpg", "upsert", undefined, { files: {} }, io);
+    const { action } = await reconcileFile("inbox/img.jpg", "upsert", undefined, { files: {} }, io);
 
     const up = asUpload(action);
     expect([...up.content]).toEqual([...JPEG]); // identical bytes
@@ -65,7 +65,7 @@ describe("reconcileFile binary safety", () => {
     const entry = remoteEntry(png);
     const { io, writes } = makeIO({ remote: { "a.png": png } });
 
-    const action = await reconcileFile("a.png", undefined, entry, { files: { "a.png": entry } }, io);
+    const { action } = await reconcileFile("a.png", undefined, entry, { files: { "a.png": entry } }, io);
     expect(action).toBeNull();
     expect([...writes.get("a.png")!]).toEqual([...png]);
   });
@@ -74,7 +74,7 @@ describe("reconcileFile binary safety", () => {
     const entry = remoteEntry(JPEG);
     const { io } = makeIO({ local: { "img.jpg": JPEG } });
     // git-only change, but remote already holds identical bytes → nothing to push
-    const action = await reconcileFile("img.jpg", "upsert", undefined, { files: { "img.jpg": entry } }, io);
+    const { action } = await reconcileFile("img.jpg", "upsert", undefined, { files: { "img.jpg": entry } }, io);
     expect(action).toBeNull();
   });
 
@@ -84,7 +84,7 @@ describe("reconcileFile binary safety", () => {
     const entry = remoteEntry(s3Bytes); // mtime == the IO's authorDate → tie → git side keeps
     const { io, writes } = makeIO({ local: { "x.bin": gitBytes }, remote: { "x.bin": s3Bytes } });
 
-    const action = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
+    const { action } = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
     expect([...asUpload(action).content]).toEqual([...gitBytes]); // git wins the tie, byte-clean
     expect(writes.has("x.bin")).toBe(false); // working tree already has git's bytes
   });
@@ -95,7 +95,7 @@ describe("reconcileFile binary safety", () => {
     const entry = { ...remoteEntry(s3Bytes), mtime: "2027-01-01T00:00:00.000Z" } as SnapshotEntry;
     const { io, writes } = makeIO({ local: { "x.bin": gitBytes }, remote: { "x.bin": s3Bytes } });
 
-    const action = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
+    const { action } = await reconcileFile("x.bin", "upsert", entry, { files: { "x.bin": entry } }, io);
     expect(action).toBeNull(); // remote newer → nothing pushed up
     expect([...writes.get("x.bin")!]).toEqual([...s3Bytes]); // working tree updated to S3's bytes
   });
@@ -112,7 +112,7 @@ describe("reconcileFile binary safety", () => {
       base: { ".obsidian/appearance.json": '{"theme":"system"}\n' },
     });
 
-    const action = await reconcileFile(
+    const { action } = await reconcileFile(
       ".obsidian/appearance.json",
       "upsert",
       entry,
@@ -139,7 +139,7 @@ describe("reconcileFile binary safety", () => {
       base: { [MANIFEST]: decodeText(v020) },
     });
 
-    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    const { action } = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
     expect(decodeText(asUpload(action).content)).toBe(decodeText(v021)); // git's 0.2.1 re-pushed
     expect(writes.has(MANIFEST)).toBe(false); // working tree NOT reverted to 0.2.0
   });
@@ -152,7 +152,7 @@ describe("reconcileFile binary safety", () => {
       base: { [MANIFEST]: decodeText(v020) },
     });
 
-    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    const { action } = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
     expect(action).toBeNull(); // nothing to push
     expect(decodeText(writes.get(MANIFEST)!)).toBe(decodeText(v021)); // took remote's 0.2.1
   });
@@ -168,7 +168,7 @@ describe("reconcileFile binary safety", () => {
       base: { [MANIFEST]: decodeText(v010) },
     });
 
-    const action = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
+    const { action } = await reconcileFile(MANIFEST, "upsert", entry, { files: { [MANIFEST]: entry } }, io);
     expect(action).toBeNull(); // remote's newer mtime wins the true conflict
     expect(decodeText(writes.get(MANIFEST)!)).toBe(decodeText(v020));
   });
@@ -184,10 +184,82 @@ describe("reconcileFile binary safety", () => {
       base: { "n.md": base },
     });
 
-    const action = await reconcileFile("n.md", "upsert", entry, { files: { "n.md": entry } }, io);
+    const { action } = await reconcileFile("n.md", "upsert", entry, { files: { "n.md": entry } }, io);
     const mergedUp = decodeText(asUpload(action).content);
     expect(mergedUp).toContain("local-add");
     expect(mergedUp).toContain("remote-add");
     expect(decodeText(writes.get("n.md")!)).toBe(mergedUp); // working tree updated to the merge
+  });
+});
+
+describe("reconcileFile outcome classification (for logging)", () => {
+  it("git → S3 of a brand-new key reports pushed{created:true}", async () => {
+    const { io } = makeIO({ local: { "notes/idea.md": encodeText("hi\n") } });
+    const { outcome } = await reconcileFile("notes/idea.md", "upsert", undefined, { files: {} }, io);
+    expect(outcome).toEqual({ kind: "pushed", created: true });
+  });
+
+  it("git → S3 of an existing key reports pushed{created:false}", async () => {
+    const oldBytes = encodeText("old\n");
+    const newBytes = encodeText("new\n");
+    const entry = remoteEntry(oldBytes);
+    const { io } = makeIO({ local: { "n.md": newBytes } });
+    // remote entry present & non-tombstone → update, not create
+    const { outcome } = await reconcileFile("n.md", "upsert", undefined, { files: { "n.md": entry } }, io);
+    expect(outcome).toEqual({ kind: "pushed", created: false });
+  });
+
+  it("S3 → git of a file absent locally reports pulled{created:true}", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const entry = remoteEntry(png);
+    const { io } = makeIO({ remote: { "a.png": png } }); // not in local → existsLocal false
+    const { outcome } = await reconcileFile("a.png", undefined, entry, { files: { "a.png": entry } }, io);
+    expect(outcome).toEqual({ kind: "pulled", created: true });
+  });
+
+  it("S3 → git overwriting a present file reports pulled{created:false}", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const entry = remoteEntry(png);
+    const { io } = makeIO({ local: { "a.png": new Uint8Array([1]) }, remote: { "a.png": png } });
+    const { outcome } = await reconcileFile("a.png", undefined, entry, { files: { "a.png": entry } }, io);
+    expect(outcome).toEqual({ kind: "pulled", created: false });
+  });
+
+  it("git delete → S3 tombstone reports tombstoned", async () => {
+    const entry = remoteEntry(encodeText("x\n"));
+    const { io } = makeIO({});
+    const { action, outcome } = await reconcileFile("gone.md", "delete", undefined, { files: { "gone.md": entry } }, io);
+    expect(action).toEqual({ tombstone: true });
+    expect(outcome).toEqual({ kind: "tombstoned" });
+  });
+
+  it("S3 tombstone → local delete reports deletedLocal", async () => {
+    const tomb = { deleted: true, mtime: "2026-07-13T00:00:00.000Z", rev: 2, by: "obsidian" } as unknown as SnapshotEntry;
+    const { io, removes } = makeIO({ local: { "gone.md": encodeText("x\n") } });
+    const { outcome } = await reconcileFile("gone.md", undefined, tomb, { files: { "gone.md": tomb } }, io);
+    expect(removes).toContain("gone.md");
+    expect(outcome).toEqual({ kind: "deletedLocal" });
+  });
+
+  it("union merge with a real conflict reports merged{conflicts:true}", async () => {
+    // divergent edits to the SAME line → union merge hits a conflict
+    const base = "line1\n";
+    const entry = remoteEntry(encodeText("remote-line\n"));
+    const { io } = makeIO({
+      local: { "n.md": encodeText("local-line\n") },
+      remote: { "n.md": encodeText("remote-line\n") },
+      base: { "n.md": base },
+    });
+    const { outcome } = await reconcileFile("n.md", "upsert", entry, { files: { "n.md": entry } }, io);
+    expect(outcome).toEqual({ kind: "merged", conflicts: true });
+  });
+
+  it("an idempotent git-only re-push reports noop", async () => {
+    const bytes = encodeText("same\n");
+    const entry = remoteEntry(bytes);
+    const { io } = makeIO({ local: { "n.md": bytes } });
+    const { action, outcome } = await reconcileFile("n.md", "upsert", undefined, { files: { "n.md": entry } }, io);
+    expect(action).toBeNull();
+    expect(outcome).toEqual({ kind: "noop" });
   });
 });

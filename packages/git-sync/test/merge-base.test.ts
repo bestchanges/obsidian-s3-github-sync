@@ -117,18 +117,18 @@ describe("regression: rename resurrection via stale diff base", () => {
   function io(removed: string[]): ReconcileIO {
     return {
       readLocal: async () => encodeText(CONTENT), // old path still in the working tree
+      existsLocal: async () => true,
       fetchRemote: async () => null, // tombstoned — no live remote content
       writeLocal: async () => {},
       removeLocal: async (p) => void removed.push(p),
       mergeBase: async () => "",
       authorDate: async () => "2026-07-13T10:44:26.000Z",
-      log: () => {},
     };
   }
 
   it("stale base: own-commit write counts as a git edit and un-tombstones the old path (the bug)", async () => {
     const removed: string[] = [];
-    const action = await reconcileFile(
+    const { action } = await reconcileFile(
       "note.md",
       "upsert", // what diffing from the pre-commit cursor reports
       tombstone,
@@ -144,7 +144,7 @@ describe("regression: rename resurrection via stale diff base", () => {
     const diffBase = await resolveDiffBase(git, "CURSOR");
     expect(diffBase).toBe("SYNC"); // own writes fall out of the diff range…
     const removed: string[] = [];
-    const action = await reconcileFile(
+    const { action } = await reconcileFile(
       "note.md",
       undefined, // …so reconcile sees the path as S3-only
       tombstone,
@@ -181,12 +181,12 @@ describe("regression: single-device table triplication via stale merge base", ()
     let written: string | null = null;
     const io: ReconcileIO = {
       readLocal: async () => enc(C0), // working tree = git-sync's own last write
+      existsLocal: async () => true,
       fetchRemote: async () => enc(C1), // live S3 = device's newer edit
       writeLocal: async (_p, b) => void (written = decodeText(b)),
       removeLocal: async () => {},
       mergeBase: base,
       authorDate: async () => "2026-07-13T00:00:00.000Z",
-      log: () => {},
     };
     return { io, remote, getWritten: () => written };
   }
@@ -206,7 +206,7 @@ describe("regression: single-device table triplication via stale merge base", ()
     const git = fakeGit({ CURSOR: { "n.md": C_MINUS1 }, SYNC: { "n.md": C0 } }, "SYNC");
     const base = await makeMergeBaseResolver(git, "CURSOR");
     const { io, remote, getWritten } = runReconcile(base);
-    const action = await reconcileFile("n.md", "upsert", remote, { files: { "n.md": remote } }, io);
+    const { action } = await reconcileFile("n.md", "upsert", remote, { files: { "n.md": remote } }, io);
 
     expect(tableCount(getWritten()!)).toBe(1); // git working tree ends at the single clean table
     expect(getWritten()).toBe(C1); // took the device's edit
