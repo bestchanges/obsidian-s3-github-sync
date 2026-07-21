@@ -1,0 +1,71 @@
+# Unattended cloud backup leg — see BACKUP.md §4.
+# Install into a repo you control (the tool repo or the content repo) at
+#   .github/workflows/s3-backup.yml
+# It pulls the vault's S3 prefix READ-ONLY (OIDC) and snapshots it into restic repos on
+# Backblaze B2 and Google Drive. The external-drive leg runs locally (scripts/backup/backup.sh).
+#
+# Requires (Settings → Secrets and variables → Actions):
+#   Variables: S3_BACKUP_BUCKET, S3_BACKUP_PREFIX, S3_BACKUP_REGION, S3_BACKUP_ROLE_ARN,
+#              S3_BACKUP_TOOL_REPO   (this sync tool repo, for the scripts)
+#   Secrets:   RESTIC_PASSWORD,
+#              B2_REPO, B2_ACCOUNT_ID, B2_ACCOUNT_KEY,           (append-only key — BACKUP.md §6.3)
+#              GDRIVE_REPO, RCLONE_CONF_B64                       (base64 of your rclone.conf)
+name: S3 backup
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly (UTC)
+  workflow_dispatch:
+    inputs:
+      check:
+        description: "restic check level for this run"
+        type: choice
+        options: ["0", "light", "full"]
+        default: "0"
+
+concurrency:
+  group: s3-backup
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # OIDC → read-only AWS role
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout backup tool
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.S3_BACKUP_TOOL_REPO }} # e.g. your-user/vault-sync
+          ref: main
+
+      - name: Install restic + rclone
+        run: sudo apt-get update && sudo apt-get install -y restic rclone
+
+      - name: Configure AWS credentials (OIDC, read-only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.S3_BACKUP_ROLE_ARN }}
+          aws-region: ${{ vars.S3_BACKUP_REGION }}
+
+      - name: Materialize rclone config (Google Drive)
+        run: |
+          mkdir -p ~/.config/rclone
+          echo "${{ secrets.RCLONE_CONF_B64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+
+      - name: Run backup → B2 + Google Drive
+        env:
+          BUCKET: ${{ vars.S3_BACKUP_BUCKET }}
+          PREFIX: ${{ vars.S3_BACKUP_PREFIX }} # <user>/vaults/<name>/ — trailing slash required
+          AWS_REGION: ${{ vars.S3_BACKUP_REGION }}
+          RESTIC_PASSWORD: ${{ secrets.RESTIC_PASSWORD }}
+          # Append-only B2 key: this leg can ADD snapshots but never delete → no --prune here.
+          B2_REPO: ${{ secrets.B2_REPO }}
+          B2_ACCOUNT_ID: ${{ secrets.B2_ACCOUNT_ID }}
+          B2_ACCOUNT_KEY: ${{ secrets.B2_ACCOUNT_KEY }}
+          GDRIVE_REPO: ${{ secrets.GDRIVE_REPO }}
+          DESTS: b2,gdrive
+          MAX_AGE_HOURS: "36" # fail loudly if backups silently stopped
+        run: ./scripts/backup/backup.sh --check "${{ inputs.check || '0' }}"

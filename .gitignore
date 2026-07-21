@@ -10,8 +10,9 @@ build/
 .env
 .env.*
 !.env.example
-# install scripts: keep the committed template, ignore real settings + minted keys + built zips
+# install / backup scripts: keep the committed templates, ignore real settings + minted keys + built zips
 !scripts/install/.env.shadow
+!scripts/backup/.env.shadow
 scripts/install/.secrets/
 *.zip
 
