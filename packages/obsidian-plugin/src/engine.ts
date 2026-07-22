@@ -785,14 +785,51 @@ export class SyncEngine {
     try {
       const files: Record<string, DeltaEntry> = {};
       const newStates = new Map<string, FileState | null>();
+      // Per-push cache of parent-directory basenames, used to confirm a stat'd path exists with the
+      // EXACT case (§2.2). Keyed by dir; null means the dir couldn't be listed (fall back to trusting
+      // stat rather than risk a false tombstone). mapPool runs concurrently, so dedupe in-flight lists.
+      const dirCache = new Map<string, Promise<Set<string> | null>>();
+      const listBasenames = (dir: string): Promise<Set<string> | null> => {
+        let p = dirCache.get(dir);
+        if (!p) {
+          p = this.vault.adapter
+            .list(dir === "" ? "/" : dir)
+            .then((l) => new Set(l.files.map((f) => f.split("/").pop() ?? f)))
+            .catch(() => null); // unreadable dir → "unknown", never treat as empty
+          dirCache.set(dir, p);
+        }
+        return p;
+      };
 
       await mapPool(paths, this.opts.concurrency, async (path) => {
         // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
         // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
         const stat = await this.vault.adapter.stat(path);
-        if (!stat || stat.type !== "file") {
+        // A case-only rename (e.g. "My Note" → "My note") leaves the OLD-cased path dirty. On a
+        // case-insensitive filesystem (macOS/iOS) stat() resolves it to the new file, so it looks
+        // alive and gets re-pushed as a duplicate — one that only materializes on case-sensitive
+        // (Android/Linux) peers. Detect that by listing the parent dir: the path is "renamed away by
+        // case" only when its exact-case basename is ABSENT yet a different-cased variant is PRESENT.
+        // (Positive evidence only — an empty/unreadable listing falls back to trusting stat, so we
+        // never wrongly tombstone a file the listing simply didn't cover.)
+        let goneByCase = false;
+        if (stat?.type === "file") {
+          const slash = path.lastIndexOf("/");
+          const base = path.slice(slash + 1);
+          const names = await listBasenames(slash === -1 ? "" : path.slice(0, slash));
+          if (names && !names.has(base)) {
+            const lower = base.toLowerCase();
+            for (const n of names) {
+              if (n.toLowerCase() === lower) {
+                goneByCase = true; // exact case gone, a case-variant took its place
+                break;
+              }
+            }
+          }
+        }
+        if (!stat || stat.type !== "file" || goneByCase) {
           if (this.state.files[path]) {
-            files[path] = { deleted: true }; // deleted locally → tombstone
+            files[path] = { deleted: true }; // deleted locally / renamed to a new case → tombstone
             newStates.set(path, null);
             this.detail.deletedRemote.push(path);
           }
