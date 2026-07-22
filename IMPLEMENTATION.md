@@ -466,6 +466,12 @@ Runs in GitHub Actions (`templates/s3-sync.yml`), triggered by push to `main`, a
 cancel-in-progress: false` serializes runs; CAS guards cross-client races. Auth is **OIDC → IAM
 role** (no stored keys). It treats the *repo* as its "local vault" and `writer id = "git-sync"`.
 
+`actions/checkout` pins `github.sha` (the trigger commit), so a run queued behind another executes
+against a checkout already behind `origin/main` — the earlier run pushed its `[skip ci]` sync commit.
+To avoid a non-fast-forward `git push`, the tool first `git fetch`es and `reset --hard`s to
+`origin/<branch>` (serialized runs ⇒ our push then fast-forwards); the push is also retried with a
+rebase of its lone sync commit if the branch still advances mid-run (rare external push).
+
 ## 5.1 State
 
 `.sync/state.json` — `{ lastSyncedRev, lastSyncedCommit }`, **committed to the repo** (versioned with

@@ -120,6 +120,20 @@ async function main(): Promise<void> {
   const storage = new S3SdkAdapter(bucket, process.env.PREFIX ?? "", process.env.AWS_REGION);
   const git = new Git(repoDir);
 
+  // ---- refresh to the real remote tip ------------------------------------
+  // The workflow checks out github.sha — the commit that *triggered* the run, frozen at trigger
+  // time. But the `s3-sync` concurrency group serializes runs, so a run queued behind another
+  // executes against a checkout that is already behind origin/main (the earlier run pushed its
+  // [skip ci] sync commit). Diffing and committing on that stale sha then fails `git push` with
+  // non-fast-forward. Reset to origin/<branch> first: runs are serialized, so our push at the end
+  // fast-forwards. (Detached HEAD — no branch to track — falls back to the checked-out sha.)
+  const branch = process.env.SYNC_BRANCH ?? (await git.currentBranch());
+  if (branch && branch !== "HEAD") {
+    await git.fetch("origin", branch);
+    await git.resetHard(`origin/${branch}`);
+    logger.info(`refreshed to origin/${branch}`);
+  }
+
   // ---- load local state -------------------------------------------------
   let state: SyncStateFile = { lastSyncedRev: 0, lastSyncedCommit: null };
   try {
@@ -337,7 +351,7 @@ async function main(): Promise<void> {
     // this sync commit's own writes out of its diff by anchoring at the commit itself
     // (resolveDiffBase), not at this cursor. One commit, no state-commit regress.
     await git.commit(`s3-sync: rev ${finalRev} [skip ci]`);
-    await git.push();
+    await git.push("origin", branch);
     logger.info(`committed + pushed (${(await git.headSha()).slice(0, 8)})`);
   } else {
     logger.info("nothing to commit");
