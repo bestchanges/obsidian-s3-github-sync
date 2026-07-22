@@ -21,6 +21,15 @@ permissions:
 
 jobs:
   sync:
+    # Only ever sync from `main`. A feature branch must never reach S3: content
+    # built/committed on a non-main branch (e.g. a plugin built on a claude/* branch)
+    # would be pushed to S3 and propagate to every device. `push` is already
+    # main-only, but `workflow_dispatch` can be fired from any branch (checkout would
+    # grab that ref), and a `workflow_run` leg fires regardless of the upstream branch
+    # — this guard blocks both unless the ref is main.
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main') ||
+      (github.event_name != 'workflow_run' && github.ref_name == 'main')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout vault content
