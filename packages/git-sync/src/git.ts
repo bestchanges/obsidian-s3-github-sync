@@ -16,6 +16,15 @@ export class Git {
     return res.stdout;
   }
 
+  /** like run() but treats any non-zero exit as failure (run() tolerates exit 1 for diff/quiet). */
+  private async runStrict(args: string[]): Promise<string> {
+    const res = await execa("git", args, { cwd: this.cwd, reject: false });
+    if (res.exitCode !== 0) {
+      throw new Error(`git ${args.join(" ")} failed (${res.exitCode}): ${res.stderr}`);
+    }
+    return res.stdout;
+  }
+
   async headSha(): Promise<string> {
     return (await this.run(["rev-parse", "HEAD"])).trim();
   }
@@ -108,8 +117,39 @@ export class Git {
     ]);
   }
 
-  async push(): Promise<void> {
-    const res = await execa("git", ["push"], { cwd: this.cwd, reject: false });
-    if (res.exitCode !== 0) throw new Error(`git push failed: ${res.stderr}`);
+  /** current branch name, or "HEAD" when detached. */
+  async currentBranch(): Promise<string> {
+    return (await this.run(["rev-parse", "--abbrev-ref", "HEAD"])).trim();
+  }
+
+  async fetch(remote: string, branch: string): Promise<void> {
+    await this.runStrict(["fetch", remote, branch]);
+  }
+
+  /** hard-reset the working tree + HEAD to `ref` (e.g. origin/main). */
+  async resetHard(ref: string): Promise<void> {
+    await this.runStrict(["reset", "--hard", ref]);
+  }
+
+  /** Push `branch` to `remote`, tolerating a mid-run advance of the remote.
+   * A plain push fails non-fast-forward when another serialized run (or a real external push) moved
+   * the branch after our checkout. Since our own change is a single sync commit, rebase it onto the
+   * new tip and retry. Bounded; a rebase conflict aborts cleanly and fails loudly (next run recovers). */
+  async push(remote = "origin", branch = "HEAD", attempts = 3): Promise<void> {
+    const target = branch === "HEAD" ? "HEAD" : branch;
+    for (let attempt = 1; ; attempt++) {
+      const res = await execa("git", ["push", remote, target], { cwd: this.cwd, reject: false });
+      if (res.exitCode === 0) return;
+      const rejected = /non-fast-forward|fetch first|\[rejected\]/i.test(res.stderr);
+      if (!rejected || attempt >= attempts || branch === "HEAD") {
+        throw new Error(`git push failed: ${res.stderr}`);
+      }
+      await this.fetch(remote, branch);
+      const rb = await execa("git", ["rebase", `${remote}/${branch}`], { cwd: this.cwd, reject: false });
+      if (rb.exitCode !== 0) {
+        await execa("git", ["rebase", "--abort"], { cwd: this.cwd, reject: false });
+        throw new Error(`git push failed: could not rebase onto ${remote}/${branch}: ${rb.stderr}`);
+      }
+    }
   }
 }
