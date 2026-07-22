@@ -287,6 +287,16 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 > engine resets `lastSyncedRev = 0` and **restores from S3**. Below the floor, missing files
 > propagate as normal tombstones.
 
+> [!important] Case-only renames on case-insensitive filesystems
+> A rename that changes only letter case (e.g. `My Note` → `My note`) leaves the **old-cased** path
+> in the dirty set. On macOS/iOS (case-insensitive APFS/HFS+) `adapter.stat(oldPath)` resolves to the
+> *new* file, so the old path looks alive and `push()` would re-upload it — a phantom duplicate that
+> only materializes on case-**sensitive** peers (Android/Linux), where the two casings are distinct
+> files. `push()` guards against this by listing the parent dir: a stat'd path is treated as
+> renamed-away (→ tombstone) only when its exact-case basename is **absent** yet a different-cased
+> variant is **present**. Positive evidence only — an empty/unreadable listing falls back to trusting
+> `stat`, so an incomplete listing never wrongly tombstones a live file.
+
 ## 4.5 Resync everything (`resyncEverything`)
 
 The escape hatch: clear cursor + state, re-scan all local files as new, then `sync(fullPull=true)`
