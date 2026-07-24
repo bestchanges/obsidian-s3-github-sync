@@ -387,6 +387,23 @@ to the download cap); local also changed → **conflict**. Conflict strategy dep
 > foreign (copied) state and for user `Resync everything`, where local content is real and the
 > lossless union merge is correct. The plugin sets `firstRun = !hadPriorState && !foreignStateDetected`.
 
+> [!note] Phantom-revert guard (`pendingPull` / `phantomRevert`)
+> A clean pull writes the remote bytes and advances the baseline **before** the write is proven
+> durable. An editor that had the note open can then autosave its **stale buffer** back over the
+> file; the reverted copy now differs from the freshly-advanced baseline and looks like a genuine
+> local edit, so the next reconcile union-merges it against a base that already equals the remote —
+> which resolves to the *old* content and **re-publishes the revert to every device** (the observed
+> `type: project` → `tags` regression). The guard remembers, per just-pulled path, both what the pull
+> **wrote** (`hash`) and what it **replaced** (`priorHash`, the true ancestor). A later reconcile that
+> finds the file back at exactly `priorHash` — before the pull is confirmed — treats it as a **clobber,
+> not an edit**: the merge leg drops it from `localDirty` and re-applies remote; the push leg restores
+> the current remote bytes instead of uploading the stale ones. The entry self-clears once the file
+> settles at `hash` (confirmed) or diverges to a genuine third state (a real edit still syncs), is
+> **not** armed during bootstrap / full-pull resync (bulk pulls, not the clobber case), and expires
+> after `PENDING_PULL_TTL_MS` (2 min). In-memory only — a clobber lands within seconds, same session.
+> Plugin-only: git-sync has no editor, so the union merge itself is unchanged and both legs stay in
+> lockstep.
+
 Remote writes
 land with the **manifest's mtime** (`DataWriteOptions`), so sort-by-modified is consistent across
 devices and the offline pre-filter stays trustworthy. Writes made by sync are wrapped in an

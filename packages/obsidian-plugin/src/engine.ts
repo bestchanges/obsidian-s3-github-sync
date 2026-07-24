@@ -52,11 +52,34 @@ const MASS_MISSING_FRACTION = 0.5;
  * "…and N more". A resync/first-sync moves thousands of files; without a cap one cycle would flood
  * the 512 KB rotating log and the S3 tail. The counts in the summary Notice are always exact. */
 const LOG_LIST_CAP = 20;
+/** How long a just-pulled file stays "unconfirmed" — long enough that an editor autosaving a stale
+ * buffer over our write (which lands within seconds, a poll interval or two later) is still caught,
+ * short enough that a much-later legitimate revert-to-the-old-bytes isn't mistaken for a clobber and
+ * that the tracking map can't accumulate. See pendingPull / phantomRevert (§2.6). */
+const PENDING_PULL_TTL_MS = 2 * 60 * 1000;
 
 export interface FileState {
   hash: string;
   s3VersionId?: string;
   mtime: string;
+}
+
+/** A clean pull is applied optimistically: we write the remote bytes and advance the baseline before
+ * knowing the write will stick. An editor can then autosave its stale buffer back over the file, and
+ * the reverted copy — now differing from the freshly-advanced baseline — looks like a genuine local
+ * edit, so conflict resolution preserves it and re-publishes the OLD content, reverting the change
+ * for every device. To catch that we remember, per just-pulled path, both what we wrote (`hash`) and
+ * what we replaced (`priorHash`, the true ancestor); a later reconcile that finds the file back at
+ * `priorHash` treats it as a clobber, not an edit. */
+interface PendingPull {
+  /** hash of the content the pull wrote (what the file should still be) */
+  hash: string;
+  s3VersionId?: string;
+  mtime: string;
+  /** hash of the content the pull replaced — a revert to exactly this is a clobber, not an edit */
+  priorHash: string | null;
+  /** Date.now() when armed, for TTL expiry */
+  at: number;
 }
 
 export interface SyncState {
@@ -131,6 +154,12 @@ export class SyncEngine {
   /** paths currently being written by sync itself — vault events for them are echoes (§2.3) */
   readonly applying = new Set<string>();
   private dirty = new Set<string>();
+  /** Files pulled this session but not yet confirmed to have held the written bytes. Guards against
+   * an editor clobbering a fresh pull with a stale buffer, which would otherwise re-publish the old
+   * content as a "local edit" (§2.6). Keyed by path; entries self-clear on confirm/divergence and
+   * expire after PENDING_PULL_TTL_MS. In-memory only: a clobber lands seconds after the pull, within
+   * the same session, so this needn't survive a restart. */
+  private pendingPull = new Map<string, PendingPull>();
   /** First-ever-sync guard: while true, a pull takes remote as-is on any local collision instead of
    * union-merging (kills the fresh-device default-config corruption). Cleared after the first pull.
    * See EngineOptions.firstRun and applyRemote(). */
@@ -493,6 +522,7 @@ export class SyncEngine {
     if (req.scanOffline) await this.scanOffline();
     else if (req.scanConfig) await this.scanConfigDir();
 
+    this.prunePendingPulls();
     await this.pull(req.fullPull);
     this.bootstrap = false; // first pull is done — later collisions are real edits again
     // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
@@ -597,7 +627,12 @@ export class SyncEngine {
       !this.bootstrap &&
       !(this.takeConfigFromRemote && this.isConfigPath(path)) &&
       localBuf !== null &&
-      (!st || localHash !== st.hash);
+      (!st || localHash !== st.hash) &&
+      // A file that has reverted to exactly the bytes a recent pull replaced is a clobber (an editor
+      // autosaving a stale buffer over our write), NOT a genuine edit — so it isn't "dirty" and must
+      // not be merged/re-published. Falling through to the clean branch re-applies the remote and
+      // re-arms the guard (§2.6, fix #1).
+      !this.phantomRevert(path, localHash);
     if (!localDirty) {
       // Per-device download cap: oversized remote files stay in the cloud on this device to save
       // space. Leave local as-is and DON'T record — the file just isn't present here, so it's not
@@ -616,6 +651,22 @@ export class SyncEngine {
       const obj = await this.storage.get(`files/${path}`);
       if (!obj) return;
       await this.write(path, obj.body, remote.mtime);
+      // Arm the phantom-revert guard: the write can be silently clobbered before the next reconcile,
+      // and the advanced baseline (recorded just below) would then make the stale copy look like an
+      // edit. Remember what we wrote and what we replaced so that revert is recognized. Skip during
+      // bootstrap / full-pull resync — those move thousands of files and aren't the clobber case, and
+      // arming them all would bloat the map. Preserve the original priorHash when re-arming a file
+      // we're already healing, so a repeated clobber keeps pointing at the true ancestor.
+      if (!this.bootstrap && !this.takeConfigFromRemote && localBuf !== null) {
+        const prior = this.pendingPull.get(path);
+        this.pendingPull.set(path, {
+          hash: remote.hash,
+          s3VersionId: obj.versionId ?? remote.s3VersionId,
+          mtime: remote.mtime,
+          priorHash: prior?.priorHash ?? st?.hash ?? localHash,
+          at: Date.now(),
+        });
+      }
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
       this.pulled++;
       this.detail.pulled.push(path);
@@ -839,6 +890,33 @@ export class SyncEngine {
         const hash = contentHash(buf);
         const st = this.state.files[path];
         const mtime = new Date(stat.mtime).toISOString();
+        // Phantom-revert guard on the push leg: a file that reverted to exactly the bytes a recent
+        // pull replaced is an editor clobbering our write, not an edit. Restore the pulled content
+        // rather than publishing the stale bytes (which would revert the change for every device).
+        const clobber = this.phantomRevert(path, hash);
+        if (clobber) {
+          // Restore from current remote (never the stale local bytes). With no concurrent change it
+          // equals what the pull wrote; if remote advanced, taking the newest is still correct.
+          const obj = await this.storage.get(`files/${path}`);
+          if (obj) {
+            await this.write(path, obj.body, clobber.mtime);
+            // Realign the baseline to the restored bytes so a stale st.hash can't re-flag it as dirty.
+            this.record(path, {
+              hash: contentHash(obj.body),
+              s3VersionId: obj.versionId,
+              size: obj.body.byteLength,
+              mtime: clobber.mtime,
+            });
+            this.pendingPull.delete(path);
+            this.pulled++; // healed back to the pulled content (took remote), not a push
+            this.detail.pulled.push(path);
+            this.opts.log(
+              "warn",
+              `healed phantom revert in ${path} — write clobbered after pull, not republishing stale content`,
+            );
+          }
+          return; // never push the reverted bytes
+        }
         if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
         const res = await this.storage.put(`files/${path}`, buf);
         const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
@@ -904,6 +982,36 @@ export class SyncEngine {
   private record(path: string, entry: FileEntry & { s3VersionId?: string }): void {
     this.state.files[path] = { hash: entry.hash, s3VersionId: entry.s3VersionId, mtime: entry.mtime };
     this.dirty.delete(path);
+  }
+
+  /** Classify a would-be local edit against the pending-pull guard (§2.6). A file we just pulled can
+   * be silently reverted by an editor autosaving a stale buffer over our write; that revert then
+   * masquerades as a local edit and gets re-published, reverting the change everywhere. Returns the
+   * pending record ONLY when `localHash` is exactly the content the pull replaced (a clobber the
+   * caller must heal instead of publish); returns null otherwise and self-clears the tracking when
+   * the file has settled at the pulled content (confirmed) or diverged to a genuine third state. */
+  private phantomRevert(path: string, localHash: string | null): PendingPull | null {
+    if (localHash === null) return null;
+    const p = this.pendingPull.get(path);
+    if (!p) return null;
+    if (Date.now() - p.at > PENDING_PULL_TTL_MS) {
+      this.pendingPull.delete(path); // stale — a real edit by now, not a clobber
+      return null;
+    }
+    if (localHash === p.hash) {
+      this.pendingPull.delete(path); // write held → pull confirmed
+      return null;
+    }
+    if (p.priorHash !== null && localHash === p.priorHash) return p; // reverted to replaced bytes → clobber
+    this.pendingPull.delete(path); // diverged to a third state → genuine edit on top of the pull
+    return null;
+  }
+
+  /** Drop pending-pull entries past their TTL so the map can't accumulate across cycles. */
+  private prunePendingPulls(): void {
+    if (this.pendingPull.size === 0) return;
+    const cutoff = Date.now() - PENDING_PULL_TTL_MS;
+    for (const [path, p] of this.pendingPull) if (p.at < cutoff) this.pendingPull.delete(path);
   }
 
   /** write with mtime aligned to the manifest (§2.5) and echo suppression */
