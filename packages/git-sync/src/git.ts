@@ -63,6 +63,28 @@ export class Git {
     return changes;
   }
 
+  /** Rename pairs (oldPath → newPath) between two commits, from `-M` detection. `diffNameStatus`
+   * deliberately splits a rename into D(old)+A(new) so both paths reconcile independently; this
+   * recovers the association so the old side's tombstone can carry `renamedTo`. Same
+   * `-z` raw-path handling; `Rxxx\0old\0new\0` records only. */
+  async renames(from: string, to: string): Promise<Map<string, string>> {
+    const out = await this.run(["diff", "--name-status", "-M", "-z", `${from}..${to}`]);
+    const tokens = out.split("\0").filter((t) => t !== "");
+    const map = new Map<string, string>();
+    let i = 0;
+    while (i < tokens.length) {
+      const status = tokens[i++];
+      if (status.startsWith("R")) {
+        map.set(tokens[i++], tokens[i++]); // old → new
+      } else if (status.startsWith("C")) {
+        i += 2; // copy: source + dest, not a rename
+      } else {
+        i++; // single-path status (A/M/D/T/U): consume its path
+      }
+    }
+    return map;
+  }
+
   async trackedFiles(): Promise<string[]> {
     return (await this.run(["ls-files", "-z"])).split("\0").filter(Boolean);
   }

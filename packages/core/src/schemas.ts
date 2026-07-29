@@ -15,6 +15,12 @@ export interface FileEntry {
 
 export interface Tombstone {
   deleted: true;
+  /** Set when this delete is the OLD side of a rename (delete(old)+add(new)): the note's content
+   * moved to this path. Lets a receiver that still holds a divergent `old` fold its edit onto `new`
+   * and drop `old`, instead of resurrecting it (the cross-device rename-duplication fix).
+   * Optional and additive: a client that doesn't understand it treats the entry as a plain tombstone
+   * and falls back to the freshest-wins delete-vs-edit tiebreak. */
+  renamedTo?: string;
 }
 
 export type DeltaEntry = FileEntry | Tombstone;

@@ -6,6 +6,7 @@ import {
   isTombstone,
   remoteIsFresher,
   SnapshotEntry,
+  Tombstone,
   unionMerge,
 } from "@vault-sync/core";
 
@@ -33,7 +34,9 @@ function isTextMergeable(p: string, aLen: number, bLen: number): boolean {
   return isTextPath(p) && aLen <= LWW_SIZE_LIMIT && bLen <= LWW_SIZE_LIMIT;
 }
 
-export type UploadAction = { content: Uint8Array; entry: FileEntry } | { tombstone: true };
+export type UploadAction =
+  | { content: Uint8Array; entry: FileEntry }
+  | { tombstone: true; renamedTo?: string };
 
 /** What reconcileFile did with a path, for logging. The action alone can't tell a pull from a
  * local-only no-op, nor new-vs-update, nor whether a union merge hit conflicts — reconcileFile is the
@@ -79,6 +82,9 @@ export async function reconcileFile(
   inS3: SnapshotEntry | undefined,
   remote: { files: Record<string, SnapshotEntry> },
   io: ReconcileIO,
+  /** When `p` was renamed away in git (this run's diff), its destination — so the tombstone we push
+   * carries `renamedTo`. Undefined for a plain delete. */
+  renamedTo?: string,
 ): Promise<ReconcileResult> {
   // git → S3 upload; `created` distinguishes a brand-new/untombstoned key from an update, for logging.
   const pushUpload = async (content: Uint8Array): Promise<ReconcileResult> => {
@@ -104,7 +110,7 @@ export async function reconcileFile(
     if (inGit === "delete") {
       const cur = remote.files[p];
       return cur && !isTombstone(cur)
-        ? { action: { tombstone: true }, outcome: { kind: "tombstoned" } }
+        ? { action: { tombstone: true, ...(renamedTo ? { renamedTo } : {}) }, outcome: { kind: "tombstoned" } }
         : NOOP;
     }
     const content = await io.readLocal(p);
@@ -135,14 +141,17 @@ export async function reconcileFile(
       return pullWrite(remoteContent!); // their edit wins over our delete
     }
     if (remoteContent === null) {
-      // delete-vs-edit (§1.5): S3 tombstoned this path but git still holds a copy. Un-tombstone
-      // (keep & re-push) ONLY when the git edit is at least as fresh as the delete. A git copy
-      // STRICTLY OLDER than the tombstone is a stale divergence — most often a file another device
-      // renamed away (rename = delete(old)+add(new)) — so let the delete win and remove it locally
-      // instead of resurrecting the old path. Mirrors the plugin's editWinsOverDelete (engine.ts).
-      // A tombstone from an older journal carries no `at` → keep the historical un-tombstone behavior.
+      // delete-vs-edit (§1.5): S3 tombstoned this path but git still holds a copy.
+      // A tombstone tagged `renamedTo` means the content moved to `new` (which arrives as its own
+      // live entry) — always remove `old`, never resurrect it. A concurrent git-side edit to `old` is
+      // rare and the source device already folded edits onto `new`, so dropping it here is acceptable
+      // and strictly better than a duplicate.
+      // Otherwise (a plain delete): un-tombstone (keep & re-push) ONLY when the git edit is at least
+      // as fresh as the delete; a git copy strictly OLDER than the tombstone is a stale divergence, so
+      // the delete wins. A legacy tombstone without `at` keeps the historical behavior.
+      const renamedTo = (inS3 as Tombstone).renamedTo;
       const deletedAt = (inS3 as { at?: string }).at;
-      if (deletedAt && remoteIsFresher(deletedAt, await io.authorDate(p))) {
+      if (renamedTo || (deletedAt && remoteIsFresher(deletedAt, await io.authorDate(p)))) {
         await io.removeLocal(p);
         return { action: null, outcome: { kind: "deletedLocal" } };
       }
