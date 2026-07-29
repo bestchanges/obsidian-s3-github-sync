@@ -135,7 +135,18 @@ export async function reconcileFile(
       return pullWrite(remoteContent!); // their edit wins over our delete
     }
     if (remoteContent === null) {
-      return pushUpload(local); // our edit wins over their delete (un-tombstones)
+      // delete-vs-edit (§1.5): S3 tombstoned this path but git still holds a copy. Un-tombstone
+      // (keep & re-push) ONLY when the git edit is at least as fresh as the delete. A git copy
+      // STRICTLY OLDER than the tombstone is a stale divergence — most often a file another device
+      // renamed away (rename = delete(old)+add(new)) — so let the delete win and remove it locally
+      // instead of resurrecting the old path. Mirrors the plugin's editWinsOverDelete (engine.ts).
+      // A tombstone from an older journal carries no `at` → keep the historical un-tombstone behavior.
+      const deletedAt = (inS3 as { at?: string }).at;
+      if (deletedAt && remoteIsFresher(deletedAt, await io.authorDate(p))) {
+        await io.removeLocal(p);
+        return { action: null, outcome: { kind: "deletedLocal" } };
+      }
+      return pushUpload(local); // our (fresher) edit wins over their delete (un-tombstones)
     }
     // Config files (.obsidian/**) and binary/oversized content resolve without a line merge (JSON
     // duplicates lines, binaries can't three-way merge), in lockstep with the plugin (engine.ts).

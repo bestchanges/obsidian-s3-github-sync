@@ -27,7 +27,12 @@ export interface Delta {
   files: Record<string, DeltaEntry>;
 }
 
-export type SnapshotEntry = DeltaEntry & { rev: number; by: string };
+/** A delta entry carried into folded/derived state: the raw entry plus the revision and writer that
+ * authored it, and `at` — the ISO time of the delta it came from. `at` is the DELETE time for a
+ * tombstone (the delete-vs-edit freshness tiebreak, §1.5) and the publish time for a live entry.
+ * Optional: entries folded into a snapshot written before `at` existed simply lack it, and readers
+ * fall back to the historical behavior. */
+export type SnapshotEntry = DeltaEntry & { rev: number; by: string; at?: string };
 
 /** snapshot.json.gz — folded state of all deltas up to `revision` */
 export interface Snapshot {

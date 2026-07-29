@@ -597,8 +597,8 @@ export class SyncEngine {
     if (isTombstone(entry)) {
       const localBuf = await this.readLocal(path);
       if (localBuf) {
-        if (st && contentHash(localBuf) !== st.hash) {
-          this.dirty.add(path); // delete-vs-edit: our edit wins (§1.5) → re-push
+        if (st && contentHash(localBuf) !== st.hash && (await this.editWinsOverDelete(path, entry))) {
+          this.dirty.add(path); // delete-vs-edit: our FRESHER edit wins (§1.5) → re-push
           return;
         }
         await this.withApplying(path, () => this.vault.adapter.remove(path));
@@ -721,6 +721,24 @@ export class SyncEngine {
       this.opts.log("warn", `union-merged conflict in ${path}`);
       new Notice(`Sync: union-merged conflict in ${path}`);
     }
+  }
+
+  /** Delete-vs-edit tiebreak (§1.5): a remote tombstone has collided with a locally-divergent copy
+   * (localHash !== st.hash). Keep — and re-publish — the local edit ONLY when it is at least as fresh
+   * as the deletion. A local copy STRICTLY OLDER than the tombstone is a stale divergence, most often
+   * a file another device renamed away (a rename is delete(old)+add(new)) while this device still held
+   * a pre-rename edit; re-publishing it resurrects the old path and duplicates the note. Comparing the
+   * local file's mtime against the tombstone's delta time (`at`) lets the delete win in that case while
+   * still preserving a genuine edit made AFTER the delete. A tombstone from an older journal carries no
+   * `at` (nothing to compare) → fall back to the historical keep-local behavior, which never loses an
+   * edit. Convergent (no bytes synthesized), and mirrored on the git-sync leg (reconcile.ts). */
+  private async editWinsOverDelete(path: string, tombstone: SnapshotEntry): Promise<boolean> {
+    const at = tombstone.at;
+    if (!at) return true; // pre-`at` tombstone → preserve the local edit (legacy behavior)
+    const stat = await this.vault.adapter.stat(path);
+    const localMtime = stat ? new Date(stat.mtime).toISOString() : "";
+    // delete wins only if strictly newer than the local edit; a tie keeps the local edit.
+    return !remoteIsFresher(at, localMtime);
   }
 
   /** Which conflict strategy a path uses: config-dir files and binary/oversized content resolve by
@@ -937,7 +955,7 @@ export class SyncEngine {
           // lost the CAS race — apply the winner's entries before retrying (§1.3)
           for (const [path, entry] of Object.entries(winner.files)) {
             if (winner.by !== this.opts.deviceId && !(path in files)) {
-              await this.applyRemote(path, { ...entry, rev: winner.rev, by: winner.by });
+              await this.applyRemote(path, { ...entry, rev: winner.rev, by: winner.by, at: winner.at });
             }
           }
         },

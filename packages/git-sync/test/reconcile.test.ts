@@ -263,3 +263,36 @@ describe("reconcileFile outcome classification (for logging)", () => {
     expect(outcome).toEqual({ kind: "noop" });
   });
 });
+
+// Mirror of the plugin's delete-vs-edit freshness tiebreak (engine.ts editWinsOverDelete). git still
+// holds a path (gitChanged=upsert) that S3 has tombstoned — the cross-device rename case. authorDate
+// is fixed at 2026-07-13 by makeIO, so the tombstone's `at` controls who wins.
+describe("reconcileFile delete-vs-edit freshness (rename resurrection)", () => {
+  const OLD = "projects/renamed-away.md";
+  const tombstone = (at: string): SnapshotEntry =>
+    ({ deleted: true, rev: 3, by: "obsidian", at } as unknown as SnapshotEntry);
+
+  it("tombstone NEWER than the git edit → delete wins, remove locally, nothing re-pushed", async () => {
+    const local = encodeText("stale pre-rename body\n");
+    const ts = tombstone("2026-07-14T00:00:00.000Z"); // newer than authorDate (2026-07-13)
+    const { io, removes } = makeIO({ local: { [OLD]: local } });
+
+    const { action, outcome } = await reconcileFile(OLD, "upsert", ts, { files: { [OLD]: ts } }, io);
+
+    expect(action).toBeNull(); // NOT re-published to S3 (no resurrection)
+    expect(removes).toContain(OLD); // removed from the git tree
+    expect(outcome).toEqual({ kind: "deletedLocal" });
+  });
+
+  it("tombstone OLDER than the git edit → edit wins, re-pushed (genuine post-delete edit)", async () => {
+    const local = encodeText("edited AFTER the delete\n");
+    const ts = tombstone("2026-07-12T00:00:00.000Z"); // older than authorDate (2026-07-13)
+    const { io, removes } = makeIO({ local: { [OLD]: local } });
+
+    const { action, outcome } = await reconcileFile(OLD, "upsert", ts, { files: { [OLD]: ts } }, io);
+
+    expect([...asUpload(action).content]).toEqual([...local]); // re-published (un-tombstoned)
+    expect(removes).not.toContain(OLD);
+    expect(outcome).toEqual({ kind: "pushed", created: true });
+  });
+});
