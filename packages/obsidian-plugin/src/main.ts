@@ -155,6 +155,9 @@ export default class S3SyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", onChange));
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        // Record the rename so the old path's tombstone carries `renamedTo`: other devices
+        // fold a divergent copy of `old` onto `new` instead of resurrecting it.
+        if (file instanceof TFile) this.engine?.recordRename(oldPath, file.path);
         this.engine?.markDirty(oldPath); // tombstone old path
         if (file instanceof TFile) this.engine?.markDirty(file.path);
       }),

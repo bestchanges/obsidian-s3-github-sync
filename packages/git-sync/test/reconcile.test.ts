@@ -296,3 +296,43 @@ describe("reconcileFile delete-vs-edit freshness (rename resurrection)", () => {
     expect(outcome).toEqual({ kind: "pushed", created: true });
   });
 });
+
+// Rename-aware: git-sync emits `renamedTo` when a git commit renames a file, and honors it on receive
+// (always delete the old side — never resurrect — since the content moved to `new`).
+describe("reconcileFile rename-aware", () => {
+  const OLD = "projects/old-name.md";
+  const NEW = "projects/new-name.md";
+  const tombstoneRenamed = (at: string): SnapshotEntry =>
+    ({ deleted: true, renamedTo: NEW, rev: 3, by: "obsidian", at } as unknown as SnapshotEntry);
+
+  it("emit: a git-side rename tombstones the old path WITH renamedTo", async () => {
+    const live = remoteEntry(encodeText("body\n")); // old is currently live in S3
+    const { io } = makeIO({}); // old already gone from the working tree (git delete)
+    const { action, outcome } = await reconcileFile(
+      OLD, "delete", undefined, { files: { [OLD]: live } }, io, NEW,
+    );
+    expect(action).toEqual({ tombstone: true, renamedTo: NEW });
+    expect(outcome).toEqual({ kind: "tombstoned" });
+  });
+
+  it("emit: a plain delete (no renamedTo arg) stays a bare tombstone", async () => {
+    const live = remoteEntry(encodeText("body\n"));
+    const { io } = makeIO({});
+    const { action } = await reconcileFile(OLD, "delete", undefined, { files: { [OLD]: live } }, io);
+    expect(action).toEqual({ tombstone: true });
+  });
+
+  it("receive: tombstone{renamedTo} always deletes old, never resurrects (even vs a newer git edit)", async () => {
+    // authorDate is 2026-07-13; the tombstone is OLDER (2026-07-12) so freshest-wins alone would RESURRECT.
+    // The rename hint overrides that: the content moved to `new`, so `old` must go.
+    const local = encodeText("git-side edit to old\n");
+    const ts = tombstoneRenamed("2026-07-12T00:00:00.000Z");
+    const { io, removes } = makeIO({ local: { [OLD]: local } });
+
+    const { action, outcome } = await reconcileFile(OLD, "upsert", ts, { files: { [OLD]: ts } }, io);
+
+    expect(action).toBeNull(); // NOT re-pushed → no resurrection
+    expect(removes).toContain(OLD); // removed from the tree
+    expect(outcome).toEqual({ kind: "deletedLocal" });
+  });
+});

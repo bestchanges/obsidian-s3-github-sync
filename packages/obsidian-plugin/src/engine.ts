@@ -17,6 +17,7 @@ import {
   remoteIsFresher,
   SnapshotEntry,
   StorageAdapter,
+  Tombstone,
   unionMerge,
 } from "@vault-sync/core";
 
@@ -154,6 +155,11 @@ export class SyncEngine {
   /** paths currently being written by sync itself — vault events for them are echoes (§2.3) */
   readonly applying = new Set<string>();
   private dirty = new Set<string>();
+  /** Pending renames captured from Obsidian's rename event (oldPath → newPath), consumed by the next
+   * push() so the OLD path's tombstone carries `renamedTo`. A receiver that still holds a
+   * divergent `old` then folds its edit onto `new` instead of resurrecting it. Cleared once the
+   * tombstone is emitted. */
+  private renames = new Map<string, string>();
   /** Files pulled this session but not yet confirmed to have held the written bytes. Guards against
    * an editor clobbering a fresh pull with a stale buffer, which would otherwise re-publish the old
    * content as a "local edit" (§2.6). Keyed by path; entries self-clear on confirm/divergence and
@@ -259,6 +265,15 @@ export class SyncEngine {
   // ------------------------------------------------------------- dirty tracking
   markDirty(path: string): void {
     if (!this.isExcluded(path) && !this.applying.has(path)) this.dirty.add(path);
+  }
+
+  /** Record a rename (oldPath → newPath) from Obsidian's rename event so the next push() tags the old
+   * path's tombstone with `renamedTo`. Ignored when either side is excluded — an excluded
+   * old path never tombstones, and an excluded target isn't a sync destination. Echo-safe: a rename
+   * sync itself performs is suppressed by the applying-set on the paths it writes. */
+  recordRename(oldPath: string, newPath: string): void {
+    if (this.isExcluded(oldPath) || this.isExcluded(newPath)) return;
+    this.renames.set(oldPath, newPath);
   }
 
   /** Mark one existing file dirty if it's new or its content changed (mtime pre-filter, hash
@@ -576,10 +591,16 @@ export class SyncEngine {
       targetRev = deltas.at(-1)!.rev;
     }
 
-    await mapPool([...changed.entries()], this.opts.concurrency, async ([path, entry]) => {
-      if (this.isExcluded(path) || !this.isSafePath(path)) return; // §2.2: skipped, not applied
-      await this.applyRemote(path, entry);
-    });
+    // Apply live entries BEFORE tombstones so a rename's destination (`new`) is materialized before
+    // its old-side tombstone folds a divergent local `old` onto it. Ordering is otherwise
+    // irrelevant to correctness — a delete after applying lives is always safe.
+    const applicable = [...changed.entries()].filter(
+      ([path]) => !this.isExcluded(path) && this.isSafePath(path),
+    );
+    const lives = applicable.filter(([, e]) => !isTombstone(e));
+    const tombstones = applicable.filter(([, e]) => isTombstone(e));
+    await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
+    await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
     this.state.lastSyncedRev = targetRev;
   }
 
@@ -595,9 +616,17 @@ export class SyncEngine {
     const st = this.state.files[path];
 
     if (isTombstone(entry)) {
+      const renamedTo = (entry as Tombstone).renamedTo;
       const localBuf = await this.readLocal(path);
       if (localBuf) {
-        if (st && contentHash(localBuf) !== st.hash && (await this.editWinsOverDelete(path, entry))) {
+        const divergent = st ? contentHash(localBuf) !== st.hash : false;
+        if (divergent && renamedTo && this.isSafePath(renamedTo) && !this.isExcluded(renamedTo)) {
+          // This delete is a rename's OLD side and we hold a divergent copy. Fold our edit onto `new`
+          // (which the live-first pull pass has already materialized) instead of resurrecting `old`,
+          // then remove `old` below. Losslessly carries a concurrent edit across the rename — the case
+          // the freshest-wins delete-vs-edit tiebreak can't preserve.
+          await this.foldRenamedEdit(path, renamedTo, localBuf, st!);
+        } else if (divergent && (await this.editWinsOverDelete(path, entry))) {
           this.dirty.add(path); // delete-vs-edit: our FRESHER edit wins (§1.5) → re-push
           return;
         }
@@ -739,6 +768,55 @@ export class SyncEngine {
     const localMtime = stat ? new Date(stat.mtime).toISOString() : "";
     // delete wins only if strictly newer than the local edit; a tie keeps the local edit.
     return !remoteIsFresher(at, localMtime);
+  }
+
+  /** Fold a divergent local `old` (being deleted as the SOURCE of a rename) onto `new`,
+   * instead of resurrecting `old`. Three-way union-merge for text (base = the last-synced `old`
+   * content via its s3VersionId, ours = the local edit, theirs = the current `new`), freshest-wins for
+   * binary/config/oversized. Writes the result to `new` and marks it dirty so the merged bytes
+   * re-publish and every device converges; the caller then removes `old`. Losslessly carries a
+   * concurrent edit across a rename — the case editWinsOverDelete's freshest-wins tiebreak cannot
+   * preserve. */
+  private async foldRenamedEdit(
+    oldPath: string,
+    newPath: string,
+    localOld: Uint8Array,
+    stOld: FileState,
+  ): Promise<void> {
+    // Current `new` content: the live-first pull pass has already written it, so prefer the live
+    // remote copy, then local, then `old` itself (a pure rename where `new` never diverged).
+    const remoteNew = await this.storage.get(`files/${newPath}`);
+    const localNew = await this.readLocal(newPath);
+    const theirs = remoteNew?.body ?? localNew ?? localOld;
+    if (contentHash(localOld) === contentHash(theirs)) return; // our edit already equals `new` → just drop `old`
+
+    if (this.isTextPath(newPath) && !this.isConfigPath(newPath) &&
+        localOld.byteLength <= LWW_SIZE_LIMIT && theirs.byteLength <= LWW_SIZE_LIMIT) {
+      const baseObj = stOld.s3VersionId
+        ? await this.storage.get(`files/${oldPath}`, { versionId: stOld.s3VersionId })
+        : null;
+      const merged = unionMerge(
+        baseObj ? decodeText(baseObj.body) : "",
+        decodeText(localOld),
+        decodeText(theirs),
+      );
+      await this.write(newPath, encodeText(merged.text), new Date().toISOString());
+      if (merged.hadConflicts) {
+        this.opts.log("warn", `rename-folded conflict ${oldPath} → ${newPath}`);
+        new Notice(`Sync: union-merged rename ${oldPath} → ${newPath}`);
+      }
+    } else {
+      // binary/config/oversized — no line merge; keep whichever side is fresher.
+      const so = await this.vault.adapter.stat(oldPath);
+      const sn = await this.vault.adapter.stat(newPath);
+      const oldMtime = so ? new Date(so.mtime).toISOString() : "";
+      const newMtime = sn ? new Date(sn.mtime).toISOString() : "";
+      if (remoteIsFresher(newMtime, oldMtime)) return; // `new` is newer → keep it, just drop `old`
+      await this.write(newPath, localOld, new Date().toISOString()); // `old` edit is newer → move it onto `new`
+    }
+    this.dirty.add(newPath); // re-publish the folded result so all devices converge
+    this.merged++;
+    this.recordMerged(newPath);
   }
 
   /** Which conflict strategy a path uses: config-dir files and binary/oversized content resolve by
@@ -898,10 +976,16 @@ export class SyncEngine {
         }
         if (!stat || stat.type !== "file" || goneByCase) {
           if (this.state.files[path]) {
-            files[path] = { deleted: true }; // deleted locally / renamed to a new case → tombstone
+            // deleted locally / renamed away → tombstone. If a rename was captured for this path,
+            // tag the tombstone with its destination so other devices fold a divergent
+            // copy of `old` onto `new` instead of resurrecting it. `renamedTo` is only trusted when it
+            // survived the drain (still a real target); a bare delete stays a plain tombstone.
+            const renamedTo = this.renames.get(path);
+            files[path] = renamedTo ? { deleted: true, renamedTo } : { deleted: true };
             newStates.set(path, null);
             this.detail.deletedRemote.push(path);
           }
+          this.renames.delete(path);
           return;
         }
         const buf = new Uint8Array(await this.vault.adapter.readBinary(path));

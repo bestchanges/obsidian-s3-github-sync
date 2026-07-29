@@ -171,6 +171,9 @@ async function main(): Promise<void> {
 
   // ---- detect git-side changes (§3.3 step 3) -----------------------------
   let gitChanged: Map<string, "upsert" | "delete">;
+  // Rename pairs (oldPath → newPath) from `-M` detection, so the old side's tombstone carries
+  // `renamedTo`. Only meaningful on the warm diff path; a cold full-state diff has none.
+  let gitRenames = new Map<string, string>();
   const warmGit =
     state.lastSyncedCommit !== null && (await git.isAncestor(state.lastSyncedCommit, head));
   if (warmGit) {
@@ -184,12 +187,18 @@ async function main(): Promise<void> {
         c.status === "D" ? "delete" : "upsert",
       ]),
     );
+    gitRenames = await git.renames(diffBase, head);
   } else {
     if (state.lastSyncedCommit) logger.warn("history rewritten — falling back to full-state diff");
     gitChanged = new Map((await git.trackedFiles()).map((p) => [p, "upsert"]));
   }
   for (const p of [...gitChanged.keys()]) {
     if (ig.ignores(p) || !isSafeRelPath(p)) gitChanged.delete(p);
+  }
+  // Drop rename hints whose destination isn't a real sync target (ignored/unsafe) — the old side then
+  // tombstones as a plain delete rather than pointing at a path that never syncs.
+  for (const [oldP, newP] of [...gitRenames]) {
+    if (ig.ignores(newP) || !isSafeRelPath(newP)) gitRenames.delete(oldP);
   }
 
   // ---- detect S3-side changes (§3.3 steps 2+4) ---------------------------
@@ -285,7 +294,7 @@ async function main(): Promise<void> {
 
   const outcomes = new Map<string, ReconcileOutcome>();
   await mapPool([...allPaths], CONCURRENCY, async (p) => {
-    const { action, outcome } = await reconcileFile(p, gitChanged.get(p), s3Changed.get(p), remote, io);
+    const { action, outcome } = await reconcileFile(p, gitChanged.get(p), s3Changed.get(p), remote, io, gitRenames.get(p));
     if (action) uploads.set(p, action);
     if (outcome.kind !== "noop") outcomes.set(p, outcome);
   });
@@ -297,7 +306,7 @@ async function main(): Promise<void> {
     const files: Record<string, DeltaEntry> = {};
     await mapPool([...uploads.entries()], CONCURRENCY, async ([p, u]) => {
       if ("tombstone" in u) {
-        files[p] = { deleted: true };
+        files[p] = u.renamedTo ? { deleted: true, renamedTo: u.renamedTo } : { deleted: true };
       } else {
         const res = await storage.put(`files/${p}`, u.content); // raw bytes
         files[p] = { ...u.entry, s3VersionId: res.versionId };
