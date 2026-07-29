@@ -84,7 +84,7 @@ export function foldDeltas(snapshot: Snapshot | null, deltas: Delta[]): Snapshot
   for (const d of [...deltas].sort((a, b) => a.rev - b.rev)) {
     if (d.rev <= revision) continue; // already folded
     for (const [path, entry] of Object.entries(d.files)) {
-      files[path] = { ...entry, rev: d.rev, by: d.by };
+      files[path] = { ...entry, rev: d.rev, by: d.by, at: d.at };
     }
     revision = d.rev;
   }
@@ -101,7 +101,7 @@ export function changedEntries(
   for (const d of [...deltas].sort((a, b) => a.rev - b.rev)) {
     if (d.rev <= sinceRev) continue;
     for (const [path, entry] of Object.entries(d.files)) {
-      out.set(path, { ...entry, rev: d.rev, by: d.by });
+      out.set(path, { ...entry, rev: d.rev, by: d.by, at: d.at });
     }
   }
   if (excludeBy) {
