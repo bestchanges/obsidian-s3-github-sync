@@ -93,10 +93,10 @@ repo). Only the plugin writes/reads it, and only when logging is enabled (§4.11
 
 ```ts
 interface FileEntry  { hash: string; s3VersionId?: string; size: number; mtime: string }
-interface Tombstone  { deleted: true }
+interface Tombstone  { deleted: true; renamedTo?: string }
 type DeltaEntry      = FileEntry | Tombstone
 interface Delta      { rev: number; by: string; at: string; files: Record<string, DeltaEntry> }
-type SnapshotEntry   = DeltaEntry & { rev: number; by: string }
+type SnapshotEntry   = DeltaEntry & { rev: number; by: string; at?: string }
 interface Snapshot   { schemaVersion: number; revision: number; updatedAt: string;
                        files: Record<string, SnapshotEntry> }
 ```
@@ -108,6 +108,13 @@ interface Snapshot   { schemaVersion: number; revision: number; updatedAt: strin
   plugin instance. Basis for echo suppression.
 - `rev` — dense global counter; the delta key is zero-padded (`pad10`) so lexicographic S3 listing
   equals revision order.
+- `renamedTo` (tombstone only) — set when a delete is the **old side of a rename**; the content moved
+  to that path. Drives rename propagation (§2.8). Optional and additive: a client that predates it
+  reads a plain tombstone and falls back to the delete-vs-edit tiebreak (§2.8).
+- `at` on a `SnapshotEntry` — the authoring delta's timestamp, carried onto each folded entry by
+  `changedEntries` / `foldDeltas` (the raw `Delta.at`). For a tombstone it is the **delete time**, the
+  input to the delete-vs-edit tiebreak (§2.8). Optional: entries folded into a snapshot written before
+  `at` existed simply lack it, and readers fall back to the pre-`at` behavior.
 
 ## 2.3 Write algorithm — CAS append (`appendDelta`)
 
@@ -175,6 +182,35 @@ across both legs.
 - `contentHash` — `spark-md5` over bytes, `"md5:<hex>"`. Pure JS → identical on mobile, desktop, CI.
 - `encodeJsonGz` / `decodeJsonGz` — `pako` gzip of JSON, the wire format for snapshot + deltas.
 - `mapPool(items, limit, fn)` — bounded concurrency (8 mobile, 50 desktop/CI).
+
+## 2.8 Renames & the delete-vs-edit tiebreak
+
+The journal has **no rename primitive** — a rename is a `{deleted:true}` for `old` plus a `FileEntry`
+for `new`, in one delta. The hazard is a **second writer that holds a diverged copy of `old`** when
+that tombstone arrives: naively "an edit always beats a delete" re-publishes `old` and the note
+**duplicates** (`old` and `new` both live). Both legs resolve this identically (kept in lockstep;
+plugin `applyRemote` §4.8, git-sync `reconcileFile` §5.4):
+
+1. **Freshest-wins tiebreak (all deletes).** A tombstone colliding with a locally-diverged copy is
+   kept-and-re-published **only if the local edit is at least as fresh as the delete** — compare the
+   local `mtime` (git: `authorDate`) against the tombstone's `at`. A copy **strictly older** than the
+   delete is a stale divergence, so the **delete wins** and the copy is removed. This converges (no
+   bytes synthesized) and preserves a genuine edit made *after* a delete. A legacy tombstone with no
+   `at` keeps the historical keep-local behavior, so no edit is ever silently dropped.
+
+2. **Rename fold (`renamedTo` present).** When the tombstone names its destination, a diverged `old`
+   is **union-merged onto `new`** instead of being resurrected or dropped — losslessly carrying a
+   concurrent edit across the rename, which (1) alone cannot do. Base = the receiver's own last-synced
+   `old` (via its recorded `s3VersionId`); *ours* = the local `old`; *theirs* = the current `new`.
+   Binary/config/oversized paths use freshest-wins between the two rather than a line-merge. `old` is
+   then removed — **never re-published**.
+
+Ordering matters: a receiver applies **live entries before tombstones** in a pull so the rename's
+`new` target already exists when the `old` side folds onto it (§4.8; git-sync reconciles the whole
+`gitChanged ∪ s3Changed` set together, §5.4). `renamedTo` is emitted by the source of the rename —
+the plugin from Obsidian's `rename` event (`recordRename`, §4.4), git-sync from `-M` rename detection
+(`git.renames()`, §5.2). Because the field is additive, a mixed fleet degrades safely: a client that
+can't read it just applies the freshest-wins tiebreak (1).
 
 ---
 
@@ -252,8 +288,9 @@ One cycle: **pull** remote changes (merge conflicts), then **push** the dirty se
 resets per-cycle counters, and persists state only when something changed or the cursor moved.
 
 - **pull** — `listDeltasSince(lastSyncedRev)`. Warm path applies `changedEntries` (excluding this
-  device unless `fullPull`); cold path (`hasGap` or behind snapshot) diffs the snapshot. For each
-  changed path not excluded/unsafe → `applyRemote`. Advances `lastSyncedRev` to the target.
+  device unless `fullPull`); cold path (`hasGap` or behind snapshot) diffs the snapshot. Changed paths
+  (not excluded/unsafe) go to `applyRemote` with **live entries before tombstones**, so a rename's
+  destination exists before its old side folds onto it (§2.8, §4.8). Advances `lastSyncedRev` to the target.
 - **push** — snapshots and **drains** the dirty set up front (so an edit that lands mid-cycle
   re-populates `dirty` and is pushed next cycle instead of being wiped by a blanket clear — the fix
   for edits lost during a slow push); then hashes each drained file; **hash unchanged → dropped**
@@ -268,7 +305,8 @@ restore files *it* originally wrote but has since lost locally — the fix for "
 ## 4.4 Change tracking & offline scan (`scanOffline`)
 
 Vault events (`create/modify/delete/rename`) feed the dirty set while running (5 s debounce before a
-push). Events don't fire while the app is closed, so `scanOffline` on startup diffs the vault against
+push). A `rename` also calls `recordRename(old → new)`, so the next push tags the old path's tombstone
+with `renamedTo` (rename propagation, §2.8). Events don't fire while the app is closed, so `scanOffline` on startup diffs the vault against
 stored state: an mtime pre-filter picks candidates, the hash decides. New files join the dirty set;
 missing files are treated as offline deletes — **except** the mass-missing guard:
 
@@ -404,6 +442,16 @@ to the download cap); local also changed → **conflict**. Conflict strategy dep
 > Plugin-only: git-sync has no editor, so the union merge itself is unchanged and both legs stay in
 > lockstep.
 
+> [!note] Deletes, renames & the delete-vs-edit tiebreak (`applyRemote`, protocol §2.8)
+> A tombstone whose target is still on disk and **diverges** from the baseline is resolved by
+> `editWinsOverDelete`: keep-and-re-push only when the local `mtime` is **≥** the tombstone's `at`; a
+> strictly-older copy loses to the delete (no resurrection). When the tombstone carries `renamedTo`,
+> `foldRenamedEdit` instead **union-merges** the diverged `old` onto `new` (base = the recorded
+> `s3VersionId` of `old`; freshest-wins for binary/config), then removes `old` — carrying a concurrent
+> edit across the rename losslessly. The **emit** side is `recordRename` (from Obsidian's `rename`
+> event, §4.4): the next `push` tags the old path's tombstone with `renamedTo`. Because a rename's
+> `new` must exist before the fold, `pull` applies **live entries before tombstones** in each cycle.
+
 Remote writes
 land with the **manifest's mtime** (`DataWriteOptions`), so sort-by-modified is consistent across
 devices and the offline pre-filter stays trustworthy. Writes made by sync are wrapped in an
@@ -509,7 +557,9 @@ manifest hashes reconstruct everything.
 
 - **Git side**: if `lastSyncedCommit` is an ancestor of `HEAD` (warm), `git diff --name-status`
   from the **diff base** (renames become delete+add); else (history rewritten / first run) fall back
-  to `ls-files` full diff. Ignored paths and unsafe paths are dropped.
+  to `ls-files` full diff. Ignored paths and unsafe paths are dropped. `git.renames()` additionally
+  recovers the `-M` rename **pairs** (`old → new`) so the old side's tombstone can carry `renamedTo`
+  (§2.8); a pair whose destination is ignored/unsafe is dropped back to a plain delete.
   The diff base is git-sync's **own last sync commit** when it sits at/after the cursor
   (`resolveDiffBase`, `merge-base.ts`), not `lastSyncedCommit` itself: the cursor is the pre-commit
   HEAD, so diffing from it would re-report the last sync commit's own S3-applied writes as git
@@ -542,9 +592,14 @@ it is unit-tested without a real repo/S3/filesystem (`test/reconcile.test.ts`). 
 `gitChanged ∪ s3Changed` (50-way parallel):
 
 - git-only upsert → PUT to S3 if the content hash differs from remote (idempotence); git-only delete
-  → tombstone if remote still lives.
+  → tombstone if remote still lives (tagged `renamedTo` when this was a git-side rename, §2.8).
 - S3-only → write into the working tree, or `rm` on a tombstone.
-- both → resolve: delete-vs-edit → edit wins; else classify like the plugin (§4.8, kept in lockstep):
+- both → resolve. **Delete-vs-edit** (S3 tombstone vs a git copy): a `renamedTo` tombstone **always
+  removes** the old side — the content moved to `new`, which arrives as its own live entry, so the old
+  path is never resurrected (a rare concurrent git-side edit to `old` is already folded onto `new` by
+  the source device). A plain tombstone uses the **freshest-wins tiebreak** — keep-and-re-push only
+  when `io.authorDate` is ≥ the tombstone's `at`; a strictly-older git copy loses to the delete
+  (§2.8). Otherwise classify like the plugin (§4.8, kept in lockstep):
   - **config (`.obsidian/**`) or binary/oversized** → **freshest-wins**: compare `io.authorDate` (git
     side) against the S3 entry's `mtime`; remote newer → write remote to the tree, no push; git newer
     (or a tie) → keep git's bytes and re-push. Mirrors the plugin's `resolveFreshestWins` so JSON
