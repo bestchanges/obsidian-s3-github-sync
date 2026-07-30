@@ -24,16 +24,48 @@ export interface UnionMergeResult {
 }
 
 /**
- * Combine the two sides of a conflict region into one, keeping lines common to
- * both exactly once and stacking only the lines that actually differ (ours then
- * theirs). LCS-aligned via diffComm, so shared context isn't duplicated. Nothing
- * is lost: every unique line from either side survives.
+ * Alignment key for a line: ignore a trailing run of spaces/tabs and any CR, so pure formatting
+ * noise between two devices — CRLF vs LF, a stray trailing space on a ``` fence — does NOT defeat
+ * line alignment and stack an otherwise-identical block twice. Used ONLY to decide what is "common";
+ * the original bytes are always what's emitted, so nothing is normalized away in the output. Leading
+ * whitespace (indentation: code, nested lists) is significant and never touched.
+ */
+function alignKey(line: string): string {
+  return line.replace(/[ \t\r]+$/, "");
+}
+
+/**
+ * A line common to both sides under alignKey but whose originals differ only by trailing whitespace:
+ * pick a ROLE-INDEPENDENT canonical original so the two sync legs emit byte-identical output no matter
+ * which side each holds as "ours". The longer original wins (preserving a meaningful trailing run — a
+ * Markdown hard break is two trailing spaces, longer than none), ties broken lexicographically. This
+ * is lossless: the more-content side is kept, never the stripped one.
+ */
+function canonicalCommon(a: string, b: string): string {
+  if (a === b) return a;
+  if (a.length !== b.length) return a.length > b.length ? a : b;
+  return a < b ? a : b;
+}
+
+/**
+ * Combine the two sides of a conflict region into one, keeping lines common to both exactly once and
+ * stacking only the lines that actually differ (ours then theirs). LCS-aligned via diffComm on the
+ * NORMALIZED keys (alignKey), so whitespace/EOL noise can't split an identical block — while the
+ * ORIGINAL bytes are emitted (canonicalCommon for shared lines, verbatim for divergent ones). Nothing
+ * is lost: every unique line from either side survives, and a genuinely-different line still stacks.
  */
 function mergeConflictSides(a: string[], b: string[]): string[] {
   const out: string[] = [];
-  for (const region of diffComm(a, b)) {
-    if (region.common) out.push(...region.common);
-    else out.push(...region.buffer1, ...region.buffer2); // ours-only, then theirs-only
+  let ia = 0;
+  let ib = 0;
+  for (const region of diffComm(a.map(alignKey), b.map(alignKey))) {
+    if (region.common) {
+      for (let k = 0; k < region.common.length; k++) out.push(canonicalCommon(a[ia++], b[ib++]));
+    } else {
+      // ours-only, then theirs-only — emit the originals, not the normalized keys.
+      for (let k = 0; k < region.buffer1.length; k++) out.push(a[ia++]);
+      for (let k = 0; k < region.buffer2.length; k++) out.push(b[ib++]);
+    }
   }
   return out;
 }
