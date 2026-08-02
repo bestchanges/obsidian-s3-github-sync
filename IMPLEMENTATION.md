@@ -325,25 +325,32 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 > engine resets `lastSyncedRev = 0` and **restores from S3**. Below the floor, missing files
 > propagate as normal tombstones.
 
-> [!important] Case-only renames — guard runs on case-insensitive filesystems ONLY
-> A rename that changes only letter case (e.g. `My Note` → `My note`) leaves the **old-cased** path
-> in the dirty set. On macOS/Windows/iOS (case-insensitive APFS/HFS+/NTFS) `adapter.stat(oldPath)`
-> resolves to the *new* file, so the old path looks alive and `push()` would re-upload it — a phantom
-> duplicate that only materializes on case-**sensitive** peers (Android/Linux), where the two casings
-> are distinct files. `push()` guards against this by listing the parent dir: a stat'd path is treated
-> as renamed-away (→ tombstone) only when its exact-case basename is **absent** yet a different-cased
-> variant is **present** (basenames compared NFC-normalized so an NFD listing entry still matches).
-> Positive evidence only — an empty/unreadable listing falls back to trusting `stat`.
+> [!important] Case-insensitive, NFC path identity (§1.2a)
+> Obsidian treats a note's name as **case-insensitive** on every platform — `Foo.md`, `foo.md`,
+> `FOO.md` are one node, wikilinks resolve across case, the graph shows one vertex (confirmed against
+> Obsidian's docs). Our S3 keys are case-**sensitive**, so a case-only rename manufactures **two keys
+> for one node** — exactly the "file created with a different casing outside Obsidian" case Obsidian
+> itself punts on. `core` makes case-insensitive identity a **protocol invariant** so neither leg ever
+> has to reason about the host filesystem's case behavior (which `Platform` can't even reveal — an
+> Android vault can sit on case-insensitive storage).
 >
-> **The guard is gated by `EngineOptions.caseInsensitiveFS` and runs ONLY where the FS is confirmed
-> case-insensitive** (`Platform.isMacOS || isWin || isIosApp`). On a case-**sensitive** filesystem
-> (Android/Linux) `stat()` never lies — the very reason git-sync needs no such guard — so the guard is
-> unnecessary AND unsafe there: a transient listing gap (a rename in flight, listing lag, or an
-> NFC/NFD mismatch) makes it read a live, freshly-pulled note as "gone by case" and tombstone it,
-> which then deletes the note on every device. This exact misfire on Android caused a real data loss
-> (2026-08-02, vault gsd2): a clean case-only rename on macOS was tombstoned by an Android peer within
-> the same pull→push cycle. Default is `false` (guard off = trust stat), so any platform not positively
-> known to be case-insensitive stays safe.
+> - `canonicalKey(path) = path.normalize("NFC").toLowerCase()` (`core/casing.ts`) is a node's identity.
+>   NFC matters as much as case: macOS/APFS and Android surface Cyrillic/accented names decomposed
+>   (NFD), a byte-different key for the same node.
+> - `collapseNodes` folds case/NFC-variant keys to a single winner — **freshest `rev`; live beats
+>   tombstone on a rev tie** (a rename is `delete(old)`+`add(new)` at one rev, the live destination
+>   survives). It runs inside `foldDeltas` (snapshots) and `changedEntries` (what a client applies), so
+>   **derived state never carries two entries for one node.** A case-only rename therefore reaches a
+>   client as the single live destination — never as a separate stale-cased tombstone that a
+>   case-insensitive filesystem would apply over the live file (the 2026-08-02 gsd2 data loss).
+> - The plugin's `push()` tombstones an old path as renamed-away **only** from Obsidian's `rename`
+>   event (`recordRename` → `this.renames`), never from a directory-listing heuristic. `stat(oldPath)`
+>   of a case-only rename lies on a case-insensitive FS (it resolves to the new file), so the old
+>   listing-based `goneByCase` guard — which caused the loss — is **removed**.
+> - git-sync (case-sensitive repo) removes any tracked file that is a case/NFC variant of a live
+>   remote node at a different exact path, guarded by "the winner exists in the tree" so it can only
+>   ever rename, never delete. Existing case-variant duplicates in S3/the repo collapse automatically
+>   on the next fold — no migration step.
 
 ## 4.5 Resync everything (`resyncEverything`)
 

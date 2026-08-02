@@ -9,6 +9,7 @@ import {
 } from "./schemas";
 import { PreconditionFailedError, StorageAdapter } from "./s3";
 import { decodeJsonGz, encodeJsonGz } from "./codec";
+import { collapseNodes } from "./casing";
 import { mapPool } from "./util";
 
 export const SNAPSHOT_KEY = "snapshot.json.gz";
@@ -88,7 +89,12 @@ export function foldDeltas(snapshot: Snapshot | null, deltas: Delta[]): Snapshot
     }
     revision = d.rev;
   }
-  return { schemaVersion: SCHEMA_VERSION, revision, updatedAt: new Date().toISOString(), files };
+  // Collapse case/normalization-variant keys to one node per canonical identity (§1.2a): a case-only
+  // rename leaves both `old` (tombstone) and `new` (live) in the folded map; keeping both would let a
+  // reader duplicate the note or apply the stale-cased tombstone over the live file. collapseNodes
+  // keeps the freshest, so the snapshot carries exactly one entry per logical node.
+  const collapsed = Object.fromEntries(collapseNodes(Object.entries(files)));
+  return { schemaVersion: SCHEMA_VERSION, revision, updatedAt: new Date().toISOString(), files: collapsed };
 }
 
 /** Last-wins changed entries after sinceRev, excluding a writer (echo suppression, §1.7). */
@@ -97,13 +103,18 @@ export function changedEntries(
   sinceRev: number,
   excludeBy?: string,
 ): Map<string, SnapshotEntry> {
-  const out = new Map<string, SnapshotEntry>();
+  const raw = new Map<string, SnapshotEntry>();
   for (const d of [...deltas].sort((a, b) => a.rev - b.rev)) {
     if (d.rev <= sinceRev) continue;
     for (const [path, entry] of Object.entries(d.files)) {
-      out.set(path, { ...entry, rev: d.rev, by: d.by, at: d.at });
+      raw.set(path, { ...entry, rev: d.rev, by: d.by, at: d.at });
     }
   }
+  // Collapse case/normalization-variant keys to one node per canonical identity (§1.2a) BEFORE echo
+  // suppression, so a client applies a case-only rename as the single freshest node (the live
+  // destination) instead of also applying the stale-cased tombstone — which on a case-insensitive
+  // filesystem would delete the just-materialized file (the Android data-loss bug).
+  const out = collapseNodes(raw);
   if (excludeBy) {
     for (const [path, entry] of out) {
       if (entry.by === excludeBy) out.delete(path);

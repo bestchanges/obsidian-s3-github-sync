@@ -10,6 +10,7 @@ import path from "node:path";
 import ignoreFactory from "ignore";
 import {
   appendDelta,
+  canonicalKey,
   Delta,
   DeltaEntry,
   FileEntry,
@@ -300,6 +301,26 @@ async function main(): Promise<void> {
   });
 
   logCycleDetail(outcomes, skipped);
+
+  // ---- case-only rename cleanup on the git side (§1.2a) -------------------
+  // core collapses S3 state to ONE key per canonical node, so when a note is re-cased the collapsed
+  // remote carries only the winning case. git is case-SENSITIVE, so the repo can be left holding the
+  // OLD-cased file as an orphan duplicate. Remove any tracked file that is a case/normalization
+  // variant of a LIVE remote node at a DIFFERENT exact path — the node now lives at the winning case.
+  // Guard with existsLocal(winner): never drop the old file unless the new-cased file is actually in
+  // the tree, so this can only ever rename (never delete) a note on the git side.
+  const liveWinnerByNode = new Map<string, string>();
+  for (const [p, e] of Object.entries(remote.files)) {
+    if (!isTombstone(e)) liveWinnerByNode.set(canonicalKey(p), p);
+  }
+  for (const q of await git.trackedFiles()) {
+    if (!isSafeRelPath(q)) continue;
+    const winner = liveWinnerByNode.get(canonicalKey(q));
+    if (winner && winner !== q && (await io.existsLocal(winner))) {
+      await io.removeLocal(q);
+      outcomes.set(q, { kind: "deletedLocal" });
+    }
+  }
 
   // ---- push to S3: files, then one delta (§1.3) ---------------------------
   if (uploads.size > 0) {
