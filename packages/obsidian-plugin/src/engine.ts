@@ -44,6 +44,11 @@ function isPerDeviceFile(path: string): boolean {
   return path.startsWith(".obsidian/") && /^workspace.*\.json$/.test(base);
 }
 const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
+/** NFC-normalize a name so a Unicode-decomposed (NFD) filesystem entry — Android/APFS surface
+ * Cyrillic/accented names in varying forms — compares equal to its composed counterpart. Byte-exact
+ * string comparison across the sync boundary otherwise treats the same name as two, which is how the
+ * case-only-rename guard once read a live pulled file as "missing" and tombstoned it. */
+const nfc = (s: string): string => s.normalize("NFC");
 /** Offline-delete safety: absence on disk is NOT a reliable delete signal (a stale/copied/moved
  * state looks identical to a mass delete). Below the floor we trust it as genuine offline deletes;
  * above the fraction we treat it as a state mismatch and RESTORE from S3 instead of tombstoning. */
@@ -123,6 +128,16 @@ export interface EngineOptions {
    * corruption everywhere. Must be false for a copied (foreign) state and for user resyncs, where
    * local content is real and union-merge is the right, lossless choice. */
   firstRun?: boolean;
+  /** True only on a case-INSENSITIVE filesystem (macOS/Windows desktop, iOS). Enables the case-only
+   * rename guard in push() (§2.2), which detects a note renamed to differ only in letter case — a
+   * situation where stat(oldPath) resolves to the new file and would otherwise re-push a phantom
+   * duplicate. On a case-SENSITIVE filesystem (Android/Linux) stat() never lies, so the guard is not
+   * only unnecessary but DANGEROUS: a transient listing gap (rename in flight, listing lag, or an
+   * NFC/NFD normalization mismatch between the tracked path and the directory listing) makes it read
+   * a live, freshly-pulled file as "renamed away by case" and tombstone it — real data loss that
+   * propagates to every device. Defaults to false (guard off = trust stat, matching git-sync), so an
+   * unknown platform never risks the loss; only a confirmed case-insensitive host turns it on. */
+  caseInsensitiveFS?: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -941,7 +956,7 @@ export class SyncEngine {
         if (!p) {
           p = this.vault.adapter
             .list(dir === "" ? "/" : dir)
-            .then((l) => new Set(l.files.map((f) => f.split("/").pop() ?? f)))
+            .then((l) => new Set(l.files.map((f) => nfc(f.split("/").pop() ?? f))))
             .catch(() => null); // unreadable dir → "unknown", never treat as empty
           dirCache.set(dir, p);
         }
@@ -953,16 +968,22 @@ export class SyncEngine {
         // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
         const stat = await this.vault.adapter.stat(path);
         // A case-only rename (e.g. "My Note" → "My note") leaves the OLD-cased path dirty. On a
-        // case-insensitive filesystem (macOS/iOS) stat() resolves it to the new file, so it looks
-        // alive and gets re-pushed as a duplicate — one that only materializes on case-sensitive
-        // (Android/Linux) peers. Detect that by listing the parent dir: the path is "renamed away by
-        // case" only when its exact-case basename is ABSENT yet a different-cased variant is PRESENT.
-        // (Positive evidence only — an empty/unreadable listing falls back to trusting stat, so we
-        // never wrongly tombstone a file the listing simply didn't cover.)
+        // case-INSENSITIVE filesystem (macOS/Windows/iOS) stat() resolves it to the new file, so it
+        // looks alive and gets re-pushed as a duplicate — one that only materializes on
+        // case-sensitive (Android/Linux) peers. Detect that by listing the parent dir: the path is
+        // "renamed away by case" only when its exact-case basename is ABSENT yet a different-cased
+        // variant is PRESENT. (Positive evidence only — an empty/unreadable listing falls back to
+        // trusting stat, so we never wrongly tombstone a file the listing simply didn't cover.)
+        //
+        // This runs ONLY when caseInsensitiveFS is set. On a case-SENSITIVE filesystem stat() never
+        // lies, so the guard is unnecessary AND unsafe: a transient listing gap (rename in flight,
+        // listing lag, or an NFC/NFD normalization mismatch between the tracked path and the listing)
+        // reads a live file as "gone by case" and tombstones it — the Android data-loss bug. Compare
+        // basenames NFC-normalized so a decomposed listing entry still matches its composed path.
         let goneByCase = false;
-        if (stat?.type === "file") {
+        if (this.opts.caseInsensitiveFS && stat?.type === "file") {
           const slash = path.lastIndexOf("/");
-          const base = path.slice(slash + 1);
+          const base = nfc(path.slice(slash + 1));
           const names = await listBasenames(slash === -1 ? "" : path.slice(0, slash));
           if (names && !names.has(base)) {
             const lower = base.toLowerCase();

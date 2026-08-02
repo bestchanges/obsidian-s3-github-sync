@@ -325,15 +325,25 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 > engine resets `lastSyncedRev = 0` and **restores from S3**. Below the floor, missing files
 > propagate as normal tombstones.
 
-> [!important] Case-only renames on case-insensitive filesystems
+> [!important] Case-only renames — guard runs on case-insensitive filesystems ONLY
 > A rename that changes only letter case (e.g. `My Note` → `My note`) leaves the **old-cased** path
-> in the dirty set. On macOS/iOS (case-insensitive APFS/HFS+) `adapter.stat(oldPath)` resolves to the
-> *new* file, so the old path looks alive and `push()` would re-upload it — a phantom duplicate that
-> only materializes on case-**sensitive** peers (Android/Linux), where the two casings are distinct
-> files. `push()` guards against this by listing the parent dir: a stat'd path is treated as
-> renamed-away (→ tombstone) only when its exact-case basename is **absent** yet a different-cased
-> variant is **present**. Positive evidence only — an empty/unreadable listing falls back to trusting
-> `stat`, so an incomplete listing never wrongly tombstones a live file.
+> in the dirty set. On macOS/Windows/iOS (case-insensitive APFS/HFS+/NTFS) `adapter.stat(oldPath)`
+> resolves to the *new* file, so the old path looks alive and `push()` would re-upload it — a phantom
+> duplicate that only materializes on case-**sensitive** peers (Android/Linux), where the two casings
+> are distinct files. `push()` guards against this by listing the parent dir: a stat'd path is treated
+> as renamed-away (→ tombstone) only when its exact-case basename is **absent** yet a different-cased
+> variant is **present** (basenames compared NFC-normalized so an NFD listing entry still matches).
+> Positive evidence only — an empty/unreadable listing falls back to trusting `stat`.
+>
+> **The guard is gated by `EngineOptions.caseInsensitiveFS` and runs ONLY where the FS is confirmed
+> case-insensitive** (`Platform.isMacOS || isWin || isIosApp`). On a case-**sensitive** filesystem
+> (Android/Linux) `stat()` never lies — the very reason git-sync needs no such guard — so the guard is
+> unnecessary AND unsafe there: a transient listing gap (a rename in flight, listing lag, or an
+> NFC/NFD mismatch) makes it read a live, freshly-pulled note as "gone by case" and tombstone it,
+> which then deletes the note on every device. This exact misfire on Android caused a real data loss
+> (2026-08-02, vault gsd2): a clean case-only rename on macOS was tombstoned by an Android peer within
+> the same pull→push cycle. Default is `false` (guard off = trust stat), so any platform not positively
+> known to be case-insensitive stays safe.
 
 ## 4.5 Resync everything (`resyncEverything`)
 

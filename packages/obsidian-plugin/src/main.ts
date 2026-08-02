@@ -413,6 +413,12 @@ export default class S3SyncPlugin extends Plugin {
           : 0,
         concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
         verbose: this.settings.verbose,
+        // Enable the case-only-rename guard ONLY on a confirmed case-insensitive filesystem
+        // (macOS/Windows desktop, iOS). Android and Linux are case-SENSITIVE, where the guard can
+        // tombstone a live, freshly-pulled note whose name differs from a listing entry only by case
+        // or Unicode normalization — real data loss (see engine.ts EngineOptions.caseInsensitiveFS).
+        // Anything not positively known to be case-insensitive stays off, trusting stat like git-sync.
+        caseInsensitiveFS: Platform.isMacOS || Platform.isWin || Platform.isIosApp,
         // Fresh device (never synced) that isn't inheriting a copied state: let the first pull take
         // remote as-is on collisions instead of union-merging Obsidian's generated config defaults.
         firstRun: !this.hadPriorState && !this.foreignStateDetected,
