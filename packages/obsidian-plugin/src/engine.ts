@@ -932,6 +932,11 @@ export class SyncEngine {
     try {
       const files: Record<string, DeltaEntry> = {};
       const newStates = new Map<string, FileState | null>();
+      // Reverse rename map (destination → source), captured BEFORE the mapPool drains this.renames.
+      // A rename whose content is unchanged is pushed with a server-side S3 copy from the OLD object
+      // instead of re-uploading the bytes (rename-without-edit optimization).
+      const renameSrc = new Map<string, string>();
+      for (const [oldP, newP] of this.renames) renameSrc.set(newP, oldP);
 
       await mapPool(paths, this.opts.concurrency, async (path) => {
         // A path Obsidian's `rename` event told us was renamed away (this.renames) is tombstoned with
@@ -996,10 +1001,21 @@ export class SyncEngine {
           return; // never push the reverted bytes
         }
         if (st && st.hash === hash) return; // mtime-only touch → drop (§1.6)
-        const res = await this.storage.put(`files/${path}`, buf);
-        const entry: FileEntry = { hash, s3VersionId: res.versionId, size: buf.byteLength, mtime };
+        // Rename-without-edit: if this path is a rename destination whose content matches the OLD
+        // object's recorded bytes, copy it server-side (no bytes leave the device) instead of
+        // re-uploading. Falls back to a normal upload if the source isn't a synced object, the content
+        // changed (rename+edit), or the adapter has no copy().
+        const src = renameSrc.get(path);
+        const srcState = src ? this.state.files[src] : undefined;
+        let versionId: string | undefined;
+        if (this.storage.copy && src && srcState && srcState.hash === hash && srcState.s3VersionId) {
+          versionId = (await this.storage.copy(`files/${src}`, `files/${path}`, srcState.s3VersionId)).versionId;
+        } else {
+          versionId = (await this.storage.put(`files/${path}`, buf)).versionId;
+        }
+        const entry: FileEntry = { hash, s3VersionId: versionId, size: buf.byteLength, mtime };
         files[path] = entry;
-        newStates.set(path, { hash, s3VersionId: res.versionId, mtime });
+        newStates.set(path, { hash, s3VersionId: versionId, mtime });
         // A conflict-resolved file is re-pushed here too — it's already in the merged list, so don't
         // list it a second time as a plain push.
         if (!this.mergedSet.has(path)) this.detail.pushed.push(path);

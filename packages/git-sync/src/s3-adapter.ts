@@ -1,4 +1,5 @@
 import {
+  CopyObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   HeadObjectCommand,
@@ -111,5 +112,16 @@ export class S3SdkAdapter implements StorageAdapter {
 
   async delete(key: string): Promise<void> {
     await this.client.send(new DeleteObjectCommand({ Bucket: this.bucket, Key: this.k(key) }));
+  }
+
+  async copy(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult> {
+    // CopySource must be `bucket/key`, URL-encoded per PATH SEGMENT (slashes kept) so spaces and
+    // non-ASCII (Cyrillic) keys are valid; the SDK does not encode it for us.
+    const encoded = this.k(srcKey).split("/").map(encodeURIComponent).join("/");
+    const copySource = `${this.bucket}/${encoded}` + (srcVersionId ? `?versionId=${srcVersionId}` : "");
+    const res = await this.client.send(
+      new CopyObjectCommand({ Bucket: this.bucket, Key: this.k(destKey), CopySource: copySource }),
+    );
+    return { etag: res.CopyObjectResult?.ETag, versionId: res.VersionId };
   }
 }

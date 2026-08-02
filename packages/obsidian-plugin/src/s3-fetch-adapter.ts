@@ -24,6 +24,7 @@ export class S3FetchAdapter implements StorageAdapter {
   private aws: AwsClient;
   private base: string;
   private prefix: string;
+  private bucket: string;
 
   constructor(cfg: S3FetchConfig) {
     this.aws = new AwsClient({
@@ -32,6 +33,7 @@ export class S3FetchAdapter implements StorageAdapter {
       region: cfg.region,
       service: "s3",
     });
+    this.bucket = cfg.bucket;
     this.base = `https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com`;
     this.prefix = cfg.prefix ?? "";
   }
@@ -124,5 +126,24 @@ export class S3FetchAdapter implements StorageAdapter {
   async delete(key: string): Promise<void> {
     const res = await this.aws.fetch(this.url(key), { method: "DELETE" });
     if (!res.ok && res.status !== 404) throw new Error(`S3 DELETE ${key}: ${res.status}`);
+  }
+
+  async copy(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult> {
+    // S3 REST CopyObject: PUT the destination with an x-amz-copy-source header (empty body). The
+    // source is `/bucket/key`, URL-encoded per PATH SEGMENT (slashes kept) so spaces/Cyrillic keys
+    // are valid; the versionId, if given, pins the exact source bytes.
+    const encoded = (this.prefix + srcKey).split("/").map(encodeURIComponent).join("/");
+    const copySource = `/${this.bucket}/${encoded}` + (srcVersionId ? `?versionId=${srcVersionId}` : "");
+    const res = await this.aws.fetch(this.url(destKey), {
+      method: "PUT",
+      headers: { "x-amz-copy-source": copySource },
+    });
+    if (!res.ok) throw new Error(`S3 COPY ${srcKey}→${destKey}: ${res.status}`);
+    // versionId of the NEW object is in the response header; the ETag lives in the CopyObjectResult
+    // body, which we don't need (the delta only carries s3VersionId).
+    return {
+      etag: res.headers.get("etag") ?? undefined,
+      versionId: res.headers.get("x-amz-version-id") ?? undefined,
+    };
   }
 }

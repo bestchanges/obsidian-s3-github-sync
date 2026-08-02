@@ -67,4 +67,12 @@ export class InMemoryStorage implements StorageAdapter {
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
   }
+
+  async copy(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult> {
+    const body = srcVersionId
+      ? this.versions.get(srcKey)?.get(srcVersionId)
+      : this.objects.get(srcKey)?.body;
+    if (!body) throw new Error(`copy: source not found: ${srcKey}${srcVersionId ? `@${srcVersionId}` : ""}`);
+    return this.put(destKey, body);
+  }
 }
