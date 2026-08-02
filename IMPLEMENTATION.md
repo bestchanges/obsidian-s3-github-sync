@@ -186,7 +186,13 @@ across both legs.
 ## 2.8 Renames & the delete-vs-edit tiebreak
 
 The journal has **no rename primitive** — a rename is a `{deleted:true}` for `old` plus a `FileEntry`
-for `new`, in one delta. The hazard is a **second writer that holds a diverged copy of `old`** when
+for `new`, in one delta. S3 has no server-side rename either, so `new`'s object is created fresh and
+`old`'s object is left in place (a journal tombstone, never a physical `DeleteObject` — see §1.4). To
+avoid re-uploading the whole file for a **name-only** change, the plugin push emits `new` via
+`StorageAdapter.copy` (S3 `CopyObject`, pinned to `old`'s `s3VersionId`) whenever the renamed file's
+content is unchanged; a rename that also edited the file, or a source that was never synced, falls
+back to a normal upload. The resulting delta is byte-identical either way, so git-sync (which uploads)
+and the plugin stay convergent. The hazard is a **second writer that holds a diverged copy of `old`** when
 that tombstone arrives: naively "an edit always beats a delete" re-publishes `old` and the note
 **duplicates** (`old` and `new` both live). Both legs resolve this identically (kept in lockstep;
 plugin `applyRemote` §4.8, git-sync `reconcileFile` §5.4):

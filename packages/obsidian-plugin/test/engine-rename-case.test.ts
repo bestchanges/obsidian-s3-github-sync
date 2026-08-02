@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type StorageAdapter, decodeJsonGz } from "@vault-sync/core";
+import { type StorageAdapter, contentHash, decodeJsonGz } from "@vault-sync/core";
 import { SyncEngine, SyncState } from "../src/engine";
 
 // Push-side behavior for renames after the case-insensitive-identity rework. The old data-losing
@@ -18,6 +18,7 @@ interface DeltaLike {
 class CapturingStorage implements StorageAdapter {
   deltas: DeltaLike[] = [];
   uploaded: string[] = [];
+  copied: { src: string; dest: string; srcVersionId?: string }[] = [];
 
   list = async (): Promise<never[]> => [];
   head = async (): Promise<null> => null;
@@ -27,6 +28,10 @@ class CapturingStorage implements StorageAdapter {
     if (key.startsWith("deltas/")) this.deltas.push(decodeJsonGz<DeltaLike>(body));
     else if (key.startsWith("files/")) this.uploaded.push(key.slice("files/".length));
     return { etag: "e", versionId: "v" };
+  };
+  copy = async (src: string, dest: string, srcVersionId?: string): Promise<{ etag: string; versionId: string }> => {
+    this.copied.push({ src, dest, srcVersionId });
+    return { etag: "e", versionId: "vcopy" };
   };
 }
 
@@ -107,6 +112,49 @@ describe("SyncEngine rename push", () => {
     expect(files[live]).toMatchObject({ hash: expect.any(String) });
     expect(files[live]).not.toHaveProperty("deleted");
     expect(storage.uploaded).toEqual([live]);
+  });
+
+  it("rename WITHOUT edit copies the object server-side instead of re-uploading the bytes", async () => {
+    const oldName = "notes/Old Name.md";
+    const newName = "notes/New Name.md";
+    const unchangedHash = contentHash(new TextEncoder().encode("weight-data")); // makeVault's readBinary
+    const storage = new CapturingStorage();
+    const engine = makeEngine(
+      makeVault([newName]),
+      { lastSyncedRev: 5, files: { [oldName]: { hash: unchangedHash, s3VersionId: "vOld", mtime: "t" } } },
+      storage,
+    );
+
+    engine.recordRename(oldName, newName);
+    engine.markDirty(oldName);
+    engine.markDirty(newName);
+    await engine.sync({ label: "manual sync" });
+
+    // Copied old → new (pinned to the old version), nothing re-uploaded.
+    expect(storage.copied).toEqual([{ src: "files/notes/Old Name.md", dest: "files/notes/New Name.md", srcVersionId: "vOld" }]);
+    expect(storage.uploaded).toEqual([]);
+    const files = storage.deltas[0].files;
+    expect(files[oldName]).toEqual({ deleted: true, renamedTo: newName });
+    expect(files[newName]).toMatchObject({ hash: unchangedHash });
+  });
+
+  it("rename WITH an edit re-uploads (content changed → no server-side copy)", async () => {
+    const oldName = "notes/Old.md";
+    const newName = "notes/New.md";
+    const storage = new CapturingStorage();
+    const engine = makeEngine(
+      makeVault([newName]),
+      { lastSyncedRev: 5, files: { [oldName]: { hash: "STALE-different", s3VersionId: "vOld", mtime: "t" } } },
+      storage,
+    );
+
+    engine.recordRename(oldName, newName);
+    engine.markDirty(oldName);
+    engine.markDirty(newName);
+    await engine.sync({ label: "manual sync" });
+
+    expect(storage.copied).toEqual([]); // content differs from the old object → full upload
+    expect(storage.uploaded).toEqual([newName]);
   });
 
   it("a genuinely deleted file (absent on disk, no rename) tombstones as a plain delete", async () => {
