@@ -44,11 +44,6 @@ function isPerDeviceFile(path: string): boolean {
   return path.startsWith(".obsidian/") && /^workspace.*\.json$/.test(base);
 }
 const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
-/** NFC-normalize a name so a Unicode-decomposed (NFD) filesystem entry — Android/APFS surface
- * Cyrillic/accented names in varying forms — compares equal to its composed counterpart. Byte-exact
- * string comparison across the sync boundary otherwise treats the same name as two, which is how the
- * case-only-rename guard once read a live pulled file as "missing" and tombstoned it. */
-const nfc = (s: string): string => s.normalize("NFC");
 /** Offline-delete safety: absence on disk is NOT a reliable delete signal (a stale/copied/moved
  * state looks identical to a mass delete). Below the floor we trust it as genuine offline deletes;
  * above the fraction we treat it as a state mismatch and RESTORE from S3 instead of tombstoning. */
@@ -128,16 +123,6 @@ export interface EngineOptions {
    * corruption everywhere. Must be false for a copied (foreign) state and for user resyncs, where
    * local content is real and union-merge is the right, lossless choice. */
   firstRun?: boolean;
-  /** True only on a case-INSENSITIVE filesystem (macOS/Windows desktop, iOS). Enables the case-only
-   * rename guard in push() (§2.2), which detects a note renamed to differ only in letter case — a
-   * situation where stat(oldPath) resolves to the new file and would otherwise re-push a phantom
-   * duplicate. On a case-SENSITIVE filesystem (Android/Linux) stat() never lies, so the guard is not
-   * only unnecessary but DANGEROUS: a transient listing gap (rename in flight, listing lag, or an
-   * NFC/NFD normalization mismatch between the tracked path and the directory listing) makes it read
-   * a live, freshly-pulled file as "renamed away by case" and tombstone it — real data loss that
-   * propagates to every device. Defaults to false (guard off = trust stat, matching git-sync), so an
-   * unknown platform never risks the loss; only a confirmed case-insensitive host turns it on. */
-  caseInsensitiveFS?: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -947,66 +932,36 @@ export class SyncEngine {
     try {
       const files: Record<string, DeltaEntry> = {};
       const newStates = new Map<string, FileState | null>();
-      // Per-push cache of parent-directory basenames, used to confirm a stat'd path exists with the
-      // EXACT case (§2.2). Keyed by dir; null means the dir couldn't be listed (fall back to trusting
-      // stat rather than risk a false tombstone). mapPool runs concurrently, so dedupe in-flight lists.
-      const dirCache = new Map<string, Promise<Set<string> | null>>();
-      const listBasenames = (dir: string): Promise<Set<string> | null> => {
-        let p = dirCache.get(dir);
-        if (!p) {
-          p = this.vault.adapter
-            .list(dir === "" ? "/" : dir)
-            .then((l) => new Set(l.files.map((f) => nfc(f.split("/").pop() ?? f))))
-            .catch(() => null); // unreadable dir → "unknown", never treat as empty
-          dirCache.set(dir, p);
-        }
-        return p;
-      };
 
       await mapPool(paths, this.opts.concurrency, async (path) => {
-        // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
-        // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
-        const stat = await this.vault.adapter.stat(path);
-        // A case-only rename (e.g. "My Note" → "My note") leaves the OLD-cased path dirty. On a
-        // case-INSENSITIVE filesystem (macOS/Windows/iOS) stat() resolves it to the new file, so it
-        // looks alive and gets re-pushed as a duplicate — one that only materializes on
-        // case-sensitive (Android/Linux) peers. Detect that by listing the parent dir: the path is
-        // "renamed away by case" only when its exact-case basename is ABSENT yet a different-cased
-        // variant is PRESENT. (Positive evidence only — an empty/unreadable listing falls back to
-        // trusting stat, so we never wrongly tombstone a file the listing simply didn't cover.)
-        //
-        // This runs ONLY when caseInsensitiveFS is set. On a case-SENSITIVE filesystem stat() never
-        // lies, so the guard is unnecessary AND unsafe: a transient listing gap (rename in flight,
-        // listing lag, or an NFC/NFD normalization mismatch between the tracked path and the listing)
-        // reads a live file as "gone by case" and tombstones it — the Android data-loss bug. Compare
-        // basenames NFC-normalized so a decomposed listing entry still matches its composed path.
-        let goneByCase = false;
-        if (this.opts.caseInsensitiveFS && stat?.type === "file") {
-          const slash = path.lastIndexOf("/");
-          const base = nfc(path.slice(slash + 1));
-          const names = await listBasenames(slash === -1 ? "" : path.slice(0, slash));
-          if (names && !names.has(base)) {
-            const lower = base.toLowerCase();
-            for (const n of names) {
-              if (n.toLowerCase() === lower) {
-                goneByCase = true; // exact case gone, a case-variant took its place
-                break;
-              }
-            }
-          }
-        }
-        if (!stat || stat.type !== "file" || goneByCase) {
+        // A path Obsidian's `rename` event told us was renamed away (this.renames) is tombstoned with
+        // `renamedTo`, WITHOUT consulting stat(). This is the whole case-only-rename story: on a
+        // case-INSENSITIVE filesystem (macOS/Windows/iOS/Android) stat(oldPath) of a rename that only
+        // changed letter case resolves to the NEW file, so a stat-based check sees `old` as alive and
+        // re-pushes it as a live duplicate. Trusting the rename event is authoritative and needs no
+        // directory-listing heuristics (the old, data-losing `goneByCase` guard, removed). The
+        // destination pushes as its own live entry below; core (collapseNodes) folds the old→new pair
+        // to one node per canonical identity, so no peer ever sees two keys for one note (§1.2a).
+        const renamedAway = this.renames.get(path);
+        this.renames.delete(path);
+        if (renamedAway && renamedAway !== path) {
           if (this.state.files[path]) {
-            // deleted locally / renamed away → tombstone. If a rename was captured for this path,
-            // tag the tombstone with its destination so other devices fold a divergent
-            // copy of `old` onto `new` instead of resurrecting it. `renamedTo` is only trusted when it
-            // survived the drain (still a real target); a bare delete stays a plain tombstone.
-            const renamedTo = this.renames.get(path);
-            files[path] = renamedTo ? { deleted: true, renamedTo } : { deleted: true };
+            files[path] = { deleted: true, renamedTo: renamedAway };
             newStates.set(path, null);
             this.detail.deletedRemote.push(path);
           }
-          this.renames.delete(path);
+          return;
+        }
+
+        // Read through the adapter, NOT the vault index — getAbstractFileByPath() omits the config
+        // dir, so index-based lookups would treat every ".obsidian" file as absent and skip it.
+        const stat = await this.vault.adapter.stat(path);
+        if (!stat || stat.type !== "file") {
+          if (this.state.files[path]) {
+            files[path] = { deleted: true }; // deleted locally → tombstone
+            newStates.set(path, null);
+            this.detail.deletedRemote.push(path);
+          }
           return;
         }
         const buf = new Uint8Array(await this.vault.adapter.readBinary(path));
