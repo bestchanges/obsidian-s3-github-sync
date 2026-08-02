@@ -49,4 +49,9 @@ export interface StorageAdapter {
   /** Keys strictly after `startAfter`, lexicographic order (S3 ListObjectsV2 semantics) */
   list(prefix: string, startAfter?: string): Promise<ObjectInfo[]>;
   delete(key: string): Promise<void>;
+  /** Server-side copy of one object to another key (S3 CopyObject) — no bytes cross the client.
+   * Used for rename-without-edit so a name-only change doesn't re-upload the whole file. `srcVersionId`
+   * pins the exact source version. Returns the NEW object's identifiers. OPTIONAL: callers must fall
+   * back to get()+put() when an adapter (or a test fake) doesn't implement it. */
+  copy?(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult>;
 }
