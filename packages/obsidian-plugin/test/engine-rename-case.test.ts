@@ -59,7 +59,12 @@ function makeVault(diskFiles: string[], listThrows = false): any {
   };
 }
 
-function makeEngine(vault: any, state: SyncState, storage: StorageAdapter): SyncEngine {
+function makeEngine(
+  vault: any,
+  state: SyncState,
+  storage: StorageAdapter,
+  caseInsensitiveFS = true, // the macOS/iOS default these tests model; false = case-sensitive (Android/Linux)
+): SyncEngine {
   return new SyncEngine(vault, storage, state, {
     deviceId: "dev-mbp",
     selfDir: ".obsidian/plugins/vault-s3-sync",
@@ -67,9 +72,40 @@ function makeEngine(vault: any, state: SyncState, storage: StorageAdapter): Sync
     concurrency: 4,
     maxDownloadBytes: 0,
     verbose: false,
+    caseInsensitiveFS,
     log: () => {},
     onStateChanged: async () => {},
   });
+}
+
+/** Vault on a case-SENSITIVE filesystem (Android/Linux): stat() resolves ONLY the exact path, and
+ * list() returns exact basenames — optionally run through `mangle` to model the real failure trigger
+ * (an NFD-normalized listing entry, or a stale listing that still shows a case-sibling). `diskFiles`
+ * are the exact vault-relative paths on disk. */
+function makeVaultCS(diskFiles: string[], listNames?: string[]): any {
+  const exact = new Set(diskFiles);
+  const inDir = (dir: string, names: string[]) =>
+    names.filter((f) => {
+      const slash = f.lastIndexOf("/");
+      return (slash === -1 ? "" : f.slice(0, slash)) === dir;
+    });
+  return {
+    configDir: ".obsidian",
+    getFiles: () => [],
+    adapter: {
+      stat: async (p: string) =>
+        exact.has(p) ? { type: "file", mtime: 1000, size: 11, ctime: 1000 } : null,
+      list: async (dir: string) => ({
+        files: inDir(dir === "/" ? "" : dir, listNames ?? diskFiles),
+        folders: [],
+      }),
+      readBinary: async () => new TextEncoder().encode("weight-data").buffer,
+      exists: async () => true,
+      writeBinary: async () => {},
+      remove: async () => {},
+      mkdir: async () => {},
+    },
+  };
 }
 
 describe("SyncEngine case-only rename", () => {
@@ -129,5 +165,64 @@ describe("SyncEngine case-only rename", () => {
     expect(files[path]).toMatchObject({ hash: expect.any(String) });
     expect(files[path]).not.toHaveProperty("deleted");
     expect(storage.uploaded).toEqual([path]);
+  });
+
+  it("NFC-normalizes basename comparison so a decomposed listing entry isn't a false tombstone", async () => {
+    // On macOS/APFS a listing can surface a name in NFD (decomposed) while the tracked path is NFC.
+    // Byte-exact comparison would read the file as "gone by case" and tombstone it. The guard must
+    // compare NFC-normalized. "ё" is the giveaway: NFC = U+0451, NFD = "е"+U+0308.
+    const nfcPath = "notes/её.md".normalize("NFC");
+    const nfdListing = "notes/её.md".normalize("NFD");
+    expect(nfcPath).not.toEqual(nfdListing); // sanity: the two byte-forms really differ
+    const storage = new CapturingStorage();
+    // On disk (stat) resolves the NFC path; the directory listing returns the NFD form.
+    const engine = makeEngine(
+      makeVaultCS([nfcPath], [nfdListing]),
+      { lastSyncedRev: 1, files: {} },
+      storage,
+      /* caseInsensitiveFS */ true,
+    );
+
+    engine.markDirty(nfcPath);
+    await engine.sync({ label: "manual sync" });
+
+    const files = storage.deltas[0].files;
+    expect(files[nfcPath]).not.toHaveProperty("deleted");
+    expect(storage.uploaded).toEqual([nfcPath]);
+  });
+});
+
+// The real-world data-loss regression (2026-08-02, vault gsd2): a case-only rename on macOS
+// ("Мой Вес…" → "Мой вес…") propagated a clean rename-aware delta. An ANDROID peer (case-SENSITIVE
+// filesystem) pulled the new lowercase note, then in the SAME cycle's push its case-only guard read
+// the freshly-pulled file as "gone by case" — a listing gap after the rename showed the old capital
+// sibling but not yet the exact lowercase name — and TOMBSTONED it. That tombstone deleted the note
+// on every device. The guard must never run on a case-sensitive filesystem: stat() there is
+// authoritative (the same reason git-sync needs no guard), so a live file is always re-pushed, never
+// tombstoned by case.
+describe("SyncEngine case-only rename on a case-sensitive filesystem (Android/Linux)", () => {
+  it("does NOT tombstone a live pulled note when a case-sibling lingers in the listing", async () => {
+    const live = "health/Мой вес за всё время.md"; // freshly pulled (lowercase в), on disk
+    const sibling = "health/Мой Вес за всё время.md"; // the pre-rename capital, still in a stale listing
+    const storage = new CapturingStorage();
+    // Disk holds only the live lowercase note; the directory listing still shows the capital sibling
+    // and NOT the exact lowercase name — the exact gap that fired the guard on Android.
+    const engine = makeEngine(
+      makeVaultCS([live], [sibling]),
+      { lastSyncedRev: 5, files: { [live]: { hash: "old", mtime: "t" } } },
+      storage,
+      /* caseInsensitiveFS */ false,
+    );
+
+    engine.markDirty(live);
+    await engine.sync({ label: "poll" });
+
+    const files = storage.deltas[0].files;
+    // The live note is re-pushed (harmless), NOT tombstoned. This is the whole fix.
+    expect(files[live]).not.toHaveProperty("deleted");
+    expect(files[live]).toMatchObject({ hash: expect.any(String) });
+    expect(storage.uploaded).toEqual([live]);
+    // And under no circumstance is a delete emitted for it.
+    expect(files[live]?.deleted).toBeUndefined();
   });
 });
