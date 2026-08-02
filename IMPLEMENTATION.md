@@ -349,6 +349,13 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 >   **derived state never carries two entries for one node.** A case-only rename therefore reaches a
 >   client as the single live destination — never as a separate stale-cased tombstone that a
 >   case-insensitive filesystem would apply over the live file (the 2026-08-02 gsd2 data loss).
+> - **Display-case propagation:** collapse keeps the note alive but a case-insensitive peer that
+>   didn't originate the rename keeps the file on disk under its OLD case (the apply deliberately never
+>   rewrites the shared inode). So on pull, `applyRemote` renames the local file to the winning name
+>   (`renameLocalToCanonical`, a pure `adapter.rename` — never a delete) when a live node matches a
+>   tracked path under a different case/NFC form. Echo-suppressed (both paths in the applying-set) so
+>   it isn't re-pushed as a user rename. On failure it no-ops — the note is untouched, only its shown
+>   name lags.
 > - The plugin's `push()` tombstones an old path as renamed-away **only** from Obsidian's `rename`
 >   event (`recordRename` → `this.renames`), never from a directory-listing heuristic. `stat(oldPath)`
 >   of a case-only rename lies on a case-insensitive FS (it resolves to the new file), so the old
