@@ -1,6 +1,7 @@
 import { Notice, Vault } from "obsidian";
 import {
   appendDelta,
+  canonicalKey,
   changedEntries,
   contentHash,
   decodeText,
@@ -160,6 +161,9 @@ export class SyncEngine {
    * divergent `old` then folds its edit onto `new` instead of resurrecting it. Cleared once the
    * tombstone is emitted. */
   private renames = new Map<string, string>();
+  /** canonical key → tracked state path, built per-pull so applyRemote can find a local file that is
+   * the SAME node under a different case/NFC form and rename it to the winning name (§1.2a). */
+  private nodeIndex: Map<string, string> | undefined;
   /** Files pulled this session but not yet confirmed to have held the written bytes. Guards against
    * an editor clobbering a fresh pull with a stale buffer, which would otherwise re-publish the old
    * content as a "local edit" (§2.6). Keyed by path; entries self-clear on confirm/divergence and
@@ -273,6 +277,9 @@ export class SyncEngine {
    * sync itself performs is suppressed by the applying-set on the paths it writes. */
   recordRename(oldPath: string, newPath: string): void {
     if (this.isExcluded(oldPath) || this.isExcluded(newPath)) return;
+    // Echo-safe: a rename sync itself performs (display-case propagation) puts both paths in the
+    // applying-set; ignore its rename event so it isn't re-pushed as a user rename.
+    if (this.applying.has(oldPath) || this.applying.has(newPath)) return;
     this.renames.set(oldPath, newPath);
   }
 
@@ -599,8 +606,14 @@ export class SyncEngine {
     );
     const lives = applicable.filter(([, e]) => !isTombstone(e));
     const tombstones = applicable.filter(([, e]) => isTombstone(e));
+    // Index tracked paths by canonical identity so applyRemote can spot a node that already exists
+    // locally under a DIFFERENT case/NFC form and rename the on-disk file to the winning name
+    // (display-case propagation, §1.2a). Built once per pull, read-only during the concurrent apply.
+    this.nodeIndex = new Map();
+    for (const k of Object.keys(this.state.files)) this.nodeIndex.set(canonicalKey(k), k);
     await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
     await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
+    this.nodeIndex = undefined;
     this.state.lastSyncedRev = targetRev;
   }
 
@@ -640,6 +653,12 @@ export class SyncEngine {
     }
 
     const remote = entry as FileEntry & SnapshotEntry;
+    // Display-case / NFC propagation (§1.2a): if this canonical node already exists locally under a
+    // DIFFERENT exact name — a case- or NFC-only rename another device made — rename the on-disk file
+    // to the winning name so the new name shows here too. A pure rename (never a delete), so it can't
+    // lose the shared inode; on any failure we skip and fall through to normal content handling.
+    const variant = this.nodeIndex?.get(canonicalKey(path));
+    if (variant && variant !== path) await this.renameLocalToCanonical(variant, path);
     const localBuf = await this.readLocal(path);
     const localHash = localBuf ? contentHash(localBuf) : null;
     if (localHash === remote.hash) {
@@ -1076,6 +1095,37 @@ export class SyncEngine {
   private record(path: string, entry: FileEntry & { s3VersionId?: string }): void {
     this.state.files[path] = { hash: entry.hash, s3VersionId: entry.s3VersionId, mtime: entry.mtime };
     this.dirty.delete(path);
+  }
+
+  /** Rename the local on-disk file `from` → `to` when they're the same node under a different
+   * case/NFC form, so a case-only rename made on another device shows here too (§1.2a). Pure rename:
+   * on a case-insensitive FS it just re-cases the name (same inode); on a case-sensitive FS it moves
+   * the file. Echo-suppressed (both paths in `applying`) so the resulting vault rename event isn't
+   * re-pushed. On any failure it no-ops — the note is untouched, only its displayed name lags. */
+  private async renameLocalToCanonical(from: string, to: string): Promise<void> {
+    const st = await this.vault.adapter.stat(from);
+    if (!st || st.type !== "file") return; // nothing on disk under the old name
+    this.applying.add(from);
+    this.applying.add(to);
+    try {
+      await this.vault.adapter.rename(from, to);
+    } catch {
+      this.applying.delete(from);
+      this.applying.delete(to);
+      return; // rename unsupported/failed → leave as-is; content handling below is still data-safe
+    }
+    const prior = this.state.files[from];
+    if (prior) {
+      this.state.files[to] = prior; // migrate the tracked entry to the winning name
+      delete this.state.files[from];
+    }
+    this.detail.pulled.push(to);
+    this.opts.log("info", `re-cased ${from} → ${to}`);
+    // vault events fire async — release on the next tick, matching write()'s echo window
+    setTimeout(() => {
+      this.applying.delete(from);
+      this.applying.delete(to);
+    }, 500);
   }
 
   /** Classify a would-be local edit against the pending-pull guard (§2.6). A file we just pulled can
