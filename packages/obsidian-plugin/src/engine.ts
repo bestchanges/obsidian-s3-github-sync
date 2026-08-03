@@ -357,10 +357,24 @@ export class SyncEngine {
    * Runs inside the cycle lock (via a scanOffline request), so it can't race a concurrent sync. */
   private async scanOffline(): Promise<void> {
     const known = new Set<string>();
+    // Tracked notes by canonical identity — so a disk file that matches a tracked note only by
+    // case/NFC is reconciled as THAT node instead of (a) pushing it as a new duplicate and (b)
+    // leaving the tracked name to look "missing" below and be tombstoned. That false tombstone is
+    // exactly how a stale/mismatched device wiped a case-renamed note off every peer (§1.2a).
+    const trackedByNode = new Map<string, string>();
+    for (const k of Object.keys(this.state.files)) trackedByNode.set(canonicalKey(k), k);
     for (const file of this.vault.getFiles()) {
       if (this.isExcluded(file.path)) continue;
-      known.add(file.path);
-      await this.markIfChanged(file.path, file.stat.mtime);
+      let p = file.path;
+      const tracked = trackedByNode.get(canonicalKey(p));
+      if (tracked && tracked !== p) {
+        // Same node under a different case/NFC on disk → re-case to the tracked name so on-disk and
+        // state agree. Pure rename (never a delete); no-ops on failure.
+        await this.renameLocalToCanonical(p, tracked);
+        p = tracked;
+      }
+      known.add(p);
+      await this.markIfChanged(p, file.stat.mtime);
     }
     // getFiles() skips the config dir — walk it explicitly so ".obsidian" content is both detected
     // as dirty AND counted as "known" (otherwise every tracked config file would look deleted below).
@@ -377,8 +391,12 @@ export class SyncEngine {
       // paths out of the "missing" set below — don't tombstone what we simply couldn't see.
       for (const p of Object.keys(this.state.files)) if (this.isConfigPath(p)) known.add(p);
     }
+    // A tracked path is "missing" only if NO disk file matches it even canonically — a case/NFC
+    // variant present on disk keeps it alive (backstop for anything the re-case above didn't cover,
+    // e.g. config files). Prevents the offline scan from tombstoning a note that is really still here.
+    const knownCanonical = new Set([...known].map(canonicalKey));
     const missing = Object.keys(this.state.files).filter(
-      (p) => !known.has(p) && !this.isExcluded(p),
+      (p) => !known.has(p) && !knownCanonical.has(canonicalKey(p)) && !this.isExcluded(p),
     );
     const total = Object.keys(this.state.files).length;
     if (

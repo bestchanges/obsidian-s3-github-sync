@@ -360,6 +360,12 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 >   event (`recordRename` → `this.renames`), never from a directory-listing heuristic. `stat(oldPath)`
 >   of a case-only rename lies on a case-insensitive FS (it resolves to the new file), so the old
 >   listing-based `goneByCase` guard — which caused the loss — is **removed**.
+> - The **offline scan** (`scanOffline`, §4.4) matches disk files to tracked state by canonical
+>   identity: a file present under a different case/NFC than its tracked key is re-cased and counted as
+>   present, never flagged "missing" and tombstoned. Without this, a device whose on-disk name and
+>   state key disagreed (e.g. it pulled a case-rename under old code) would tombstone the live note on
+>   startup and delete it off every peer — the 2026-08-03 gsd2 recurrence, caused by a device left on
+>   an old build.
 > - git-sync (case-sensitive repo) removes any tracked file that is a case/NFC variant of a live
 >   remote node at a different exact path, guarded by "the winner exists in the tree" so it can only
 >   ever rename, never delete. Existing case-variant duplicates in S3/the repo collapse automatically
