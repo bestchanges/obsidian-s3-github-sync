@@ -103,4 +103,26 @@ describe("SyncEngine display-case propagation", () => {
     const deltas = await storage.list("deltas/");
     expect(deltas.map((d) => d.key)).toEqual([deltaKey(1)]);
   });
+
+  it("offline scan does NOT tombstone a note that's present under a different case (the Mac Mini bug)", async () => {
+    // Reproduces rev 4368: a device whose STATE tracks `aaa.md` but whose DISK holds `AAA.md` (a case
+    // mismatch left by pulling the rename under old code). The offline scan used exact-case set
+    // membership, so `aaa.md` looked "missing" and got tombstoned — deleting the live note on every
+    // peer. It must recognize the file is present (canonically) and never tombstone it.
+    const content = "alpha";
+    const hash = contentHash(enc(content));
+    const storage = new InMemoryStorage(); // no deltas → pull is inert; only the offline scan runs
+    const disk = new Map<string, Uint8Array>([["_synctest/AAA.md", enc(content)]]); // wrong case on disk
+    const state: SyncState = { lastSyncedRev: 0, files: { "_synctest/aaa.md": { hash, mtime: "t" } } };
+    const engine = makeEngine(ciVault(disk), storage, state);
+
+    await engine.sync({ label: "startup", scanOffline: true });
+
+    // Nothing was pushed — no tombstone for a note that's still here (just under a different case).
+    expect(await storage.list("deltas/")).toEqual([]);
+    // Reconciled to the tracked name, still exactly one copy, content intact.
+    expect([...disk.keys()]).toEqual(["_synctest/aaa.md"]);
+    expect(new TextDecoder().decode(disk.get("_synctest/aaa.md"))).toBe(content);
+    expect(state.files["_synctest/aaa.md"]).toBeTruthy();
+  });
 });
