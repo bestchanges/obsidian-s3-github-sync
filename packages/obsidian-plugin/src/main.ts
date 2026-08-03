@@ -416,6 +416,16 @@ export default class S3SyncPlugin extends Plugin {
         // Fresh device (never synced) that isn't inheriting a copied state: let the first pull take
         // remote as-is on collisions instead of union-merging Obsidian's generated config defaults.
         firstRun: !this.hadPriorState && !this.foreignStateDetected,
+        // Re-case a note to a pulled case-only rename through Obsidian's own API so it works on mobile
+        // (the raw adapter rejects a case-only rename there) and the new name shows without a reload.
+        // Returns false for anything that isn't a note in the vault index (e.g. config files) so the
+        // engine falls back to the storage adapter.
+        renameFile: async (from, to) => {
+          const file = this.app.vault.getAbstractFileByPath(from);
+          if (!(file instanceof TFile)) return false;
+          await this.app.fileManager.renameFile(file, to);
+          return true;
+        },
         onStateChanged: async (state) => {
           this.syncState = state;
           await this.persistState();
