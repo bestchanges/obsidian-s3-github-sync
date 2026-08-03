@@ -56,7 +56,12 @@ function ciVault(disk: Map<string, Uint8Array>): any {
   };
 }
 
-function makeEngine(vault: any, storage: StorageAdapter, state: SyncState): SyncEngine {
+function makeEngine(
+  vault: any,
+  storage: StorageAdapter,
+  state: SyncState,
+  renameFile?: (from: string, to: string) => Promise<boolean>,
+): SyncEngine {
   return new SyncEngine(vault, storage, state, {
     deviceId: "dev-android",
     selfDir: ".obsidian/plugins/vault-s3-sync",
@@ -64,6 +69,7 @@ function makeEngine(vault: any, storage: StorageAdapter, state: SyncState): Sync
     concurrency: 4,
     maxDownloadBytes: 0,
     verbose: false,
+    renameFile,
     log: () => {},
     onStateChanged: async () => {},
   });
@@ -102,6 +108,48 @@ describe("SyncEngine display-case propagation", () => {
     // No new delta was pushed (the re-case is echo-suppressed, not a user edit).
     const deltas = await storage.list("deltas/");
     expect(deltas.map((d) => d.key)).toEqual([deltaKey(1)]);
+  });
+
+  it("re-cases via Obsidian's rename API when the raw adapter can't (mobile case-only rename)", async () => {
+    // On mobile the storage adapter rejects a case-only rename, so the engine must go through the
+    // injected Obsidian rename (fileManager.renameFile) — which re-cases there and refreshes the UI.
+    // Model that: adapter.rename THROWS, but the renameFile callback succeeds.
+    const content = "alpha";
+    const hash = contentHash(enc(content));
+    const storage = new InMemoryStorage();
+    const delta: Delta = {
+      rev: 1,
+      by: "peer-mac",
+      at: "2026-08-03T00:00:00Z",
+      files: {
+        "_synctest/aaa.md": { deleted: true, renamedTo: "_synctest/aaA.md" },
+        "_synctest/aaA.md": { hash, size: content.length, mtime: "2026-08-03T00:00:00Z" },
+      },
+    };
+    await storage.put(deltaKey(1), encodeJsonGz(delta));
+
+    const disk = new Map<string, Uint8Array>([["_synctest/aaa.md", enc(content)]]);
+    const vault = ciVault(disk);
+    vault.adapter.rename = async () => {
+      throw new Error("EEXIST: case-only rename rejected (mobile FS)");
+    };
+    let calledWith: [string, string] | null = null;
+    const renameFile = async (from: string, to: string): Promise<boolean> => {
+      calledWith = [from, to];
+      const b = disk.get(from)!; // Obsidian's rename succeeds where the adapter couldn't
+      disk.delete(from);
+      disk.set(to, b);
+      return true;
+    };
+    const state: SyncState = { lastSyncedRev: 0, files: { "_synctest/aaa.md": { hash, mtime: "t" } } };
+    const engine = makeEngine(vault, storage, state, renameFile);
+
+    await engine.sync({ label: "poll" });
+
+    expect(calledWith).toEqual(["_synctest/aaa.md", "_synctest/aaA.md"]); // used Obsidian's API
+    expect([...disk.keys()]).toEqual(["_synctest/aaA.md"]); // re-cased despite adapter failure
+    expect(state.files["_synctest/aaA.md"]).toBeTruthy();
+    expect(await storage.list("deltas/")).toHaveLength(1); // no echo push
   });
 
   it("offline scan does NOT tombstone a note that's present under a different case (the Mac Mini bug)", async () => {

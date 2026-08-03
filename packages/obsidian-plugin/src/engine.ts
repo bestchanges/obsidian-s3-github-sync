@@ -124,6 +124,13 @@ export interface EngineOptions {
    * corruption everywhere. Must be false for a copied (foreign) state and for user resyncs, where
    * local content is real and union-merge is the right, lossless choice. */
   firstRun?: boolean;
+  /** Rename a NOTE through Obsidian's own API (`fileManager.renameFile`) rather than the raw storage
+   * adapter. Used to re-case a file to a pulled case-only rename: the adapter rejects a case-only
+   * rename on Obsidian mobile AND bypasses the metadata cache (so the new name wouldn't show without
+   * a reload), whereas Obsidian's rename performs it and refreshes the UI live. Returns false when the
+   * path isn't a note in the vault index (e.g. a config file) so the engine falls back to the adapter.
+   * Optional: absent in tests / where only adapter renames are available. */
+  renameFile?: (from: string, to: string) => Promise<boolean>;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -1126,7 +1133,12 @@ export class SyncEngine {
     this.applying.add(from);
     this.applying.add(to);
     try {
-      await this.vault.adapter.rename(from, to);
+      // Prefer Obsidian's own rename: it re-cases on mobile — where the raw adapter rejects a
+      // case-only rename — AND refreshes the file cache so the new name shows without an app reload.
+      // Falls back to the adapter for paths outside the vault index (config) or when no callback is
+      // wired (tests / desktop-only).
+      const done = this.opts.renameFile ? await this.opts.renameFile(from, to).catch(() => false) : false;
+      if (!done) await this.vault.adapter.rename(from, to);
     } catch {
       this.applying.delete(from);
       this.applying.delete(to);
