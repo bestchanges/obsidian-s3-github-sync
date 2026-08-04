@@ -130,7 +130,7 @@ export interface EngineOptions {
    * a reload), whereas Obsidian's rename performs it and refreshes the UI live. Returns false when the
    * path isn't a note in the vault index (e.g. a config file) so the engine falls back to the adapter.
    * Optional: absent in tests / where only adapter renames are available. */
-  renameFile?: (from: string, to: string) => Promise<boolean>;
+  renameFile?: (from: string, to: string, viaTmp: string) => Promise<boolean>;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -1130,19 +1130,47 @@ export class SyncEngine {
   private async renameLocalToCanonical(from: string, to: string): Promise<void> {
     const st = await this.vault.adapter.stat(from);
     if (!st || st.type !== "file") return; // nothing on disk under the old name
+    // A case/NFC-only rename is a "target already exists" fold-collision on a case-INSENSITIVE
+    // filesystem (Obsidian mobile rejects it — both via fileManager and the raw adapter). Hop through
+    // a unique interim name so neither step collides. `tmp` is a real .md path in the same folder,
+    // added to the applying-set so its own vault events are treated as echoes, not user edits.
+    const slash = to.lastIndexOf("/");
+    const tmp = (slash >= 0 ? to.slice(0, slash + 1) : "") + `recasing-${Date.now()}.md`;
     this.applying.add(from);
     this.applying.add(to);
-    try {
-      // Prefer Obsidian's own rename: it re-cases on mobile — where the raw adapter rejects a
-      // case-only rename — AND refreshes the file cache so the new name shows without an app reload.
-      // Falls back to the adapter for paths outside the vault index (config) or when no callback is
-      // wired (tests / desktop-only).
-      const done = this.opts.renameFile ? await this.opts.renameFile(from, to).catch(() => false) : false;
-      if (!done) await this.vault.adapter.rename(from, to);
-    } catch {
+    this.applying.add(tmp);
+    const release = () => {
       this.applying.delete(from);
       this.applying.delete(to);
-      return; // rename unsupported/failed → leave as-is; content handling below is still data-safe
+      this.applying.delete(tmp);
+    };
+    const warn = (stage: string, e: unknown): void =>
+      this.opts.log("warn", `re-case ${stage} failed ${from} → ${to}: ${(e as Error)?.message ?? String(e)}`);
+
+    let via = "";
+    // 1. Obsidian's own rename (updates the UI/cache + links). main.ts temp-hops internally on a
+    //    fold-collision, so this is the working path on mobile too. Returns false only for a path not
+    //    in the vault index (config); throws surface the real error instead of being swallowed.
+    if (this.opts.renameFile) {
+      try {
+        if (await this.opts.renameFile(from, to, tmp)) via = "obsidian";
+      } catch (e) {
+        warn("via Obsidian API", e);
+      }
+    }
+    // 2. Fallback: temp-hop on the raw adapter (config files / desktop / no callback).
+    if (!via) {
+      try {
+        await this.vault.adapter.rename(from, tmp);
+        await this.vault.adapter.rename(tmp, to);
+        via = "adapter";
+      } catch (e) {
+        warn("via adapter temp-hop", e);
+      }
+    }
+    if (!via) {
+      release();
+      return; // give up — data-safe: the note is untouched, only its shown name lags
     }
     const prior = this.state.files[from];
     if (prior) {
@@ -1150,12 +1178,9 @@ export class SyncEngine {
       delete this.state.files[from];
     }
     this.detail.pulled.push(to);
-    this.opts.log("info", `re-cased ${from} → ${to}`);
+    this.opts.log("info", `re-cased ${from} → ${to} (${via})`);
     // vault events fire async — release on the next tick, matching write()'s echo window
-    setTimeout(() => {
-      this.applying.delete(from);
-      this.applying.delete(to);
-    }, 500);
+    setTimeout(release, 500);
   }
 
   /** Classify a would-be local edit against the pending-pull guard (§2.6). A file we just pulled can

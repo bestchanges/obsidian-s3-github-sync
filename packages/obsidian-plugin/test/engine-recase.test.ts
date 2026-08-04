@@ -152,6 +152,43 @@ describe("SyncEngine display-case propagation", () => {
     expect(await storage.list("deltas/")).toHaveLength(1); // no echo push
   });
 
+  it("temp-hops the adapter when a direct case-only rename is rejected (mobile fold-collision)", async () => {
+    // Obsidian mobile rejects a case-only rename ("target already exists" — the names fold together on
+    // the case-insensitive volume). The engine must hop through an interim name so neither step
+    // collides. No renameFile callback here → the engine's own adapter temp-hop must do it.
+    const content = "alpha";
+    const hash = contentHash(enc(content));
+    const storage = new InMemoryStorage();
+    const delta: Delta = {
+      rev: 1,
+      by: "peer-mac",
+      at: "2026-08-04T00:00:00Z",
+      files: {
+        "_synctest/aaa.md": { deleted: true, renamedTo: "_synctest/aAa.md" },
+        "_synctest/aAa.md": { hash, size: content.length, mtime: "2026-08-04T00:00:00Z" },
+      },
+    };
+    await storage.put(deltaKey(1), encodeJsonGz(delta));
+
+    const disk = new Map<string, Uint8Array>([["_synctest/aaa.md", enc(content)]]);
+    const vault = ciVault(disk);
+    const baseRename = vault.adapter.rename;
+    vault.adapter.rename = async (from: string, to: string) => {
+      if (to !== from && to.toLowerCase() === from.toLowerCase()) {
+        throw new Error("EEXIST: case-only rename rejected (mobile FS)"); // direct case-only fails
+      }
+      return baseRename(from, to); // a non-colliding rename is fine
+    };
+    const state: SyncState = { lastSyncedRev: 0, files: { "_synctest/aaa.md": { hash, mtime: "t" } } };
+    const engine = makeEngine(vault, storage, state); // no renameFile → adapter temp-hop path
+
+    await engine.sync({ label: "poll" });
+
+    expect([...disk.keys()]).toEqual(["_synctest/aAa.md"]); // re-cased via the temp-hop, one copy
+    expect(state.files["_synctest/aAa.md"]).toBeTruthy();
+    expect(await storage.list("deltas/")).toHaveLength(1); // no echo push (temp incl.)
+  });
+
   it("offline scan does NOT tombstone a note that's present under a different case (the Mac Mini bug)", async () => {
     // Reproduces rev 4368: a device whose STATE tracks `aaa.md` but whose DISK holds `AAA.md` (a case
     // mismatch left by pulling the rename under old code). The offline scan used exact-case set

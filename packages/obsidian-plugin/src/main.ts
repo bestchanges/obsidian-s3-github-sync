@@ -420,10 +420,18 @@ export default class S3SyncPlugin extends Plugin {
         // (the raw adapter rejects a case-only rename there) and the new name shows without a reload.
         // Returns false for anything that isn't a note in the vault index (e.g. config files) so the
         // engine falls back to the storage adapter.
-        renameFile: async (from, to) => {
+        renameFile: async (from, to, viaTmp) => {
           const file = this.app.vault.getAbstractFileByPath(from);
-          if (!(file instanceof TFile)) return false;
-          await this.app.fileManager.renameFile(file, to);
+          if (!(file instanceof TFile)) return false; // not a note in the index → engine uses the adapter
+          try {
+            await this.app.fileManager.renameFile(file, to);
+          } catch {
+            // Case-only rename is a "target exists" fold-collision on mobile's case-insensitive
+            // volume. Hop through a unique interim name — each step is a non-colliding rename, and
+            // fileManager keeps the metadata cache + UI in sync so the new case shows without a reload.
+            await this.app.fileManager.renameFile(file, viaTmp);
+            await this.app.fileManager.renameFile(file, to);
+          }
           return true;
         },
         onStateChanged: async (state) => {
