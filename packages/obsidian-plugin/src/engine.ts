@@ -131,6 +131,11 @@ export interface EngineOptions {
    * path isn't a note in the vault index (e.g. a config file) so the engine falls back to the adapter.
    * Optional: absent in tests / where only adapter renames are available. */
   renameFile?: (from: string, to: string, viaTmp: string) => Promise<boolean>;
+  /** Called with the path just before sync overwrites an EXISTING local file with remote bytes.
+   * The plugin routes this to Obsidian's File recovery store so the pre-sync local content is always
+   * recoverable in-app, even when this device never pushed it (§4.12). Best-effort by contract:
+   * failures must not abort the write, so implementations swallow their own errors. */
+  onBeforeOverwrite?: (path: string) => Promise<void>;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -1218,6 +1223,15 @@ export class SyncEngine {
     await this.withApplying(path, async () => {
       const dir = path.split("/").slice(0, -1).join("/");
       if (dir && !(await this.vault.adapter.exists(dir))) await this.vault.adapter.mkdir(dir);
+      // Snapshot the bytes we're about to replace into Obsidian's File recovery store (§4.12). Only
+      // for an existing file — a first download replaces nothing. Never let it block the write.
+      if (this.opts.onBeforeOverwrite && (await this.vault.adapter.exists(path))) {
+        try {
+          await this.opts.onBeforeOverwrite(path);
+        } catch {
+          /* best-effort safety net; a failed snapshot must not stop the sync */
+        }
+      }
       await this.vault.adapter.writeBinary(
         path,
         data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
