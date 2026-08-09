@@ -8,7 +8,7 @@ S3 is the hub; both legs speak one protocol: an append-only **delta journal** (`
 |---|---|
 | `packages/core` | Shared protocol client: schemas, delta journal, CAS, **the** union merge (node-diff3), hashing. Pure logic, no platform APIs. Conformance tests live here. |
 | `packages/git-sync` | CLI run by GitHub Actions (`templates/s3-sync.yml`): repo ⇄ S3, `.gitignore`-aware, `.s3syncignore` for GitHub-only folders, snapshot compaction + 30-day delta pruning. |
-| `packages/obsidian-plugin` | Vault ⇄ S3: 15 s LIST polling, offline catch-up, mtime alignment, excluded (local-only) folders, versioned merge bases. Desktop + mobile. |
+| `packages/obsidian-plugin` | Vault ⇄ S3: 15 s LIST polling, offline catch-up, mtime alignment, excluded (local-only) folders, versioned merge bases, per-note version history + restore. Desktop + mobile. |
 
 ```bash
 npm install

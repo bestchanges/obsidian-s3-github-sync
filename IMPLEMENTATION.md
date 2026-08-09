@@ -46,6 +46,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/core/src/schemas.ts` | `Delta` / `Snapshot` / `FileEntry` / `Tombstone` types, `pad10`, `parseDelta`, tombstone/empty helpers. |
 | `packages/core/src/journal.ts` | CAS append, `listDeltasSince`, `foldDeltas`, `changedEntries`, snapshot read/write, `pruneDeltas`, gap detection. |
 | `packages/core/src/merge.ts` | Three-way union merge (`node-diff3`). **The** merge, shared by both legs. |
+| `packages/core/src/history.ts` | Per-file version history off the journal (`fileHistory`, `readFileHistory`, `readVersionContent`, `lineDiff`) — §2.9. |
 | `packages/core/src/hash.ts` | `contentHash` → `"md5:<hex>"` via `spark-md5` (pure JS). |
 | `packages/core/src/codec.ts` | gzip(JSON) via `pako`; text encode/decode. |
 | `packages/core/src/s3.ts` | `StorageAdapter` interface + `PreconditionFailedError`. |
@@ -60,6 +61,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/main.ts` | Plugin lifecycle, persistence, device identity, settings UI, commands. |
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
+| `packages/obsidian-plugin/src/history-modal.ts` | `VersionHistoryModal`: per-note revision list, diff, restore (§4.12). |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
 | `packages/mcp-server/` | Optional third client: remote MCP server on Lambda (stateless, bearer-auth POC). Module map + behavior: its `README.md`; rationale: [[MCP Server Design.md\|MCP Server Design.md]]. |
 | `templates/s3-sync.yml` | The Actions workflow the content repo installs. |
@@ -217,6 +219,36 @@ Ordering matters: a receiver applies **live entries before tombstones** in a pul
 the plugin from Obsidian's `rename` event (`recordRename`, §4.4), git-sync from `-M` rename detection
 (`git.renames()`, §5.2). Because the field is additive, a mixed fleet degrades safely: a client that
 can't read it just applies the freshest-wins tiebreak (1).
+
+## 2.9 Version history (`history.ts`)
+
+The journal is already a complete, attributed history — every write to a path records `rev`, `at`,
+`by` (**which device**), `hash`, `size` and the `s3VersionId` of the bytes — so per-file history is a
+**query over `deltas/`, not a second store**. Nothing new is written to S3 for this feature.
+
+- `fileHistory(deltas, path)` → `FileVersion[]`, **newest first**. Pure.
+- `readFileHistory(storage, path)` → the above plus `oldestRevAvailable` / `truncated`, so a caller
+  can say "older revisions were pruned" instead of silently showing a short list.
+- `readVersionContent(storage, version)` → the exact bytes, `GET files/<path>?versionId=<s3VersionId>`.
+  Entries predating `s3VersionId` fall back to the object's current version (verify against `hash`).
+- `lineDiff(before, after)` → `DiffLine[]` for display, built on the same `diffComm` primitive the
+  union merge aligns conflict regions with (§2.6), so the diff shown matches how a merge would treat
+  the two sides.
+
+Two behaviors make the trail readable rather than literal:
+
+1. **Case/NFC identity.** Lookup canonicalizes via `canonicalKey` (§2.8a), so a case-only rename
+   doesn't split one note's history into two unrelated lists.
+2. **Rename-following.** Walking newest→oldest, when the tracked path is `new` and some entry at that
+   rev is a tombstone whose `renamedTo` is `new`, the trail continues under `old` for older revisions.
+   Without it, history for a renamed note stops dead at the rename. Each row reports the path **as
+   stored at that rev**, which is what makes a rename visible in the list.
+
+> [!note] Retention bounds history, not vault age
+> `readFileHistory` reads every surviving delta, and the journal is pruned to `RETENTION_DAYS`
+> (§2.5, §11). Compaction is age-gated, so in practice the journal often reaches much further back
+> than the nominal window — but `truncated` is the honest signal, and S3 object versions outlive the
+> journal regardless (§9).
 
 ---
 
@@ -513,7 +545,10 @@ new edit.
   toggle, **Resync everything** (warning), **Export setup vault** (CTA).
 - **Commands**: `Sync now`, `Resync everything from S3`, `Pause/resume sync`,
   `Export setup vault (for a new device)`,
-  `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only).
+  `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only),
+  `Version history of this note` (§4.12; active-note only).
+- **File menu**: `Version history (S3 sync)` on any synced file (§4.12).
+- **CLI**: `vault-s3-sync:history --path <path> [--total]` (§4.12).
 - **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup
   runs in two phases (§4.4): a bare remote **pull** first (fast — cloud changes land in seconds),
   then it starts polling, then the full **`scanOffline`** catch-up in the background.
@@ -571,6 +606,81 @@ off there are no disk writes, no S3 PUTs, and no note paths leave the device.
 > [!note] Privacy
 > Log lines contain **note paths** (never credentials). Shipping to `_logs/` exposes those paths to
 > anyone who can read the bucket — the same audience that already holds the entire vault (§10).
+
+## 4.12 Version history & the File-recovery safety net (`history-modal.ts`)
+
+Obsidian's built-in **"Open version history"** belongs to **Obsidian Sync** — the string lives under
+its `sync` i18n namespace and the action throws `Sync is not set up for this vault` without a
+subscription. There is **no plugin-facing API** to supply history: the public `obsidian.d.ts` has no
+mention of version history, snapshots or revisions, and the app exposes no provider registration
+(`registerVersionHistory` / `versionHistoryProvider` and friends simply do not exist). So the plugin
+renders its own, off a source that is strictly richer than Sync's — see §2.9.
+
+**`VersionHistoryModal`** — a two-pane modal built with Obsidian's own shipped classes
+(`mod-sidebar-layout`, `modal-sidebar-list-item`, `diff-line mod-left/mod-right`), so it matches the
+native look with no bundled CSS:
+
+- **List** — one row per journal revision, newest first: local timestamp, `rev`, the **writing
+  device** (this device is labelled as such), and size / `deleted` / `renamed → <path>`. A pruned
+  journal appends an explicit "older revisions are no longer available" line rather than pretending
+  the list is complete.
+- **Content** — the revision's text, or a **Show changes** toggle that diffs against the next older
+  live revision (`lineDiff`, §2.9). Tombstones render as a note, not a blank pane. Binaries (NUL byte
+  in the first 8 KB) and anything over `PREVIEW_MAX_BYTES` (2 MB) show metadata only — **restore
+  still works** for them.
+- **Restore** — writes the chosen bytes back at the **current** path and marks it dirty; the ordinary
+  debounced push then publishes it as a **new revision**. History stays append-only: nothing in S3 is
+  rewritten, and the restore itself is just another entry in the trail. On a tombstone row the button
+  becomes *Restore the previous revision*.
+
+Entry points: the **file-menu** item *Version history (S3 sync)* (the public `workspace.on("file-menu")`
+hook — Sync's own entry is not extensible), the command **Version history of this note**, and the CLI
+handler **`vault-s3-sync:history`** (`--path`, `--total`), the public counterpart of Sync's
+`sync:history`.
+
+`registerCliHandler` exists only since Obsidian **1.12.2**, which is why `manifest.minAppVersion` is
+pinned there (§4.13). The call is still feature-detected as defence-in-depth: the primary
+distribution channel is the vault sync itself (§8), so a plugin that throws in `onload` takes sync
+down with it and can no longer receive its own fix.
+
+### The File-recovery safety net
+
+`EngineOptions.onBeforeOverwrite` fires in `SyncEngine.write()` immediately before sync replaces an
+**existing** local file, and the plugin routes it to Obsidian's **File recovery** core plugin. This
+covers the one gap the journal cannot: bytes that were **never pushed** (an offline edit a remote
+overwrite lands on) exist in no revision anywhere. Obsidian itself calls the same `forceAdd` before
+restoring a version. The restore path uses it too, so an unwanted restore is undoable in-app.
+
+> [!warning] This is the one private-API touch in the codebase
+> `app.internalPlugins.getEnabledPluginById("file-recovery").forceAdd(file, data)` is **not** public
+> API. It is therefore fully feature-detected and wrapped so that **any** failure is logged and
+> swallowed — a missing or changed internal shape costs the extra safety net, never the sync (the
+> engine hook is contractually best-effort and a throwing implementation cannot block the write).
+> File-recovery snapshots are **device-local, `.md`/`.canvas` only, and never sync** — they are a
+> local backstop, not a substitute for the journal or S3 object versions.
+
+## 4.13 `minAppVersion` policy
+
+`manifest.json` declares **`minAppVersion: 1.12.2`**. Obsidian refuses to load a plugin whose
+`minAppVersion` exceeds the running app, so this is a hard floor, not a hint.
+
+The floor is set by the **newest API the plugin actually calls**, which is `registerCliHandler`
+(§4.12, Obsidian 1.12.2). Everything else in the plugin's Obsidian surface — `Plugin`, `Modal`,
+`Setting`, `Menu`, `Vault`/`DataAdapter`, `workspace.on("file-menu")`, `Platform`, `normalizePath`,
+`getLinkpath` — predates 1.4.0. Raise the floor only when a newly-used API demands it, and record the
+API that forced it here.
+
+`versions.json` (version → `minAppVersion`) is derived, never hand-edited: `bump:plugin` writes
+`versions[target] = manifest.minAppVersion`, and the release workflow's auto-bump carries the change
+into the new entry. So changing the floor means editing **`manifest.json` only**, then merging.
+
+> [!warning] Raising the floor can strand a device
+> Distribution is primarily the vault sync itself (§8): `main.js` + `manifest.json` propagate as
+> ordinary vault content. A device running an app **older** than the new `minAppVersion` will accept
+> the synced manifest and then refuse to load the plugin — so **that device stops syncing** and can
+> no longer receive its own fix, the hazard called out in §8/CLAUDE.md. Before merging a floor bump,
+> confirm every device (including mobile, which often lags desktop) is at or above it; recover a
+> stranded device by updating Obsidian there, or by manually installing an older plugin build.
 
 ---
 
@@ -775,6 +885,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Sync loop | dual echo suppression: `by` field + `[skip ci]` bot commits |
 | Corrupt S3 object | manifest hash mismatch on apply → skip/re-fetch |
 | "Resync pulled 0 files" | resync uses `fullPull` (no echo suppression) → restores own lost files |
+| Wrong content in one note (bad merge, unwanted edit, remote clobber) | **Version history** (§4.12): pick a revision, diff it, restore — attributed by device and rev |
+| Note deleted / renamed unexpectedly | Version history follows renames and shows the tombstone with its writing device; restore the revision before it |
+| Local bytes lost that were never pushed | Obsidian **File recovery** snapshot taken before every sync overwrite (§4.12) — device-local, `.md`/`.canvas` |
 
 ---
 
@@ -811,6 +924,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Log S3 upload tail | 256 KB | `UPLOAD_BYTES` (logger.ts) |
 | Log flush debounce | 1 s | `FLUSH_DEBOUNCE_MS` (logger.ts) |
 | Log S3 namespace | `_logs/<deviceId>.log` | `LOG_PREFIX` (logger.ts) |
+| History preview cap | 2 MB (larger → metadata only) | `PREVIEW_MAX_BYTES` (history-modal.ts) |
+| History binary sniff | NUL byte in first 8 KB | history-modal.ts |
 
 ---
 
