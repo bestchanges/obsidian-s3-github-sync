@@ -160,8 +160,11 @@ export default class S3SyncPlugin extends Plugin {
       }),
     );
     // Obsidian Sync registers `sync:history` for the same job; this is the public equivalent.
-    // Feature-detected: registerCliHandler landed in Obsidian 1.12.2, well above our manifest
-    // minAppVersion, so on an older app we simply skip the CLI command rather than fail onload.
+    // registerCliHandler landed in 1.12.2, which is exactly why manifest.minAppVersion is pinned
+    // there — Obsidian refuses to load a plugin below its own minAppVersion, so this is guaranteed
+    // present. The check is kept as defence-in-depth: our primary channel is self-distribution
+    // through the vault sync itself (§8), where a plugin that throws in onload takes sync down with
+    // it and can no longer receive its own fix. Cheap insurance against an onload-fatal surprise.
     if (typeof this.registerCliHandler === "function") {
       this.registerCliHandler(
         "vault-s3-sync:history",

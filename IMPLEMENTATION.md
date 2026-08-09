@@ -548,8 +548,7 @@ new edit.
   `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only),
   `Version history of this note` (§4.12; active-note only).
 - **File menu**: `Version history (S3 sync)` on any synced file (§4.12).
-- **CLI**: `vault-s3-sync:history --path <path> [--total]` (§4.12), registered only on Obsidian
-  ≥ 1.12.2.
+- **CLI**: `vault-s3-sync:history --path <path> [--total]` (§4.12).
 - **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup
   runs in two phases (§4.4): a bare remote **pull** first (fast — cloud changes land in seconds),
   then it starts polling, then the full **`scanOffline`** catch-up in the background.
@@ -637,9 +636,12 @@ native look with no bundled CSS:
 Entry points: the **file-menu** item *Version history (S3 sync)* (the public `workspace.on("file-menu")`
 hook — Sync's own entry is not extensible), the command **Version history of this note**, and the CLI
 handler **`vault-s3-sync:history`** (`--path`, `--total`), the public counterpart of Sync's
-`sync:history`. `registerCliHandler` is **feature-detected**: it exists only since Obsidian 1.12.2,
-far above our `minAppVersion`, so older apps just don't get the CLI command instead of failing
-`onload`.
+`sync:history`.
+
+`registerCliHandler` exists only since Obsidian **1.12.2**, which is why `manifest.minAppVersion` is
+pinned there (§4.13). The call is still feature-detected as defence-in-depth: the primary
+distribution channel is the vault sync itself (§8), so a plugin that throws in `onload` takes sync
+down with it and can no longer receive its own fix.
 
 ### The File-recovery safety net
 
@@ -656,6 +658,29 @@ restoring a version. The restore path uses it too, so an unwanted restore is und
 > engine hook is contractually best-effort and a throwing implementation cannot block the write).
 > File-recovery snapshots are **device-local, `.md`/`.canvas` only, and never sync** — they are a
 > local backstop, not a substitute for the journal or S3 object versions.
+
+## 4.13 `minAppVersion` policy
+
+`manifest.json` declares **`minAppVersion: 1.12.2`**. Obsidian refuses to load a plugin whose
+`minAppVersion` exceeds the running app, so this is a hard floor, not a hint.
+
+The floor is set by the **newest API the plugin actually calls**, which is `registerCliHandler`
+(§4.12, Obsidian 1.12.2). Everything else in the plugin's Obsidian surface — `Plugin`, `Modal`,
+`Setting`, `Menu`, `Vault`/`DataAdapter`, `workspace.on("file-menu")`, `Platform`, `normalizePath`,
+`getLinkpath` — predates 1.4.0. Raise the floor only when a newly-used API demands it, and record the
+API that forced it here.
+
+`versions.json` (version → `minAppVersion`) is derived, never hand-edited: `bump:plugin` writes
+`versions[target] = manifest.minAppVersion`, and the release workflow's auto-bump carries the change
+into the new entry. So changing the floor means editing **`manifest.json` only**, then merging.
+
+> [!warning] Raising the floor can strand a device
+> Distribution is primarily the vault sync itself (§8): `main.js` + `manifest.json` propagate as
+> ordinary vault content. A device running an app **older** than the new `minAppVersion` will accept
+> the synced manifest and then refuse to load the plugin — so **that device stops syncing** and can
+> no longer receive its own fix, the hazard called out in §8/CLAUDE.md. Before merging a floor bump,
+> confirm every device (including mobile, which often lags desktop) is at or above it; recover a
+> stranded device by updating Obsidian there, or by manually installing an older plugin build.
 
 ---
 

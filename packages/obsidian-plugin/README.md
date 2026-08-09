@@ -32,9 +32,13 @@ Two-way sync between an Obsidian vault and S3 (desktop **and** mobile), one leg 
   snapshot is also taken before sync overwrites any local file, covering bytes that never reached S3.
 
 Commands: **Sync now**, **Resync everything from S3**, **Export setup vault**, **Version history of
-this note**; file-menu entry *Version history (S3 sync)*; CLI `vault-s3-sync:history --path <path>`
-(Obsidian ≥ 1.12.2). Full settings and behavior:
-[IMPLEMENTATION.md §4.9](../../IMPLEMENTATION.md).
+this note**; file-menu entry *Version history (S3 sync)*; CLI `vault-s3-sync:history --path <path>`.
+Full settings and behavior: [IMPLEMENTATION.md §4.9](../../IMPLEMENTATION.md).
+
+> **Requires Obsidian ≥ 1.12.2** (`minAppVersion`), the release that introduced `registerCliHandler`.
+> Obsidian will not load the plugin on an older app — and since the plugin distributes through the
+> vault sync itself, a device below that floor stops syncing until it's updated. See
+> [IMPLEMENTATION.md §4.13](../../IMPLEMENTATION.md).
 
 > ⚠️ **Requires bucket CORS.** The plugin makes cross-origin requests from `app://obsidian.md`
 > (desktop) and `capacitor://localhost` / `http://localhost` (mobile); without CORS exposing `ETag`
