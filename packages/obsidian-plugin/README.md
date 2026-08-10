@@ -25,9 +25,20 @@ Two-way sync between an Obsidian vault and S3 (desktop **and** mobile), one leg 
   copied to a new machine triggers a clean full resync instead of two devices sharing an id.
 - **One-click new-device setup** — *Export setup vault* bundles the plugin + connection settings into
   a zip (share sheet on mobile, download on desktop).
+- **Version history per note** — every revision in the delta journal, with the **device** that wrote
+  it, a diff against the previous revision, and one-click restore. Follows renames. Obsidian's own
+  "Open version history" is Obsidian Sync–only with no plugin API, so this is our own panel over a
+  richer source ([IMPLEMENTATION.md §2.9, §4.12](../../IMPLEMENTATION.md)). A **File recovery**
+  snapshot is also taken before sync overwrites any local file, covering bytes that never reached S3.
 
-Commands: **Sync now**, **Resync everything from S3**, **Export setup vault**. Full settings and
-behavior: [IMPLEMENTATION.md §4.9](../../IMPLEMENTATION.md).
+Commands: **Sync now**, **Resync everything from S3**, **Export setup vault**, **Version history of
+this note**; file-menu entry *Version history (S3 sync)*; CLI `vault-s3-sync:history --path <path>`.
+Full settings and behavior: [IMPLEMENTATION.md §4.9](../../IMPLEMENTATION.md).
+
+> **Requires Obsidian ≥ 1.12.2** (`minAppVersion`), the release that introduced `registerCliHandler`.
+> Obsidian will not load the plugin on an older app — and since the plugin distributes through the
+> vault sync itself, a device below that floor stops syncing until it's updated. See
+> [IMPLEMENTATION.md §4.13](../../IMPLEMENTATION.md).
 
 > ⚠️ **Requires bucket CORS.** The plugin makes cross-origin requests from `app://obsidian.md`
 > (desktop) and `capacitor://localhost` / `http://localhost` (mobile); without CORS exposing `ETag`

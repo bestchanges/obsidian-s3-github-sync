@@ -1,11 +1,12 @@
-import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
+import { Menu, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
+import { VersionHistoryModal } from "./history-modal";
 import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
-import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
+import { decodeJsonGz, encodeJsonGz, readFileHistory } from "@vault-sync/core";
 
 interface Settings {
   bucket: string;
@@ -136,6 +137,46 @@ export default class S3SyncPlugin extends Plugin {
       name: "Export setup vault (for a new device)",
       callback: () => void this.exportStarterVault(),
     });
+    this.addCommand({
+      id: "version-history",
+      name: "Version history of this note",
+      checkCallback: (checking: boolean) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || !this.configured()) return false;
+        if (!checking) this.openVersionHistory(file.path);
+        return true;
+      },
+    });
+    // Mirror Sync's context-menu affordance on our own history (§4.12). `file-menu` is the public
+    // hook; Obsidian's own "Open version history" is Sync-only and has no API to extend.
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu: Menu, file: TAbstractFile) => {
+        if (!(file instanceof TFile) || !this.configured()) return;
+        if (this.engine?.isExcluded(file.path)) return;
+        menu.addItem((item) =>
+          item
+            .setTitle("Version history (S3 sync)")
+            .setIcon("lucide-history")
+            .onClick(() => this.openVersionHistory(file.path)));
+      }),
+    );
+    // Obsidian Sync registers `sync:history` for the same job; this is the public equivalent.
+    // registerCliHandler landed in 1.12.2, which is exactly why manifest.minAppVersion is pinned
+    // there — Obsidian refuses to load a plugin below its own minAppVersion, so this is guaranteed
+    // present. The check is kept as defence-in-depth: our primary channel is self-distribution
+    // through the vault sync itself (§8), where a plugin that throws in onload takes sync down with
+    // it and can no longer receive its own fix. Cheap insurance against an onload-fatal surprise.
+    if (typeof this.registerCliHandler === "function") {
+      this.registerCliHandler(
+        "vault-s3-sync:history",
+        "List S3 sync revisions of a vault file",
+        {
+          path: { value: "<path>", description: "Vault-relative file path" },
+          total: { description: "Return the revision count only" },
+        },
+        (params) => this.cliHistory(params),
+      );
+    }
     this.addCommand({
       id: "force-sync-linked-files",
       name: "Force download linked files of this note (ignore size limit)",
@@ -394,6 +435,94 @@ export default class S3SyncPlugin extends Plugin {
     }
   }
 
+  // -------------------------------------------------- version history (§4.12)
+  /** Open the journal-backed history panel for a vault path. */
+  openVersionHistory(path: string): void {
+    if (!this.configured()) {
+      new Notice("S3 Vault Sync: set the bucket and access keys first.");
+      return;
+    }
+    const isMobile = (this.app as unknown as { isMobile?: boolean }).isMobile === true;
+    new VersionHistoryModal(this.app, {
+      storage: new S3FetchAdapter({
+        bucket: this.settings.bucket,
+        region: this.settings.region,
+        accessKeyId: this.settings.accessKeyId,
+        secretAccessKey: this.settings.secretAccessKey,
+        prefix: this.settings.prefix,
+      }),
+      path,
+      deviceId: this.settings.deviceId,
+      concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
+      log: (level, msg) => this.logger.log(level, msg),
+      backupBeforeWrite: (p) => this.recoverySnapshot(p),
+      // A restore is an ordinary local edit: mark it dirty and let the debounced push publish it as
+      // a new revision, so history stays append-only.
+      afterRestore: () => {
+        this.engine?.markDirty(path);
+        void this.runSync("manual");
+      },
+    }).open();
+  }
+
+  /**
+   * Push the CURRENT local bytes of a path into Obsidian's **File recovery** store before sync (or a
+   * restore) overwrites them (§4.12).
+   *
+   * `file-recovery` is a core plugin reached through `app.internalPlugins`, which is NOT part of the
+   * public API — Obsidian's own Sync calls the same `forceAdd` before restoring a version. Everything
+   * here is therefore feature-detected and best-effort: if the shape ever changes, we lose the extra
+   * safety net, never the sync. Snapshots are device-local and cover `.md`/`.canvas` only.
+   */
+  private async recoverySnapshot(path: string): Promise<void> {
+    const ext = path.split(".").pop()?.toLowerCase();
+    if (ext !== "md" && ext !== "canvas") return;
+    try {
+      const internal = (this.app as unknown as {
+        internalPlugins?: {
+          getEnabledPluginById(id: string): { forceAdd?(file: TFile, data: string): Promise<void> } | null;
+        };
+      }).internalPlugins;
+      const recovery = internal?.getEnabledPluginById("file-recovery");
+      if (!recovery?.forceAdd) return;
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (!(file instanceof TFile)) return;
+      await recovery.forceAdd(file, await this.app.vault.read(file));
+    } catch (err) {
+      this.logger.log("warn", `file-recovery snapshot skipped for ${path}: ${String(err)}`);
+    }
+  }
+
+  /** `vault-s3-sync:history` — the CLI equivalent of the panel (Sync exposes `sync:history`). */
+  private async cliHistory(params: Record<string, string>): Promise<string> {
+    if (!this.configured()) return "S3 Vault Sync is not configured.";
+    const path = params.path || this.app.workspace.getActiveFile()?.path;
+    if (!path) return "Pass --path <path>, or open the file first.";
+    const isMobile = (this.app as unknown as { isMobile?: boolean }).isMobile === true;
+    const storage = new S3FetchAdapter({
+      bucket: this.settings.bucket,
+      region: this.settings.region,
+      accessKeyId: this.settings.accessKeyId,
+      secretAccessKey: this.settings.secretAccessKey,
+      prefix: this.settings.prefix,
+    });
+    const { versions, truncated, oldestRevAvailable } = await readFileHistory(
+      storage,
+      path,
+      isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
+    );
+    if (params.total === "true") return String(versions.length);
+    if (versions.length === 0) return `No revisions found for ${path}`;
+    const lines = versions.map((v) => {
+      const when = (v.at ? new Date(v.at).toISOString().replace("T", " ").slice(0, 19) : "").padEnd(19);
+      const what = v.deleted ? (v.renamedTo ? `renamed → ${v.renamedTo}` : "deleted") : `${v.size ?? 0} B`;
+      const where = v.path === path ? "" : `  (as ${v.path})`;
+      return `${String(v.rev).padStart(6)}  ${when}  ${v.by.padEnd(24)}  ${what}${where}`;
+    });
+    if (truncated) lines.push(`(journal pruned below rev ${oldestRevAvailable} — older revisions unavailable)`);
+    return [path, ...lines].join("\n");
+  }
+
   rebuildEngine(): void {
     if (!this.configured()) {
       this.engine = null;
@@ -431,6 +560,28 @@ export default class S3SyncPlugin extends Plugin {
         // the first cycle must ask before resolving collisions instead of union-merging the vault.
         adoptedForeignState: this.foreignStateDetected,
         deferConflicts: this.foreignStateDetected,
+        // Re-case a note to a pulled case-only rename through Obsidian's own API so it works on mobile
+        // (the raw adapter rejects a case-only rename there) and the new name shows without a reload.
+        // Returns false for anything that isn't a note in the vault index (e.g. config files) so the
+        // engine falls back to the storage adapter.
+        renameFile: async (from, to, viaTmp) => {
+          const file = this.app.vault.getAbstractFileByPath(from);
+          if (!(file instanceof TFile)) return false; // not a note in the index → engine uses the adapter
+          try {
+            await this.app.fileManager.renameFile(file, to);
+          } catch {
+            // Case-only rename is a "target exists" fold-collision on mobile's case-insensitive
+            // volume. Hop through a unique interim name — each step is a non-colliding rename, and
+            // fileManager keeps the metadata cache + UI in sync so the new case shows without a reload.
+            await this.app.fileManager.renameFile(file, viaTmp);
+            await this.app.fileManager.renameFile(file, to);
+          }
+          return true;
+        },
+        // Safety net (§4.12): whatever sync is about to replace goes into Obsidian's File recovery
+        // store first, so a bad remote overwrite is recoverable in-app even on a device that never
+        // pushed those bytes (the journal only has what reached S3).
+        onBeforeOverwrite: (path) => this.recoverySnapshot(path),
         onStateChanged: async (state) => {
           this.syncState = state;
           await this.persistState();

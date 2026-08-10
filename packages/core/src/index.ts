@@ -6,5 +6,6 @@ export * from "./hash";
 export * from "./merge";
 export * from "./frontmatter";
 export * from "./journal";
+export * from "./history";
 export * from "./memory";
 export * from "./util";
