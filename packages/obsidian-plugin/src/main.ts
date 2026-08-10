@@ -2,6 +2,7 @@ import { Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFi
 import { SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
+import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
 import { decodeJsonGz, encodeJsonGz } from "@vault-sync/core";
@@ -260,7 +261,16 @@ export default class S3SyncPlugin extends Plugin {
     } else if (this.settings.machineFingerprint !== fp) {
       this.settings.deviceId = this.mintDeviceId();
       this.settings.machineFingerprint = fp;
-      this.syncState = { lastSyncedRev: 0, files: {} }; // foreign state → cold full pull
+      // Foreign state (this vault was copied/restored onto another machine, or the OS was
+      // reinstalled): re-mint the id so delta attribution and echo suppression can't collide with
+      // the device this copy came from, and rewind the cursor for a cold full pull — but KEEP the
+      // file baselines. They are content-addressed (`path → {hash, s3VersionId}`), so every entry
+      // whose hash still matches the file on disk is a valid merge base; applyRemote re-hashes each
+      // file anyway, so a stale entry costs nothing while a correct one turns the whole restore into
+      // ordinary clean fast-forwards. Dropping them used to leave every colliding note with NO merge
+      // base, and `unionMerge("", local, remote)` keeps both sides of every changed line — which is
+      // how a Mac rebuild duplicated every rolled-forward recurring task in the vault.
+      this.syncState = { lastSyncedRev: 0, files: this.syncState.files };
       this.foreignStateDetected = true;
       changed = true;
     }
@@ -416,6 +426,11 @@ export default class S3SyncPlugin extends Plugin {
         // Fresh device (never synced) that isn't inheriting a copied state: let the first pull take
         // remote as-is on collisions instead of union-merging Obsidian's generated config defaults.
         firstRun: !this.hadPriorState && !this.foreignStateDetected,
+        // Copied/restored state: the retained baselines have never been checked against THIS disk,
+        // so the first offline scan must restore what it can't find rather than tombstone it, and
+        // the first cycle must ask before resolving collisions instead of union-merging the vault.
+        adoptedForeignState: this.foreignStateDetected,
+        deferConflicts: this.foreignStateDetected,
         onStateChanged: async (state) => {
           this.syncState = state;
           await this.persistState();
@@ -447,8 +462,35 @@ export default class S3SyncPlugin extends Plugin {
     // pull can't see) wait for the scan below.
     if (!this.settings.syncPaused) new Notice("S3 Vault Sync: syncing from cloud…");
     await this.runSync("startup-pull"); // fast: pull remote deltas, announce started/done
+    // New device (§4.2a): the pull refused to resolve local↔remote collisions on its own. Ask BEFORE
+    // anything else runs — the offline scan below would mark those same files dirty and push the
+    // local copy over the cloud one, which is the decision we're trying not to make silently.
+    if (this.engine.deferredConflicts().length && (await this.promptForeignState()) === "pause") {
+      return; // paused by the answer; resuming from settings restarts polling and syncs
+    }
     this.startPolling(); // poll loop live now — the app is responsive without waiting on the scan
     void this.runSync("startup-scan"); // offline catch-up (§2.4) in the background; pushes local edits
+  }
+
+  /** Ask which side wins the collisions the first cycle on a new machine declined to resolve, then
+   * carry out the answer (§4.2a). Resolves once the follow-up cycle has finished, so the caller can
+   * safely start the offline scan afterwards. */
+  private async promptForeignState(): Promise<ForeignStateChoice> {
+    const engine = this.engine;
+    if (!engine) return "merge";
+    const paths = engine.deferredConflicts();
+    this.logger.info(`new device: ${paths.length} deferred collision(s) — asking the user`);
+    const choice = await new Promise<ForeignStateChoice>((resolve) => {
+      new ForeignStateModal(this.app, paths, this.settings.deviceId, resolve).open();
+    });
+    this.logger.info(`new device: user chose "${choice}" for ${paths.length} collision(s)`);
+    if (choice === "pause") {
+      await this.setSyncPaused(true);
+      return choice;
+    }
+    if (choice === "cloud") await engine.resolveDeferredFromCloud();
+    else await engine.resolveDeferredByMerging();
+    return choice;
   }
 
   startPolling(): void {

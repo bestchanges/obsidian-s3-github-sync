@@ -123,6 +123,17 @@ export interface EngineOptions {
    * corruption everywhere. Must be false for a copied (foreign) state and for user resyncs, where
    * local content is real and union-merge is the right, lossless choice. */
   firstRun?: boolean;
+  /** This device ADOPTED a copied/restored state (the machine fingerprint changed, §4.2). The file
+   * baselines are kept — they are content-addressed, so every entry whose recorded hash still
+   * matches the file on disk is a valid merge base — but nothing has yet verified that the disk
+   * agrees with them. Until the first offline scan completes, a tracked file that isn't on disk is
+   * RESTORED from S3, never tombstoned: a partial restore would otherwise delete the missing notes
+   * off every device. */
+  adoptedForeignState?: boolean;
+  /** Don't union-merge local↔remote collisions — collect them and let the caller decide (§4.2a).
+   * Set for the first cycle after adopting a foreign state, where silently union-merging the whole
+   * vault is the one outcome nobody would pick knowingly. Clean files still pull normally. */
+  deferConflicts?: boolean;
   onStateChanged: (state: SyncState) => Promise<void>;
 }
 
@@ -149,6 +160,9 @@ interface CycleReq {
   /** paths/linkpaths to force-download from S3 ignoring the per-device size cap (§4.7.1).
    * Resolved against live remote state; empty on ordinary cycles. */
   forcePaths: string[];
+  /** arm the bootstrap guard for this cycle: every local↔remote collision is taken from remote
+   * as-is instead of union-merged. Set when the user answers "cloud wins" to the new-device prompt. */
+  takeRemoteOnCollision?: boolean;
 }
 
 export class SyncEngine {
@@ -170,6 +184,16 @@ export class SyncEngine {
    * union-merging (kills the fresh-device default-config corruption). Cleared after the first pull.
    * See EngineOptions.firstRun and applyRemote(). */
   private bootstrap: boolean;
+  /** Adopted-foreign-state guard: while true the offline scan RESTORES tracked files it can't find
+   * on disk instead of tombstoning them. Cleared once that first scan has run and the disk has been
+   * confirmed against the adopted baselines. See EngineOptions.adoptedForeignState. */
+  private adoptedState: boolean;
+  /** While true, a local↔remote collision is neither merged nor overwritten: the path is collected
+   * in `deferred` and left alone, for the caller to resolve. See EngineOptions.deferConflicts. */
+  private deferConflicts: boolean;
+  /** Paths whose collision this cycle declined to resolve (deferConflicts). Drained by the plugin,
+   * which asks the user whether the cloud or a union merge wins. */
+  private readonly deferred = new Set<string>();
   /** During a full-pull reconcile (resync), config-dir files (.obsidian/**) are taken from S3
    * AS-IS instead of freshest-wins — on a resync S3 is authoritative for config. This is also the
    * HEAL path for config a prior bad merge corrupted locally: the corrupted copy has a newer mtime
@@ -248,6 +272,55 @@ export class SyncEngine {
     private opts: EngineOptions,
   ) {
     this.bootstrap = opts.firstRun ?? false;
+    this.adoptedState = opts.adoptedForeignState ?? false;
+    this.deferConflicts = opts.deferConflicts ?? false;
+  }
+
+  // --------------------------------------------- deferred conflicts (§4.2a)
+  /** Paths this cycle declined to merge, for the "new device" prompt. Read-only view. */
+  deferredConflicts(): string[] {
+    return [...this.deferred];
+  }
+
+  /** Resolve every deferred collision by taking the cloud copy as-is (the right answer after a
+   * machine rebuild/restore, where S3 — not this disk — is the current truth). Runs a full pull
+   * with the bootstrap guard armed, so each collision is taken from remote instead of merged. */
+  async resolveDeferredFromCloud(): Promise<void> {
+    this.deferConflicts = false;
+    this.deferred.clear();
+    // Cold re-pull: the deferred paths' deltas are already behind the cursor, so rewind it to see
+    // them again. Unlike `resetCursor` this KEEPS state.files — those baselines are the whole point
+    // (§4.2) and files that already match remote short-circuit on their hash anyway.
+    this.state.lastSyncedRev = 0;
+    await this.request({
+      resetCursor: false,
+      scanOffline: false,
+      scanConfig: false,
+      fullPull: true, // ignore echo suppression: files THIS device once wrote must restore too
+      takeRemoteOnCollision: true,
+      label: "cloud wins",
+      announce: true,
+      force: true,
+      forcePaths: [],
+    });
+  }
+
+  /** Resolve every deferred collision by union-merging it (lossless, keeps both sides — the pre-4.2a
+   * behavior). Also the fallback when the prompt is dismissed without a choice. */
+  async resolveDeferredByMerging(): Promise<void> {
+    this.deferConflicts = false;
+    this.deferred.clear();
+    this.state.lastSyncedRev = 0; // cold re-pull, keeping the baselines (see above)
+    await this.request({
+      resetCursor: false,
+      scanOffline: false,
+      scanConfig: false,
+      fullPull: true,
+      label: "merge with cloud",
+      announce: true,
+      force: true,
+      forcePaths: [],
+    });
   }
 
   // ------------------------------------------------------------- exclusions
@@ -374,6 +447,21 @@ export class SyncEngine {
       (p) => !known.has(p) && !this.isExcluded(p),
     );
     const total = Object.keys(this.state.files).length;
+    if (this.adoptedState && missing.length) {
+      // The baselines came from a copied/restored vault (§4.2) and this is the first scan that has
+      // ever checked them against this disk. A tracked path we can't see is far more likely to be a
+      // gap in the restore than a deletion the user made — and guessing wrong deletes it everywhere.
+      // Restore from S3 instead; a genuine deletion can be redone here and will propagate normally.
+      this.notify(
+        `Sync: ${missing.length} tracked file(s) aren't in this copy of the vault — restoring them ` +
+          `from S3 rather than deleting. Delete them again here if they should be gone.`,
+        true,
+      );
+      this.state.lastSyncedRev = 0;
+      this.adoptedState = false; // disk is reconciled with the adopted state from here on
+      return;
+    }
+    this.adoptedState = false;
     if (
       missing.length >= MASS_MISSING_MIN &&
       missing.length / Math.max(1, total) > MASS_MISSING_FRACTION
@@ -489,6 +577,7 @@ export class SyncEngine {
       announce: true,
       force: (base?.force ?? false) || add.force,
       forcePaths: [...(base?.forcePaths ?? []), ...add.forcePaths],
+      takeRemoteOnCollision: (base?.takeRemoteOnCollision ?? false) || (add.takeRemoteOnCollision ?? false),
     };
   }
 
@@ -528,6 +617,9 @@ export class SyncEngine {
     // remote as-is rather than freshest-wins, so a locally-corrupted config with a newer mtime can't
     // win and re-propagate. Ordinary cycles leave freshest-wins in charge.
     this.takeConfigFromRemote = req.fullPull;
+    // "Cloud wins" answer to the new-device prompt: reuse the first-run guard so every collision is
+    // taken from remote as-is. Cleared with the rest of the bootstrap flag after this cycle's pull.
+    if (req.takeRemoteOnCollision) this.bootstrap = true;
 
     if (req.resetCursor) {
       this.state.lastSyncedRev = 0;
@@ -540,6 +632,10 @@ export class SyncEngine {
     this.prunePendingPulls();
     await this.pull(req.fullPull);
     this.bootstrap = false; // first pull is done — later collisions are real edits again
+    // Deferral is a one-cycle guard too: whatever this pull collected is handed to the prompt now,
+    // and ordinary cycles (polls, edits) must resolve their conflicts normally rather than pile up
+    // deferred paths nobody will ever be asked about.
+    this.deferConflicts = false;
     // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
     // dirty) and so a delete-vs-edit re-push it triggers is flushed in the same cycle.
     if (req.forcePaths.length) this.forceResult = await this.forceDownload(req.forcePaths);
@@ -662,6 +758,15 @@ export class SyncEngine {
       // not be merged/re-published. Falling through to the clean branch re-applies the remote and
       // re-arms the guard (§2.6, fix #1).
       !this.phantomRevert(path, localHash);
+    // New-device prompt (§4.2a): this cycle is not allowed to guess. Record the collision and leave
+    // BOTH copies exactly as they are — no write, no state change, not dirty (pushing would clobber
+    // the cloud). The plugin drains `deferred`, asks, and re-runs a cycle that resolves them all one
+    // way. If the prompt is dismissed the fallback re-run union-merges, i.e. the old behavior.
+    if (localDirty && this.deferConflicts) {
+      this.deferred.add(path);
+      this.dirty.delete(path);
+      return;
+    }
     if (!localDirty) {
       // Per-device download cap: oversized remote files stay in the cloud on this device to save
       // space. Leave local as-is and DON'T record — the file just isn't present here, so it's not
