@@ -315,10 +315,43 @@ Each device needs a unique, stable writer id for echo suppression, and copying a
   - no `deviceId` → mint one, record the fingerprint;
   - legacy fingerprint (empty, or the old `ua:` scheme) → adopt the stable fingerprint in place and
     keep the id — a one-time upgrade migration, **no** foreign-state resync;
-  - fingerprint present but different → the `data.json` was **copied from another machine**:
-    mint a fresh `deviceId`, reset the sync cursor to 0, and flag a **foreign-state full resync** on
-    startup (so the copied device rebuilds its own state and pulls the whole vault instead of
-    trusting a stranger's cursor).
+  - fingerprint present but different → the `data.json` was **copied from another machine** (or the
+    OS was reinstalled): mint a fresh `deviceId`, reset the sync cursor to 0, and flag a
+    **foreign-state full resync** on startup (so the copied device pulls the whole vault instead of
+    trusting a stranger's cursor). The **file baselines are kept** — see below.
+
+> [!important] Adopting a foreign state keeps the baselines (`adoptedForeignState`)
+> The cursor is rewound, but `state.files` is **retained**. Those entries are content-addressed
+> (`path → {hash, s3VersionId}`) with nothing machine-specific in them, so every entry whose hash
+> still matches the file on disk is a **valid merge base** — and `applyRemote` re-hashes each file
+> anyway, so a stale entry costs nothing while a correct one turns the whole restore into ordinary
+> clean fast-forwards (§4.8). Dropping them left every colliding note with **no** base, and
+> `unionMerge("", local, remote)` keeps both sides of every changed line: the 2026-08 Mac rebuild
+> that came back with every rolled-forward recurring task duplicated (one open copy per `⏳` date).
+> Because the retained baselines have never been checked against *this* disk, the first offline scan
+> runs under `adoptedForeignState`: a tracked path that isn't on disk is **restored from S3, never
+> tombstoned** (a partial restore would otherwise delete the missing notes off every device), and the
+> flag clears once that scan has reconciled disk and state.
+
+> [!note] §4.2a The new-device prompt (`deferConflicts`, `foreign-state-modal.ts`)
+> On the first cycle after adopting a foreign state the engine **refuses to resolve collisions
+> silently**. A path whose local copy differs from both its baseline and the cloud is added to
+> `deferred` and left completely alone — not written, not recorded, not marked dirty (pushing it
+> would clobber the cloud copy). Clean files still pull normally, so the vault comes up to date
+> either way. `startup()` then drains `deferredConflicts()` **before** the offline scan (which would
+> otherwise mark those same files dirty and push them) and asks:
+> - **Use cloud** → `resolveDeferredFromCloud()`: a cold re-pull (cursor to 0, baselines kept) with
+>   the bootstrap guard armed, so each collision is taken from S3 as-is. The right answer after a
+>   rebuild or restore, where the cloud kept syncing and this disk is a snapshot.
+> - **Merge both** → `resolveDeferredByMerging()`: the same re-pull with the ordinary union merge.
+>   Lossless, but where the two edits touch the same region it keeps **both** copies — the
+>   duplicate-task outcome, now a named choice with its cost stated rather than an imposed default.
+>   Also the fallback when the dialog is dismissed, since it is the only option that discards nothing.
+> - **Pause sync** → leaves both copies untouched for comparison; polling and the offline scan don't
+>   start, and resuming from settings picks sync back up.
+>
+> Plugin-only: git-sync has no device identity and the union merge itself is unchanged, so both legs
+> stay in lockstep (§6).
 
 ## 4.3 Sync cycle (`SyncEngine.sync` → `pull` + `push`)
 
@@ -878,7 +911,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Client crash mid-push | files-before-delta ordering → no dangling refs; dirty set persisted |
 | Client behind retention | cold path: fetch snapshot, full diff, resume deltas |
 | Divergent offline edits | three-way union merge via versioned base |
-| Copied `data.json` / stale state | fingerprint mismatch → fresh id + foreign-state full resync |
+| Copied `data.json` / stale state | fingerprint mismatch → fresh id + foreign-state full resync, **baselines kept** as merge bases (§4.2) |
+| Vault restored onto a rebuilt machine | retained baselines make unchanged files clean fast-forwards; genuine collisions are **deferred to the new-device prompt** (§4.2a) instead of union-merged into duplicates |
 | Mass local disappearance | mass-missing guard restores from S3 instead of tombstoning |
 | Oversized attachment | stays S3-only (git 25 MB guard; per-device download cap) |
 | `.gitignore`/metadata absent on one client | `GIT_META_FILES` exclusion on both legs prevents tombstoning it |
