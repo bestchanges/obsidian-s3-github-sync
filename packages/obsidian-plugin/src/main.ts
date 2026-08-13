@@ -91,6 +91,24 @@ function deserializeState(c: CompactState): SyncState {
 
 const PUSH_DEBOUNCE_MS = 5_000; // §2.2
 
+/** A poll tick that lands more than this many intervals past the previous one means the device was
+ * frozen in between (mobile suspend, laptop sleep) — the WebView is running again but its network
+ * stack usually is not, and firing the cycle now just burns it on "Failed to fetch". */
+const POLL_LATE_FACTOR = 2;
+/** How long to let the network settle after a resume before the catch-up cycle. */
+const RESUME_GRACE_MS = 1_500;
+/** Consecutive background failures before a transient network error is worth a Notice. Resume
+ * failures come in ones and recover on the next cycle; a real outage keeps counting. */
+const TRANSIENT_QUIET_FAILURES = 3;
+
+/** Network-level failure (the request never reached S3) as opposed to a protocol/logic error: fetch
+ * rejects with TypeError, our own request timeout surfaces as AbortError. These are expected after a
+ * resume and self-heal, so they don't deserve the same noise as a real fault. */
+function isTransientNetworkError(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  return err instanceof Error && err.name === "AbortError";
+}
+
 /** localStorage key holding this device's stable anchor (§4.2). Namespaced by plugin id; per-device
  * and never written to data.json, so it survives OS/WebView/app updates and isn't copied with the
  * bundle. */
@@ -103,6 +121,13 @@ export default class S3SyncPlugin extends Plugin {
   private engine: SyncEngine | null = null;
   private pushTimer: number | null = null;
   private pollTimer: number | null = null;
+  /** Wall clock of the last poll tick, and the interval it was armed with — together they tell a
+   * normal tick from one that fired after the device was frozen (§resume handling in startPolling). */
+  private lastPollTick = 0;
+  private pollIntervalMs = 0;
+  /** Armed catch-up cycle after a resume; non-null means one is already pending, so the drift check
+   * and the visibility event coalesce into a single sync instead of racing each other. */
+  private resumeTimer: number | null = null;
   private foreignStateDetected = false;
   /** True until this device has ever persisted sync state — i.e. no state file existed on load and
    * none was migrated. Gates the engine's first-run "remote wins on collision" bootstrap so a fresh
@@ -206,6 +231,17 @@ export default class S3SyncPlugin extends Plugin {
     );
     this.registerEvent(this.app.vault.on("modify", () => this.schedulePush()));
 
+    // Coming back to the app after it was backgrounded is the other half of the resume story: on
+    // Android the poll timer may not have ticked at all while frozen, so the drift check in
+    // startPolling has nothing to notice. Only act when a poll is actually due — a quick app switch
+    // shouldn't trigger an extra cycle.
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState !== "visible" || this.pollTimer === null) return;
+      if (Date.now() - this.lastPollTick < this.pollIntervalMs) return;
+      this.lastPollTick = Date.now();
+      this.scheduleResumeSync();
+    });
+
     // defer startup sync until the vault index is ready
     this.app.workspace.onLayoutReady(() => void this.startup());
   }
@@ -213,6 +249,7 @@ export default class S3SyncPlugin extends Plugin {
   onunload(): void {
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     if (this.pollTimer) window.clearInterval(this.pollTimer);
+    if (this.resumeTimer) window.clearTimeout(this.resumeTimer);
     void this.logger?.flush(); // best-effort: land any buffered lines before teardown
   }
 
@@ -480,14 +517,17 @@ export default class S3SyncPlugin extends Plugin {
     try {
       const internal = (this.app as unknown as {
         internalPlugins?: {
-          getEnabledPluginById(id: string): { forceAdd?(file: TFile, data: string): Promise<void> } | null;
+          getEnabledPluginById(id: string): { forceAdd?(path: string, data: string): Promise<void> } | null;
         };
       }).internalPlugins;
       const recovery = internal?.getEnabledPluginById("file-recovery");
       if (!recovery?.forceAdd) return;
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) return;
-      await recovery.forceAdd(file, await this.app.vault.read(file));
+      // forceAdd takes the PATH, not the TFile: it stores `{path, ts, data}` straight into IndexedDB,
+      // and a TFile there fails the structured clone (it reaches app internals, which hold functions).
+      // Obsidian's own restore path calls it the same way.
+      await recovery.forceAdd(file.path, await this.app.vault.read(file));
     } catch (err) {
       this.logger.log("warn", `file-recovery snapshot skipped for ${path}: ${String(err)}`);
     }
@@ -646,11 +686,30 @@ export default class S3SyncPlugin extends Plugin {
 
   startPolling(): void {
     if (this.pollTimer) window.clearInterval(this.pollTimer);
-    this.pollTimer = window.setInterval(
-      () => void this.runSync("poll"),
-      Math.max(5, this.settings.pollIntervalSec) * 1000,
-    );
+    this.pollIntervalMs = Math.max(5, this.settings.pollIntervalSec) * 1000;
+    this.lastPollTick = Date.now();
+    this.pollTimer = window.setInterval(() => {
+      const now = Date.now();
+      // A tick that is this late means the clock ran on while the WebView didn't: the device was
+      // suspended. Its network stack comes back a beat after the JS does, so let it settle rather
+      // than spend this cycle on a request that can't leave the device.
+      const resumed = now - this.lastPollTick > this.pollIntervalMs * POLL_LATE_FACTOR;
+      this.lastPollTick = now;
+      if (resumed) this.scheduleResumeSync();
+      else void this.runSync("poll");
+    }, this.pollIntervalMs);
     this.registerInterval(this.pollTimer);
+  }
+
+  /** Arm the one catch-up cycle that follows a resume. Idempotent while pending, so the drift check
+   * and the visibilitychange handler firing for the same wake-up produce a single sync. */
+  private scheduleResumeSync(): void {
+    if (this.resumeTimer !== null) return;
+    this.resumeTimer = window.setTimeout(() => {
+      this.resumeTimer = null;
+      this.lastPollTick = Date.now();
+      void this.runSync("poll");
+    }, RESUME_GRACE_MS);
   }
 
   private schedulePush(): void {
@@ -679,7 +738,9 @@ export default class S3SyncPlugin extends Plugin {
         : reason === "startup-scan"
           ? { scanOffline: true, label: "startup (offline scan)", announce: true }
           : reason === "manual"
-            ? { scanConfig: true, label: "manual sync", announce: true }
+            ? // force: the user asked for this cycle, so it reports start/finish (and any conflict
+              // or queued-behind notice) whether or not verbose mode is on.
+              { scanConfig: true, label: "manual sync", announce: true, force: true }
             : reason === "poll"
               ? { scanConfig: true, label: "poll" }
               : { label: "edit save" };
@@ -688,8 +749,15 @@ export default class S3SyncPlugin extends Plugin {
       this.syncFailures = 0;
     } catch (err) {
       this.syncFailures += 1;
-      this.logger.error(`${reason} failed`, err);
-      if (this.syncFailures === 1 || this.syncFailures % 10 === 0) {
+      // A cycle the user triggered always reports its outcome — silence after "Sync now" reads as
+      // "nothing happened". Background cycles stay throttled, and a transient network failure (the
+      // usual post-resume one, which the next cycle recovers from) is only worth a WARN and a Notice
+      // once it has actually persisted.
+      const userInitiated = reason === "manual" || reason.startsWith("startup");
+      const quiet = !userInitiated && isTransientNetworkError(err);
+      this.logger.log(quiet ? "warn" : "error", `${reason} failed: ${String(err)}`);
+      const firstNotice = quiet ? TRANSIENT_QUIET_FAILURES : 1;
+      if (userInitiated || this.syncFailures === firstNotice || this.syncFailures % 10 === 0) {
         new Notice(`S3 sync failed (${reason}) — will keep retrying. ${String(err)}`);
       }
       // dirty set is preserved; next poll retries (§2.6)
