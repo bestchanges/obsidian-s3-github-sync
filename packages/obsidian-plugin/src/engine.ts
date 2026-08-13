@@ -558,7 +558,8 @@ export class SyncEngine {
   /** Request one reconcile cycle. Serialized: if a cycle is already running the request coalesces
    * into a single queued follow-up (so polls/edits can't pile up) and resolves when that cycle
    * completes. `fullPull` ignores echo suppression; `scanConfig`/`scanOffline` pick the pre-scan;
-   * `announce`/`label` drive the queued/started/done notices. */
+   * `announce`/`label` drive the queued/started/done notices, and `force` lifts them past the
+   * verbose gate — set it for user-initiated cycles ("Sync now"), which must always report. */
   async sync(
     opts: {
       fullPull?: boolean;
@@ -566,6 +567,7 @@ export class SyncEngine {
       scanOffline?: boolean;
       label?: string;
       announce?: boolean;
+      force?: boolean;
     } = {},
   ): Promise<void> {
     await this.request({
@@ -575,7 +577,7 @@ export class SyncEngine {
       fullPull: opts.fullPull ?? false,
       label: opts.label ?? "sync",
       announce: opts.announce ?? false,
-      force: false,
+      force: opts.force ?? false,
       forcePaths: [],
     });
   }

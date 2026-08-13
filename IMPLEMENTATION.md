@@ -685,7 +685,7 @@ overwrite lands on) exist in no revision anywhere. Obsidian itself calls the sam
 restoring a version. The restore path uses it too, so an unwanted restore is undoable in-app.
 
 > [!warning] This is the one private-API touch in the codebase
-> `app.internalPlugins.getEnabledPluginById("file-recovery").forceAdd(file, data)` is **not** public
+> `app.internalPlugins.getEnabledPluginById("file-recovery").forceAdd(path, data)` is **not** public
 > API. It is therefore fully feature-detected and wrapped so that **any** failure is logged and
 > swallowed — a missing or changed internal shape costs the extra safety net, never the sync (the
 > engine hook is contractually best-effort and a throwing implementation cannot block the write).
