@@ -373,21 +373,41 @@ resets per-cycle counters, and persists state only when something changed or the
 Echo suppression is **disabled during a full resync** (`excludeBy = undefined`) so a device can
 restore files *it* originally wrote but has since lost locally — the fix for "resync pulled 0 files".
 
-## 4.4 Change tracking & offline scan (`scanOffline`)
+## 4.4 Change tracking & offline scan (`scanForOfflineChanges`)
 
 Vault events (`create/modify/delete/rename`) feed the dirty set while running (5 s debounce before a
 push). A `rename` also calls `recordRename(old → new)`, so the next push tags the old path's tombstone
-with `renamedTo` (rename propagation, §2.8). Events don't fire while the app is closed, so `scanOffline` on startup diffs the vault against
-stored state: an mtime pre-filter picks candidates, the hash decides. New files join the dirty set;
-missing files are treated as offline deletes — **except** the mass-missing guard:
+with `renamedTo` (rename propagation, §2.8). Events don't fire while the app is closed, so the offline
+scan diffs the vault against stored state: an mtime pre-filter picks candidates, the hash decides. New
+files join the dirty set; missing files are treated as offline deletes — **except** the mass-missing
+guard.
 
-> [!note] Startup runs the pull before the scan
-> On mobile the offline scan takes minutes (it walks the whole vault + `.obsidian`), so startup
-> does a bare remote **pull first** and runs `scanOffline` **afterwards, in the background** — cloud
-> changes land in seconds instead of queueing behind the scan. This is safe because `applyRemote`
-> re-hashes each local file, so an offline edit that *also* changed remotely still conflict-merges
-> during the pull; only **pure-local** offline edits/deletes (invisible to the pull) wait for the
-> scan to push them up.
+> [!important] The scan runs OFF the reconcile lock, and off the launch path
+> The scan is split so its expensive part never starves the fast path:
+> - **Walk (`scanOfflineWalk`, off-lock):** stat/hashes the vault + `.obsidian` in `SCAN_CHUNK`-file
+>   batches, yielding to the event loop between batches. It only reads `state.files` and appends to
+>   the dirty set — the same off-lock path vault events already use — so poll/pull/push cycles keep
+>   running *during* the walk. Marking a file dirty is self-correcting: `push()` re-stats before
+>   tombstoning, so a file still present when the finalize runs is never wrongly deleted.
+> - **Finalize (`resolveMissing`, in a short locked cycle):** from the disk paths the walk saw,
+>   decides what's genuinely gone, then applies the guards below. Because the walk ran without the
+>   lock, it **re-verifies** each missing candidate against the live disk (`adapter.exists`, cheap —
+>   only the candidates) so a file a concurrent pull materialised mid-walk isn't tombstoned as a
+>   phantom delete.
+>
+> **Scheduling (per platform, `main.ts`):**
+> - **Startup** still does a bare remote **pull first** (`startup-pull`) so cloud changes land in
+>   seconds; the scan no longer rides the launch path at all.
+> - **Desktop:** the scan is armed `OFFLINE_SCAN_DELAY_MS` (30 s) after launch, keeping the first
+>   moments for the fast pull + quick-edit push.
+> - **Mobile:** no automatic scan — vault files are practically never edited outside the app, so a
+>   routine full-vault walk is pure cost. The **"Scan for external changes"** command runs it on
+>   demand (available on all platforms). To keep a *quick-edit-then-close* from stranding (the debounce
+>   may not have fired), the plugin **flushes the pending push on `visibilitychange → hidden` and
+>   `onunload`** (`flushPendingPush`), so the edit ships before the OS suspends the app.
+>
+> `resyncEverything` keeps its own **in-lock** walk (`scanOffline` = walk + `resolveMissing`, no
+> re-verify needed since nothing interleaves): it's a deliberate, rare, user-waits action.
 
 > [!important] Mass-missing guard (offline-delete safety)
 > If ≥ `MASS_MISSING_MIN` (10) tracked files are missing **and** they exceed
@@ -429,7 +449,7 @@ missing files are treated as offline deletes — **except** the mass-missing gua
 >   event (`recordRename` → `this.renames`), never from a directory-listing heuristic. `stat(oldPath)`
 >   of a case-only rename lies on a case-insensitive FS (it resolves to the new file), so the old
 >   listing-based `goneByCase` guard — which caused the loss — is **removed**.
-> - The **offline scan** (`scanOffline`, §4.4) matches disk files to tracked state by canonical
+> - The **offline scan** (`scanOfflineWalk`, §4.4) matches disk files to tracked state by canonical
 >   identity: a file present under a different case/NFC than its tracked key is re-cased and counted as
 >   present, never flagged "missing" and tombstoned. Without this, a device whose on-disk name and
 >   state key disagreed (e.g. it pulled a case-rename under old code) would tombstone the live note on
@@ -577,14 +597,15 @@ new edit.
   key prefix, poll interval (≥ 5 s), excluded folders, **max download size (MB)**, device id, verbose
   toggle, **Resync everything** (warning), **Export setup vault** (CTA).
 - **Commands**: `Sync now`, `Resync everything from S3`, `Pause/resume sync`,
+  `Scan for external changes` (§4.4; runs the offline scan on demand — the only scan trigger on mobile),
   `Export setup vault (for a new device)`,
   `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only),
   `Version history of this note` (§4.12; active-note only).
 - **File menu**: `Version history (S3 sync)` on any synced file (§4.12).
 - **CLI**: `vault-s3-sync:history --path <path> [--total]` (§4.12).
-- **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup
-  runs in two phases (§4.4): a bare remote **pull** first (fast — cloud changes land in seconds),
-  then it starts polling, then the full **`scanOffline`** catch-up in the background.
+- **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup does
+  a bare remote **pull** first (fast — cloud changes land in seconds), then starts polling. The offline
+  scan (§4.4) is decoupled from launch: armed 30 s later on **desktop**, on-demand only on **mobile**.
 
 ## 4.10 Starter-vault export (`starter.ts`)
 
@@ -945,6 +966,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 |---|---|---|
 | Poll interval | 15 s (min 5) | plugin `pollIntervalSec` |
 | Push debounce | 5 s | `PUSH_DEBOUNCE_MS` (main.ts) |
+| Offline-scan delay (desktop) | 30 s after launch | `OFFLINE_SCAN_DELAY_MS` (main.ts) |
+| Offline-scan yield batch | 250 files | `SCAN_CHUNK` (engine.ts) |
 | Transfer concurrency | 8 mobile / 50 desktop / 50 CI | settings / `CONCURRENCY` |
 | Download cap | 10 MB (0 = off) | plugin `maxDownloadMB` |
 | Union-merge cutoff | 5 MB / binary → LWW | `LWW_SIZE_LIMIT` (engine.ts) |

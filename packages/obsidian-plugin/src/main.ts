@@ -90,6 +90,10 @@ function deserializeState(c: CompactState): SyncState {
 }
 
 const PUSH_DEBOUNCE_MS = 5_000; // §2.2
+/** Desktop-only: how long after launch the offline scan is armed. Keeps the first moments of a
+ * session for the fast pull + quick-edit push; the scan (off the reconcile lock) then catches any
+ * edits made outside the app while it was closed (§4.4). */
+const OFFLINE_SCAN_DELAY_MS = 30_000;
 
 /** A poll tick that lands more than this many intervals past the previous one means the device was
  * frozen in between (mobile suspend, laptop sleep) — the WebView is running again but its network
@@ -128,6 +132,10 @@ export default class S3SyncPlugin extends Plugin {
   /** Armed catch-up cycle after a resume; non-null means one is already pending, so the drift check
    * and the visibility event coalesce into a single sync instead of racing each other. */
   private resumeTimer: number | null = null;
+  /** Pending desktop deferred-scan timer; null when none is armed (also nulled once it fires). */
+  private offlineScanTimer: number | null = null;
+  /** Single-flight guard so the deferred timer and a manual "Scan for external changes" can't overlap. */
+  private offlineScanRunning = false;
   private foreignStateDetected = false;
   /** True until this device has ever persisted sync state — i.e. no state file existed on load and
    * none was migrated. Gates the engine's first-run "remote wins on collision" bootstrap so a fresh
@@ -156,6 +164,11 @@ export default class S3SyncPlugin extends Plugin {
       id: "toggle-sync-pause",
       name: "Pause/resume sync",
       callback: () => void this.setSyncPaused(!this.settings.syncPaused),
+    });
+    this.addCommand({
+      id: "scan-external-changes",
+      name: "Scan for external changes",
+      callback: () => void this.runOfflineScan("manual"),
     });
     this.addCommand({
       id: "export-starter-vault",
@@ -236,7 +249,13 @@ export default class S3SyncPlugin extends Plugin {
     // startPolling has nothing to notice. Only act when a poll is actually due — a quick app switch
     // shouldn't trigger an extra cycle.
     this.registerDomEvent(document, "visibilitychange", () => {
-      if (document.visibilityState !== "visible" || this.pollTimer === null) return;
+      // Backgrounded/closed: flush any debounced edit now so a "quick edit then close" (common on
+      // mobile, inside the 5 s debounce) ships before the OS suspends the app rather than stranding.
+      if (document.visibilityState === "hidden") {
+        this.flushPendingPush();
+        return;
+      }
+      if (this.pollTimer === null) return;
       if (Date.now() - this.lastPollTick < this.pollIntervalMs) return;
       this.lastPollTick = Date.now();
       this.scheduleResumeSync();
@@ -247,9 +266,13 @@ export default class S3SyncPlugin extends Plugin {
   }
 
   onunload(): void {
+    // Best-effort flush before teardown so a debounced edit isn't lost when the app quits/reloads.
+    // Kick it BEFORE clearing pushTimer (flushPendingPush cancels the debounce and syncs now).
+    this.flushPendingPush();
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     if (this.pollTimer) window.clearInterval(this.pollTimer);
     if (this.resumeTimer) window.clearTimeout(this.resumeTimer);
+    this.clearOfflineScan();
     void this.logger?.flush(); // best-effort: land any buffered lines before teardown
   }
 
@@ -408,6 +431,9 @@ export default class S3SyncPlugin extends Plugin {
       new Notice("S3 Vault Sync resumed.");
       this.startPolling();
       void this.runSync("manual");
+      // Desktop: the deferred scan may have been skipped while paused (or never armed if paused at
+      // launch) — re-arm it so external-edit catch-up still happens once syncing is back on.
+      if (!Platform.isMobile) this.scheduleOfflineScan();
     }
   }
 
@@ -644,23 +670,91 @@ export default class S3SyncPlugin extends Plugin {
     if (this.settings.syncPaused) {
       new Notice("S3 Vault Sync is paused — resume it in settings when you're ready to sync.");
     }
-    // Startup order (§2.4): pull from S3 FIRST so remote changes land in seconds, THEN scan local
-    // files for offline edits/deletes. On mobile the offline scan takes minutes (it walks the whole
-    // vault + .obsidian, hashing candidates), so running it first — as one combined cycle used to —
-    // strands the cloud pull behind it, the opposite of what someone opening the app wants. It's
-    // safe to pull first: applyRemote re-hashes each local file, so an offline edit that ALSO changed
-    // remotely still conflict-merges in the pull; only PURE-local offline edits/deletes (which the
-    // pull can't see) wait for the scan below.
+    // Startup (§2.4, §4.4): pull from S3 FIRST so remote changes land in seconds. The offline scan is
+    // NOT on the launch path anymore — on desktop it's armed 30 s later (below), on mobile it's manual
+    // only — so nothing expensive stands between opening the app and seeing fresh notes / pushing a
+    // quick edit. Pulling first is safe regardless: applyRemote re-hashes each local file, so an
+    // offline edit that ALSO changed remotely still conflict-merges in the pull; only PURE-local
+    // offline edits/deletes (invisible to the pull) wait for the deferred/manual scan.
     if (!this.settings.syncPaused) new Notice("S3 Vault Sync: syncing from cloud…");
     await this.runSync("startup-pull"); // fast: pull remote deltas, announce started/done
     // New device (§4.2a): the pull refused to resolve local↔remote collisions on its own. Ask BEFORE
-    // anything else runs — the offline scan below would mark those same files dirty and push the
+    // anything else runs — the offline scan would later mark those same files dirty and push the
     // local copy over the cloud one, which is the decision we're trying not to make silently.
     if (this.engine.deferredConflicts().length && (await this.promptForeignState()) === "pause") {
       return; // paused by the answer; resuming from settings restarts polling and syncs
     }
     this.startPolling(); // poll loop live now — the app is responsive without waiting on the scan
-    void this.runSync("startup-scan"); // offline catch-up (§2.4) in the background; pushes local edits
+    // Offline catch-up (§2.4, §4.4) no longer rides the launch path. On mobile it's off entirely —
+    // vault files are practically never edited outside the app, so a routine full-vault scan is pure
+    // cost (use the "Scan for external changes" command for the rare exception). On desktop it's armed
+    // to run 30 s after launch, off the reconcile lock, so it can't delay fresh pulls or edit pushes.
+    if (this.foreignStateDetected) {
+      // A copied/restored vault (§4.2) must still reconcile disk against the adopted baselines on ANY
+      // platform: the scan's adopted-state guard restores tracked files this copy is missing rather
+      // than tombstoning them. Run it now (off-lock, so still non-blocking) instead of deferring.
+      void this.runOfflineScan("deferred");
+    } else if (!Platform.isMobile) {
+      this.scheduleOfflineScan();
+    }
+  }
+
+  /** Arm the deferred desktop offline scan. Idempotent while pending; a manual scan (or resync)
+   * cancels it via clearOfflineScan so the two can't both run. */
+  private scheduleOfflineScan(delayMs = OFFLINE_SCAN_DELAY_MS): void {
+    if (this.offlineScanTimer !== null) return;
+    this.offlineScanTimer = window.setTimeout(() => {
+      this.offlineScanTimer = null;
+      void this.runOfflineScan("deferred");
+    }, delayMs);
+  }
+
+  private clearOfflineScan(): void {
+    if (this.offlineScanTimer !== null) {
+      window.clearTimeout(this.offlineScanTimer);
+      this.offlineScanTimer = null;
+    }
+  }
+
+  /** Run the off-lock offline walk + its locked finalize. Skips when unconfigured or paused, and is
+   * single-flighted so the deferred timer and a manual command can't overlap. */
+  private async runOfflineScan(reason: "deferred" | "manual"): Promise<void> {
+    this.clearOfflineScan(); // a manual run satisfies (and cancels) any pending deferred one
+    if (!this.engine) {
+      if (reason === "manual") new Notice("S3 Vault Sync: not configured");
+      return;
+    }
+    if (this.settings.syncPaused) {
+      if (reason === "manual") new Notice("S3 Vault Sync is paused — resume it in settings to scan.");
+      return;
+    }
+    if (this.offlineScanRunning) return;
+    this.offlineScanRunning = true;
+    this.logger.info(`offline scan started (${reason})`);
+    try {
+      await this.engine.scanForOfflineChanges();
+      this.logger.info("offline scan finished");
+    } catch (err) {
+      this.logger.error("offline scan failed", err);
+      if (reason === "manual") new Notice(`S3 Vault Sync: scan failed — ${String(err)}`);
+    } finally {
+      this.offlineScanRunning = false;
+    }
+    void this.logger.uploadIfDirty();
+  }
+
+  /** Flush any debounced edit immediately (used when the app is backgrounded/closed). On mobile a
+   * "quick edit then close" can happen well inside the 5 s push debounce; without this the edit — which
+   * fires no vault event on the next launch and, with the scan off on mobile, has nothing to recover
+   * it — would sit unsynced until a manual sync. Cancels the debounce and pushes now. Best-effort:
+   * the OS may suspend before it lands, but the background window is normally enough for a small push. */
+  private flushPendingPush(): void {
+    if (!this.engine || this.settings.syncPaused) return;
+    if (this.pushTimer) {
+      window.clearTimeout(this.pushTimer);
+      this.pushTimer = null;
+    }
+    void this.runSync("background-flush");
   }
 
   /** Ask which side wins the collisions the first cycle on a new machine declined to resolve, then
@@ -743,7 +837,10 @@ export default class S3SyncPlugin extends Plugin {
               { scanConfig: true, label: "manual sync", announce: true, force: true }
             : reason === "poll"
               ? { scanConfig: true, label: "poll" }
-              : { label: "edit save" };
+              : reason === "background-flush"
+                ? // app backgrounded/closed: push the pending edit, don't scan (§4.4)
+                  { label: "background flush" }
+                : { label: "edit save" };
     try {
       await this.engine.sync(opts);
       this.syncFailures = 0;

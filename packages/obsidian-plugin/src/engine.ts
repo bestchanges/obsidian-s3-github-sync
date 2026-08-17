@@ -59,6 +59,10 @@ const LOG_LIST_CAP = 20;
  * short enough that a much-later legitimate revert-to-the-old-bytes isn't mistaken for a clobber and
  * that the tracking map can't accumulate. See pendingPull / phantomRevert (§2.6). */
 const PENDING_PULL_TTL_MS = 2 * 60 * 1000;
+/** Files stat/hashed per batch by the offline walk before it yields to the event loop. The walk runs
+ * OFF the reconcile lock (§4.4), so yielding keeps the mobile UI smooth AND lets a concurrent poll/pull
+ * cycle interleave — the whole point of decoupling the scan from the fast path. */
+const SCAN_CHUNK = 250;
 
 export interface FileState {
   hash: string;
@@ -176,6 +180,11 @@ interface CycleReq {
   /** arm the bootstrap guard for this cycle: every local↔remote collision is taken from remote
    * as-is instead of union-merged. Set when the user answers "cloud wins" to the new-device prompt. */
   takeRemoteOnCollision?: boolean;
+  /** finalize an off-lock offline walk (§4.4): `known` is the set of disk paths the walk saw, and
+   * this cycle resolves which tracked files are genuinely missing (with a fresh disk re-verify, since
+   * the walk ran without the lock). Set only by scanForOfflineChanges; it replaces the in-cycle
+   * scanOffline pre-scan for the deferred/manual path. */
+  resolveMissing?: { known: Set<string> };
 }
 
 export class SyncEngine {
@@ -438,9 +447,19 @@ export class SyncEngine {
     }
   }
 
-  /** Detect files edited while Obsidian was closed (§2.4): mtime pre-filter, hash decides.
-   * Runs inside the cycle lock (via a scanOffline request), so it can't race a concurrent sync. */
-  private async scanOffline(): Promise<void> {
+  /** Yield a turn to the event loop so a long walk can't monopolize the JS thread (mobile UI) or the
+   * reconcile lock. A macrotask (not a microtask) so pending timers/promises actually get to run. */
+  private yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  /** The expensive half of the offline scan (§2.4): walk the vault + config dir, marking changed files
+   * dirty (mtime pre-filter, hash decides). Yields every SCAN_CHUNK files. Callable OFF the reconcile
+   * lock — it only reads `state.files` and appends to `dirty` (the same off-lock path vault events
+   * already use), and marking dirty is self-correcting because push() re-stats before tombstoning.
+   * Returns the set of disk paths seen (canonicalised to the tracked name where a case/NFC variant was
+   * re-cased), which resolveMissing uses to decide what's genuinely gone. */
+  private async scanOfflineWalk(): Promise<Set<string>> {
     const known = new Set<string>();
     // Tracked notes by canonical identity — so a disk file that matches a tracked note only by
     // case/NFC is reconciled as THAT node instead of (a) pushing it as a new duplicate and (b)
@@ -448,18 +467,21 @@ export class SyncEngine {
     // exactly how a stale/mismatched device wiped a case-renamed note off every peer (§1.2a).
     const trackedByNode = new Map<string, string>();
     for (const k of Object.keys(this.state.files)) trackedByNode.set(canonicalKey(k), k);
+    let n = 0;
     for (const file of this.vault.getFiles()) {
       if (this.isExcluded(file.path)) continue;
       let p = file.path;
       const tracked = trackedByNode.get(canonicalKey(p));
       if (tracked && tracked !== p) {
         // Same node under a different case/NFC on disk → re-case to the tracked name so on-disk and
-        // state agree. Pure rename (never a delete); no-ops on failure.
+        // state agree. Pure rename (never a delete); no-ops on failure. Its own state mutation is
+        // guarded by the applying-set and no-ops when `from` is already gone, so it's safe off-lock.
         await this.renameLocalToCanonical(p, tracked);
         p = tracked;
       }
       known.add(p);
       await this.markIfChanged(p, file.stat.mtime);
+      if (++n % SCAN_CHUNK === 0) await this.yieldToEventLoop();
     }
     // getFiles() skips the config dir — walk it explicitly so ".obsidian" content is both detected
     // as dirty AND counted as "known" (otherwise every tracked config file would look deleted below).
@@ -470,19 +492,37 @@ export class SyncEngine {
         known.add(path);
         const stat = await this.vault.adapter.stat(path);
         if (stat) await this.markIfChanged(path, stat.mtime);
+        if (++n % SCAN_CHUNK === 0) await this.yieldToEventLoop();
       }
     } else {
       // Config dir unreadable: we can't confirm any config file is gone, so keep tracked config
       // paths out of the "missing" set below — don't tombstone what we simply couldn't see.
       for (const p of Object.keys(this.state.files)) if (this.isConfigPath(p)) known.add(p);
     }
+    return known;
+  }
+
+  /** The lock-sensitive half of the offline scan: from the disk paths the walk saw (`known`), decide
+   * which tracked files are genuinely gone, then apply the adopted-state and mass-missing guards. Runs
+   * inside the cycle lock (via runCycle). `reverify` re-checks each candidate against the live disk
+   * first — set it for the deferred/manual path whose walk ran OFF the lock, so a file a concurrent
+   * pull wrote during the walk isn't tombstoned as a phantom delete. The in-lock scanOffline path
+   * (resync) runs its walk under the lock with no interleaving, so it skips the re-verify. */
+  private async resolveMissing(known: Set<string>, reverify: boolean): Promise<void> {
     // A tracked path is "missing" only if NO disk file matches it even canonically — a case/NFC
     // variant present on disk keeps it alive (backstop for anything the re-case above didn't cover,
     // e.g. config files). Prevents the offline scan from tombstoning a note that is really still here.
     const knownCanonical = new Set([...known].map(canonicalKey));
-    const missing = Object.keys(this.state.files).filter(
+    let missing = Object.keys(this.state.files).filter(
       (p) => !known.has(p) && !knownCanonical.has(canonicalKey(p)) && !this.isExcluded(p),
     );
+    if (reverify && missing.length) {
+      // The walk ran off the lock; re-check each candidate against the live disk (cheap — only the
+      // candidates) so a file a concurrent pull materialised mid-walk isn't mistaken for a deletion.
+      const verified: string[] = [];
+      for (const p of missing) if (!(await this.vault.adapter.exists(p))) verified.push(p);
+      missing = verified;
+    }
     const total = Object.keys(this.state.files).length;
     if (this.adoptedState && missing.length) {
       // The baselines came from a copied/restored vault (§4.2) and this is the first scan that has
@@ -515,6 +555,35 @@ export class SyncEngine {
     } else {
       for (const p of missing) this.dirty.add(p); // small offline deletes propagate as tombstones
     }
+  }
+
+  /** In-lock offline scan (§2.4), used by resync: walk then resolve missing, both under the cycle
+   * lock, so there's no interleaving to re-verify against. The deferred/manual path splits these — the
+   * walk runs off the lock (scanForOfflineChanges) and only the resolve runs in a cycle. */
+  private async scanOffline(): Promise<void> {
+    const known = await this.scanOfflineWalk();
+    await this.resolveMissing(known, false);
+  }
+
+  /** Deferred / manual offline scan (§4.4). The expensive walk runs OFF the reconcile lock, so fresh
+   * remote pulls and quick-edit pushes are never starved behind it (the original startup-latency
+   * complaint); when the walk finishes, a short locked cycle resolves genuinely-missing files. Armed
+   * ~30 s after launch on desktop and on demand via the "Scan for external changes" command — the only
+   * trigger on mobile, where vault files are practically never edited outside the app so a routine
+   * scan is pure cost. */
+  async scanForOfflineChanges(): Promise<void> {
+    const known = await this.scanOfflineWalk(); // off-lock: does not block pull/push cycles
+    await this.request({
+      resetCursor: false,
+      scanOffline: false,
+      scanConfig: false,
+      fullPull: false,
+      label: "offline scan",
+      announce: false,
+      force: false,
+      forcePaths: [],
+      resolveMissing: { known },
+    });
   }
 
   /** User-triggered full reconcile: forget the cursor, re-pull the entire S3 state, re-scan all
@@ -617,6 +686,17 @@ export class SyncEngine {
       force: (base?.force ?? false) || add.force,
       forcePaths: [...(base?.forcePaths ?? []), ...add.forcePaths],
       takeRemoteOnCollision: (base?.takeRemoteOnCollision ?? false) || (add.takeRemoteOnCollision ?? false),
+      // Union the known-sets if two offline-scan finalizes ever coalesce (in practice only one is ever
+      // in flight); a larger `known` only ever keeps MORE files alive, never tombstones extra.
+      resolveMissing:
+        base?.resolveMissing || add.resolveMissing
+          ? {
+              known: new Set([
+                ...(base?.resolveMissing?.known ?? []),
+                ...(add.resolveMissing?.known ?? []),
+              ]),
+            }
+          : undefined,
     };
   }
 
@@ -665,7 +745,8 @@ export class SyncEngine {
       this.state.files = {};
       this.dirty.clear();
     }
-    if (req.scanOffline) await this.scanOffline();
+    if (req.resolveMissing) await this.resolveMissing(req.resolveMissing.known, true);
+    else if (req.scanOffline) await this.scanOffline();
     else if (req.scanConfig) await this.scanConfigDir();
 
     this.prunePendingPulls();
