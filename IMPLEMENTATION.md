@@ -60,6 +60,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/engine.ts` | `SyncEngine`: pull/push, merge, exclusions, offline scan, download cap, resync. |
 | `packages/obsidian-plugin/src/main.ts` | Plugin lifecycle, persistence, device identity, settings UI, commands. |
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
+| `packages/obsidian-plugin/src/poll-schedule.ts` | Pure adaptive-poll tier selection (§4.9a) — no DOM, unit-tested. |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/history-modal.ts` | `VersionHistoryModal`: per-note revision list, diff, restore (§4.12). |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
@@ -720,9 +721,45 @@ new edit.
   `Version history of this note` (§4.12; active-note only).
 - **File menu**: `Version history (S3 sync)` on any synced file (§4.12).
 - **CLI**: `vault-s3-sync:history --path <path> [--total]` (§4.12).
-- **Polling**: `LIST` every `pollIntervalSec` (default 15). Once the vault index is ready, startup does
-  a bare remote **pull** first (fast — cloud changes land in seconds), then starts polling. The offline
-  scan (§4.4) is decoupled from launch: armed 30 s later on **desktop**, on-demand only on **mobile**.
+- **Polling**: one `LIST` per tick, on the adaptive schedule below. Once the vault index is ready,
+  startup does a bare remote **pull** first (fast — cloud changes land in seconds), then starts polling.
+  The offline scan (§4.4) is decoupled from launch: armed 30 s later on **desktop**, on-demand only on
+  **mobile**.
+
+## 4.9a Adaptive polling (`poll-schedule.ts`, `startPolling`)
+
+`pollIntervalSec` (default 15) is a **baseline**, not a fixed rate. A single interval is wrong in both
+directions: too slow in the moment you switch devices, and pure waste on a vault nobody is looking at
+(~175k LIST/device/month, ≈$0.88, almost all against an unchanged bucket). Three inputs move it:
+
+| Tier | When | Delay |
+|---|---|---|
+| **ACTIVE** | within `ACTIVE_WINDOW_MS` (2 min) of the last movement | `min(baseline, ACTIVE_POLL_MS)` = 5 s |
+| **baseline** | foreground, nothing moving | `pollIntervalSec` |
+| **BACKGROUND** | `document.visibilityState === "hidden"` | `max(baseline × 4, 60 s)` |
+
+- **"Movement"** is a local edit (`schedulePush`) or a cycle that persisted state (`onStateChanged`,
+  which the engine calls only when something transferred or the cursor advanced, §4.3). Changes
+  cluster, so a device that just saw one is likely to see another — and that is exactly when a stale
+  view gets noticed.
+- The ACTIVE tier is a **floor, never an override**: `min` against the baseline means a user who
+  already polls faster keeps their cadence.
+- **Return to device** (`onReturnToDevice`) syncs *immediately* rather than waiting out the pending
+  tick — the latency people actually notice. It is bound to `window.focus`, because desktop
+  app-switching never changes `visibilityState`; a gap long enough to look like a suspend is routed
+  through the resume grace instead (§4.9 resume handling), and the trigger is throttled by
+  `FOCUS_SYNC_MIN_GAP_MS` (5 s) so alt-tabbing doesn't cost a cycle each time.
+- The loop is a **self-rescheduling `setTimeout`**, not `setInterval`: each tick re-picks its tier, and
+  `startPolling()` stays idempotent (it clears the pending tick first) so settings changes, resumes and
+  visibility flips can all re-arm freely.
+- Tier selection lives in **`poll-schedule.ts`** — pure, no DOM, unit-tested (`test/poll-schedule.test.ts`).
+
+> [!note] Every tier is a hint
+> A tick that never fires costs **latency, never correctness**: the cycle it would have started is the
+> same one the next tick, a focus, or an edit will start. That invariant is what lets the schedule be
+> tuned freely — and it is the same contract the proposed push notifications rely on
+> ([[Change Notification Design.md|Change Notification Design.md]], Tier 1: publisher-announce over
+> MQTT, sub-second convergence at ~¼ the request cost).
 
 ## 4.10 Starter-vault export (`starter.ts`)
 
@@ -993,7 +1030,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `prefix` | `""` | must equal git-sync `PREFIX` |
 | `deviceId` | minted `<label>-<suffix>` | writer id; auto (mobile suffix = localStorage anchor) |
 | `machineFingerprint` | recomputed | copy detection; never trusted from disk (mobile: `anchor:`, not the UA) |
-| `pollIntervalSec` | 15 | min 5 |
+| `pollIntervalSec` | 15 | min 5. **Baseline** of the adaptive schedule, not a fixed rate (§4.9a) |
 | `excludedFolders` | `[]` | local-only until re-enabled |
 | `maxDownloadMB` | **10** | 0 = no limit |
 | `verbose` | false | notice on every active cycle |
@@ -1081,7 +1118,10 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 
 | Constant | Value | Where |
 |---|---|---|
-| Poll interval | 15 s (min 5) | plugin `pollIntervalSec` |
+| Poll interval (**baseline**, §4.9a) | 15 s (min 5) | plugin `pollIntervalSec` |
+| Poll — ACTIVE tier / window | 5 s / 2 min | `ACTIVE_POLL_MS` / `ACTIVE_WINDOW_MS` (poll-schedule.ts) |
+| Poll — BACKGROUND tier | baseline × 4, floor 60 s | `BACKGROUND_POLL_FACTOR` / `BACKGROUND_POLL_MIN_MS` |
+| Return-to-device sync throttle | 5 s | `FOCUS_SYNC_MIN_GAP_MS` (main.ts) |
 | Push debounce | 5 s | `PUSH_DEBOUNCE_MS` (main.ts) |
 | Offline-scan delay (desktop) | 30 s after launch | `OFFLINE_SCAN_DELAY_MS` (main.ts) |
 | Offline-scan yield batch | 250 files | `SCAN_CHUNK` (engine.ts) |

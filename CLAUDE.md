@@ -16,6 +16,9 @@ two clients — a GitHub Actions **git-sync** job and an **Obsidian plugin** —
   [packages/mcp-server/README.md](packages/mcp-server/README.md) — component details;
   installed via `scripts/install/05-create-mcp-server.sh`.
 - **Infra bootstrap (bucket, CORS, OIDC/IAM, workflow install):** [SETUP.md](SETUP.md).
+- **Change delivery (adaptive polling as built; MQTT push proposed):**
+  [Change Notification Design.md](Change%20Notification%20Design.md) — IMPLEMENTATION.md §4.9a is the
+  shipped half.
 - **Backups (external drive + B2 + Google Drive, restic, restore/DR):** [BACKUP.md](BACKUP.md) —
   design + runbook; tooling in `scripts/backup/` and `templates/s3-backup.yml`.
 - **Top-level tour:** [README.md](README.md).
