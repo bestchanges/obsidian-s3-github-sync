@@ -426,6 +426,43 @@ extra LIST is gated on a non-empty dirty set, so an idle poll (the common case) 
 one LIST. What remains after this is the window between that LIST and the CAS PUT, i.e. genuinely
 concurrent writers, which is what `onLostRace` handles (§2.3).
 
+### Chunked, resumable cycles
+
+A bulk catch-up used to be one indivisible unit of work. `lastSyncedRev` advanced only after the last
+entry was applied, so an interruption anywhere — killed app, closed laptop, the stall watchdog —
+discarded *all* of it and the next attempt started from zero. A queued "Sync now" waited behind the
+whole thing.
+
+The pull now applies entries in **revision order**, in chunks of `CYCLE_CHUNK_FILES` (500, overridable
+per-engine via `chunkFiles` like `concurrency`), committing the cursor and persisting state at each
+boundary:
+
+- **Chunks are cut on a revision boundary, never mid-revision.** `lastSyncedRev` is a single integer;
+  it may only advance to a rev whose entries are *all* applied. A revision larger than the cap still
+  goes in whole, so one oversized delta makes progress rather than deadlocking.
+- **Live entries still precede tombstones within each chunk.** A rename emits both sides in one delta,
+  so both always land in the same chunk and the §2.8 ordering survives chunking intact.
+- **The cold path chunks too.** Entries folded out of a snapshot carry their authoring `rev`, and the
+  cold path selects on `e.rev > lastSyncedRev`, so a partial cursor correctly narrows what the next
+  pass reconsiders.
+- **The last chunk takes `targetRev`**, not the highest rev that carried an applicable entry — revs
+  this device authored, or ones filtered out as excluded/unsafe, would otherwise be re-listed forever.
+
+If a request is queued when a chunk finishes, the cycle **hands the lock over at that boundary**
+(logged as `catch-up paused at rev N`) and records a `catch-up` follow-up, which `runLoop` runs once
+the queue drains — so an interrupted catch-up finishes on its own rather than waiting for the next
+poll. A yielding cycle deliberately **does not push**: its cursor sits at a boundary with revisions
+still unapplied, so pushing would claim a rev the journal already holds and CAS-walk through
+everything it just chose to defer. Not calling push is what preserves the dirty set; the resumed
+cycle publishes it against a complete baseline moments later. The follow-up carries `fullPull` over,
+since dropping it mid-resync would silently stop restoring files this device itself once wrote.
+
+The push splits the same way — one delta per batch, state committed between — so a bulk upload that
+fails partway keeps everything already published instead of redoing it. Only the not-yet-published
+paths are requeued; re-listing committed ones would just make the next cycle re-hash files it knows
+are current. An ordinary cycle is far below the cap and still produces exactly one delta and one
+persist, unchanged.
+
 ### Stall reclamation (the single-flight lock)
 
 One cycle runs at a time; concurrent triggers coalesce into a single queued slot. That makes a wedged
