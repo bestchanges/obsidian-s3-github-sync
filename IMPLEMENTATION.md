@@ -947,10 +947,18 @@ MCP server   ─┘   (then announce)      └─→ device C ─→ …
 > can be bolted onto a protocol whose expensive bugs have all been correctness bugs. Design
 > rationale, cost model and rejected alternatives: [[Change Notification Design.md|Change Notification Design.md]].
 
-**Setup** is `scripts/install/06-enable-push-notifications.sh` (resolves the ATS endpoint, grants
-`iot:Connect`/`Subscribe`/`Receive`/`Publish` scoped to the one topic, optionally grants publish to
-the git-sync OIDC role). Then set the endpoint per device, and `S3_SYNC_IOT_ENDPOINT` in the content
-repo if git-sync should announce too.
+**Setup.** New deployments get the grant at user-creation time (`02-create-user.sh` writes the
+inline `iot` policy); existing ones run `06-enable-push-notifications.sh`, which resolves the ATS
+endpoint (or takes `--endpoint`, since discovery needs `iot:DescribeEndpoint` an S3/IAM-scoped
+operator may not have), re-writes that same policy, and grants `iot:Publish` to the git-sync OIDC
+role. Then set the endpoint per device, and `S3_SYNC_IOT_ENDPOINT` in the content repo if git-sync
+should announce too.
+
+> [!note] Both policies are scoped **per user**, not per vault
+> `vaultsync/<user>-vaults-*/rev`. They attach by name (`iot`, `iot-publish`) to per-*user*
+> identities, so a per-vault document would be silently overwritten — and push quietly broken for
+> the earlier vault — the moment a second vault was set up. The wildcard is no wider in practice:
+> the identity it attaches to already has S3 access to every one of that user's vaults.
 
 ---
 
@@ -1134,9 +1142,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
   `.github/workflows/s3-sync.yml`; it checks out the content repo (full history) **and** the tool
   repo into `.sync-tool/`, then runs `tsx packages/git-sync/src/main.ts`.
 - **Change notifications (optional, §4.14)** — AWS **IoT Core**, no resources to create: an inline
-  `iot` policy on the plugin IAM user (connect/subscribe/receive/publish, scoped to one topic) and
-  an `iot:Publish` grant on the git-sync OIDC role. Installed by
-  `scripts/install/06-enable-push-notifications.sh`.
+  `iot` policy on the plugin IAM user (connect/subscribe/receive/publish) and an `iot:Publish` grant
+  on the git-sync OIDC role, both scoped to `vaultsync/<user>-vaults-*/rev`. Written by
+  `02-create-user.sh` for new users, or `06-enable-push-notifications.sh` for existing ones.
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
 - **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
   role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`

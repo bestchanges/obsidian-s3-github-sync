@@ -65,3 +65,47 @@ confirm() {
 run() {
   if [ "${DRY_RUN:-0}" = "1" ]; then printf '%s[dry-run]%s %s\n' "$Y" "$Z" "$*"; else "$@"; fi
 }
+
+# ── change notifications (IMPLEMENTATION.md §4.14) ───────────────────────────
+# The region every script should use: .env first, then the environment, then the CLI default.
+# A silent fall-back to us-east-1 would mint endpoints and policy ARNs in a region where the
+# grants don't apply, so an unresolvable region is a hard error at the call site.
+vault_region() { printf '%s' "${VAULT_REGION:-${AWS_REGION:-$(aws configure get region || true)}}"; }
+
+# MQTT topic for one vault. MUST match revTopic() in packages/obsidian-plugin/src/notify.ts and
+# packages/git-sync/src/notify.ts — the three are one wire contract (see §4.14, §6 lockstep).
+vault_topic() {
+  local slug; slug="$(printf '%s' "$(vault_prefix "$1" "$2")" |
+    sed -e 's/[^A-Za-z0-9_-]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//')"
+  printf 'vaultsync/%s/rev' "${slug:-default}"
+}
+
+# Topic ARN pattern covering EVERY vault of one user: vaultsync/<user>-vaults-*/rev
+#
+# Deliberately wildcarded rather than per-vault. These policies are attached by name ('iot' on the
+# plugin user, 'iot-publish' on the sync role) to per-USER identities, so a per-vault document would
+# be overwritten the moment a second vault was set up — silently killing push for the first. The
+# wildcard is also no wider in practice: the identity it is attached to already has S3 access to
+# every one of that user's vaults.
+vault_topic_arn_pattern() { # <user> <region> <account> [topic|topicfilter]
+  printf 'arn:aws:iot:%s:%s:%s/vaultsync/%s-vaults-*/rev' "$2" "$3" "${4:-topic}" "$1"
+}
+
+# Inline IAM policy granting a plugin device connect/subscribe/receive/publish on that user's
+# topics. Written identically by 02 (at user creation) and 06 (when enabling push on an existing
+# deployment), so re-running either is a no-op rather than a fight.
+vault_iot_policy_json() { # <user> <region> <account>
+  cat <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Sid": "Connect", "Effect": "Allow", "Action": "iot:Connect",
+      "Resource": "arn:aws:iot:$2:$3:client/*" },
+    { "Sid": "Subscribe", "Effect": "Allow", "Action": "iot:Subscribe",
+      "Resource": "$(vault_topic_arn_pattern "$1" "$2" "$3" topicfilter)" },
+    { "Sid": "ReceivePublish", "Effect": "Allow", "Action": ["iot:Receive", "iot:Publish"],
+      "Resource": "$(vault_topic_arn_pattern "$1" "$2" "$3" topic)" }
+  ]
+}
+JSON
+}

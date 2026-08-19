@@ -61,6 +61,22 @@ cat >"$POL" <<JSON
 JSON
 run aws iam put-user-policy --user-name "$IAM_USER" --policy-name s3 --policy-document "file://$POL"
 
+# --- change notifications (§4.14) -------------------------------------------
+# Granted up front rather than in 06, so instant sync is a per-device toggle later instead of an
+# IAM round-trip. Costs nothing while unused: with pushNotifications off the plugin never connects,
+# and IoT Core bills only live connections and messages. Scoped to this user's own topics.
+REGION="$(vault_region)"
+if [ -n "$REGION" ]; then
+  ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+  log "inline policy 'iot' → change notifications on vaultsync/$USER_NS-vaults-*/rev (§4.14)"
+  IOTPOL="$(mktemp)"
+  vault_iot_policy_json "$USER_NS" "$REGION" "$ACCOUNT" >"$IOTPOL"
+  run aws iam put-user-policy --user-name "$IAM_USER" --policy-name iot --policy-document "file://$IOTPOL"
+  rm -f "$IOTPOL"
+else
+  warn "no region resolved — skipping the 'iot' policy (run 06-enable-push-notifications.sh later)"
+fi
+
 # --- access key -------------------------------------------------------------
 if [ -s "$CREDS" ] && [ "$ROTATE" != 1 ]; then
   log "access key already saved → $CREDS (use --rotate to replace)"

@@ -59,10 +59,14 @@ design and details: [`packages/mcp-server/README.md`](../../packages/mcp-server/
 ```bash
 ./06-enable-push-notifications.sh --vault work --role vault-sync-work   # IAM grants + endpoint
 ```
-Creates nothing: IoT Core needs no resources for a plain MQTT topic, so this only attaches an `iot`
-policy to the plugin user (scoped to `vaultsync/<slug>/rev`) and an `iot:Publish` grant to the
-git-sync role, then prints the ATS endpoint to paste into each device's settings and
-`S3_SYNC_IOT_ENDPOINT`. Safe to skip — sync falls back to polling. Details: IMPLEMENTATION.md §4.14.
+Creates nothing: IoT Core needs no resources for a plain MQTT topic. It attaches an `iot` policy to
+the plugin user and an `iot:Publish` grant to the git-sync role — both scoped to
+`vaultsync/<user>-vaults-*/rev`, i.e. every vault of that user, because these attach by name to
+per-user identities and a per-vault document would overwrite the previous vault's. Then prints the
+ATS endpoint for each device's settings and `S3_SYNC_IOT_ENDPOINT`. `02-create-user.sh` already
+writes the same plugin-user policy for new users, so this is mainly for existing deployments.
+Add `--endpoint <host>` if the operator lacks `iot:DescribeEndpoint`. Safe to skip — sync falls back
+to polling. Details: IMPLEMENTATION.md §4.14.
 
 Add a second vault for the same user: just `03` (optional) + `04` with a new `--vault`.
 Every script takes `--dry-run` (print, don't mutate) and `--yes` (skip confirmations).
