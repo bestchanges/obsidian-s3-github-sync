@@ -25,6 +25,11 @@ export const ACTIVE_WINDOW_MS = 120_000;
 export const BACKGROUND_POLL_FACTOR = 4;
 /** …with this floor, so a short baseline can't keep a backgrounded device chatty. */
 export const BACKGROUND_POLL_MIN_MS = 60_000;
+/** Idle baseline while a change-notification socket is live (§4.14): push carries the latency, so
+ * the poll drops to a safety net. Deliberately keyed on the socket being connected *right now*,
+ * not on the setting being enabled — the moment the socket drops, the next tick re-tightens on its
+ * own with nothing to remember and nothing to reset. */
+export const PUSH_CONNECTED_POLL_MS = 60_000;
 
 export interface PollTierInput {
   /** The configured baseline in ms (already clamped to the 5 s settings floor). */
@@ -33,13 +38,24 @@ export interface PollTierInput {
   hidden: boolean;
   /** Time since the last observed movement; `Infinity` when nothing has moved this session. */
   msSinceActivity: number;
+  /** A change-notification socket is connected *at this moment* (§4.14). */
+  pushConnected?: boolean;
 }
 
 /** The delay the next poll tick should use. */
-export function pollDelayMs({ baseMs, hidden, msSinceActivity }: PollTierInput): number {
+export function pollDelayMs({
+  baseMs,
+  hidden,
+  msSinceActivity,
+  pushConnected = false,
+}: PollTierInput): number {
   if (hidden) return Math.max(baseMs * BACKGROUND_POLL_FACTOR, BACKGROUND_POLL_MIN_MS);
   // Math.min against the baseline: a user who already polls faster than ACTIVE_POLL_MS keeps their
   // cadence — the "fast" tier must never slow a device down.
   if (msSinceActivity < ACTIVE_WINDOW_MS) return Math.min(baseMs, ACTIVE_POLL_MS);
+  // Push is live: the poll is now a safety net for dropped notifications, not the delivery path.
+  // The ACTIVE tier above still wins, because a burst of local edits is about pushing, not
+  // listening — and `max` means a user who deliberately set a *longer* baseline keeps it.
+  if (pushConnected) return Math.max(baseMs, PUSH_CONNECTED_POLL_MS);
   return baseMs;
 }

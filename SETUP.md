@@ -124,7 +124,29 @@ It provisions role + function + URL + token idempotently and prints a ready-to-p
 details: [packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
 [scripts/install/README.md](scripts/install/README.md).
 
-## 8. Backups (recommended)
+## 8. Instant sync (optional)
+
+Cuts cross-device latency from "next poll" to well under a second, and *lowers* request cost. AWS
+IoT Core needs no resources created — only permissions — so this is a grant + two settings:
+
+```bash
+scripts/install/06-enable-push-notifications.sh --vault <name> [--role <git-sync OIDC role>]
+```
+
+It prints the IoT **ATS data endpoint**. Then:
+
+- **each device** → plugin settings → *Instant sync (push notifications)* **on**, *IoT endpoint* =
+  that host;
+- **content repo** (so git-sync announces too) → `gh variable set S3_SYNC_IOT_ENDPOINT --body '<endpoint>'`.
+
+Every writer announces the revision it just appended; subscribers run their ordinary sync cycle.
+A notification is only a hint — polling continues as the safety net, so a dropped message or a
+blocked WebSocket costs latency, never data. Verify with plugin logging on two devices: edit a note
+on one and look for `notify: rev <n> from <device>` on the other. Behaviour, guarantees and tuning:
+IMPLEMENTATION.md §4.14; rationale and rejected alternatives:
+[Change Notification Design.md](Change%20Notification%20Design.md).
+
+## 9. Backups (recommended)
 
 The vault lives in S3, the GitHub repo, and every device — but all three are **one live-synced
 failure domain**, so none is a backup (a bad merge, mass delete, or leaked key propagates to all).

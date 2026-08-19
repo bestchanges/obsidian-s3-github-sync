@@ -7,6 +7,7 @@ import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
 import { pollDelayMs } from "./poll-schedule";
+import { ChangeNotifier, revTopic } from "./notify";
 import { decodeJsonGz, encodeJsonGz, readFileHistory } from "@vault-sync/core";
 
 interface Settings {
@@ -36,6 +37,14 @@ interface Settings {
    * from any device's settings). Off by default: no disk writes, no PUTs, and no note paths leave
    * the device until enabled. Toggle it on to investigate a sync issue. */
   loggingEnabled: boolean;
+  /** Subscribe to change notifications over AWS IoT Core so peers' revisions arrive in
+   * milliseconds instead of at the next poll (§4.14). Off by default — it needs `iotEndpoint` and
+   * the matching IAM grants; with it off the plugin behaves exactly as before. */
+  pushNotifications: boolean;
+  /** IoT ATS data endpoint host for this account/region, e.g.
+   * `a1b2c3d4e5f6g7.iot.eu-central-1.amazonaws.com` (`aws iot describe-endpoint
+   * --endpoint-type iot:Data-ATS`). Only used when pushNotifications is on. */
+  iotEndpoint: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -54,6 +63,8 @@ const DEFAULT_SETTINGS: Settings = {
   desktopConcurrency: 50,
   syncPaused: false,
   loggingEnabled: false,
+  pushNotifications: false,
+  iotEndpoint: "",
 };
 
 interface PersistedData {
@@ -140,6 +151,8 @@ export default class S3SyncPlugin extends Plugin {
   /** Wall clock of the last observed movement (local edit, or a cycle that changed state). Drives
    * the ACTIVE poll tier; 0 means "nothing yet this session", which reads as idle. */
   private lastActivityAt = 0;
+  /** Change-notification socket (§4.14); null when the feature is off or unconfigured. */
+  private notifier: ChangeNotifier | null = null;
   /** Armed catch-up cycle after a resume; non-null means one is already pending, so the drift check
    * and the visibility event coalesce into a single sync instead of racing each other. */
   private resumeTimer: number | null = null;
@@ -264,8 +277,12 @@ export default class S3SyncPlugin extends Plugin {
       // mobile, inside the 5 s debounce) ships before the OS suspends the app rather than stranding.
       if (document.visibilityState === "hidden") {
         this.flushPendingPush();
+        // Drop the notification socket: mobile is about to be suspended and the connection dies
+        // with it anyway, so holding it open only bills connection-minutes for a dead link (§4.14).
+        this.notifier?.stop();
         return;
       }
+      this.rebuildNotifier(); // back in the foreground: re-establish the socket
       if (this.pollTimer === null) return;
       // Visible again: re-arm so the loop leaves the BACKGROUND tier immediately rather than after
       // one more long tick (§4.9a). Only sync from here when a poll is genuinely due — a quick app
@@ -293,6 +310,7 @@ export default class S3SyncPlugin extends Plugin {
     this.flushPendingPush();
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     this.polling = false;
+    this.notifier?.stop();
     if (this.pollTimer) window.clearTimeout(this.pollTimer); // self-rescheduling timeout, not an interval
     if (this.resumeTimer) window.clearTimeout(this.resumeTimer);
     this.clearOfflineScan();
@@ -448,6 +466,7 @@ export default class S3SyncPlugin extends Plugin {
     this.settings.syncPaused = paused;
     await this.persistSettings();
     this.logger.info(paused ? "sync paused by user" : "sync resumed by user");
+    this.rebuildNotifier(); // pausing drops the socket; resuming re-establishes it (§4.14)
     if (paused) {
       new Notice("S3 Vault Sync paused — no syncing until you resume.");
     } else {
@@ -671,6 +690,15 @@ export default class S3SyncPlugin extends Plugin {
         // store first, so a bad remote overwrite is recoverable in-app even on a device that never
         // pushed those bytes (the journal only has what reached S3).
         onBeforeOverwrite: (path) => this.recoverySnapshot(path),
+        // Announce our own revision so peers pull it now rather than at their next tick (§4.14).
+        // Wrapped: the delta is already durable, so nothing about announcing it may throw here.
+        onPublished: (rev) => {
+          try {
+            this.notifier?.publish(rev, this.settings.deviceId);
+          } catch (err) {
+            this.logger.warn(`notify: announce rev ${rev} failed: ${String(err)}`);
+          }
+        },
         onStateChanged: async (state) => {
           // The engine persists only when a cycle actually moved something or the cursor advanced
           // (§4.3), which makes this the cheapest honest "the vault is in motion" signal available —
@@ -712,6 +740,7 @@ export default class S3SyncPlugin extends Plugin {
       return; // paused by the answer; resuming from settings restarts polling and syncs
     }
     this.startPolling(); // poll loop live now — the app is responsive without waiting on the scan
+    this.rebuildNotifier(); // and subscribe for peers' revisions, if push is configured (§4.14)
     // Offline catch-up (§2.4, §4.4) no longer rides the launch path. On mobile it's off entirely —
     // vault files are practically never edited outside the app, so a routine full-vault scan is pure
     // cost (use the "Scan for external changes" command for the rare exception). On desktop it's armed
@@ -838,7 +867,41 @@ export default class S3SyncPlugin extends Plugin {
       baseMs: Math.max(5, this.settings.pollIntervalSec) * 1000,
       hidden: document.visibilityState === "hidden",
       msSinceActivity: this.lastActivityAt ? Date.now() - this.lastActivityAt : Infinity,
+      pushConnected: this.notifier?.connected() ?? false,
     });
+  }
+
+  // ------------------------------------------------- change notifications (§4.14)
+  /** (Re)build the notifier from current settings. Torn down and recreated rather than mutated, so
+   * changing the endpoint or credentials can't leave a socket signed with the old ones. */
+  rebuildNotifier(): void {
+    this.notifier?.stop();
+    this.notifier = null;
+    const s = this.settings;
+    // Paused sync has nothing to react to (runSync no-ops), so don't hold a socket open for it.
+    if (!s.pushNotifications || !s.iotEndpoint || !this.configured() || s.syncPaused) return;
+    this.notifier = new ChangeNotifier(
+      {
+        endpoint: s.iotEndpoint,
+        region: s.region,
+        accessKeyId: s.accessKeyId,
+        secretAccessKey: s.secretAccessKey,
+        deviceId: s.deviceId,
+        topic: revTopic(s.prefix),
+      },
+      {
+        // A peer published `rev`. Run the ordinary cycle — it coalesces into the engine's
+        // single-flight queue like any other trigger, and re-reads the journal itself, so a
+        // notification for a revision we already have costs one LIST and nothing else.
+        onRev: (rev, by) => {
+          this.logger.info(`notify: rev ${rev} from ${by}`);
+          this.lastActivityAt = Date.now();
+          void this.runSync("notified");
+        },
+        log: (level, msg) => this.logger.log(level, msg),
+      },
+    );
+    this.notifier.start();
   }
 
   /** The user just came back to this device (desktop window focus, or the app returning to the
@@ -898,8 +961,12 @@ export default class S3SyncPlugin extends Plugin {
             ? // force: the user asked for this cycle, so it reports start/finish (and any conflict
               // or queued-behind notice) whether or not verbose mode is on.
               { scanConfig: true, label: "manual sync", announce: true, force: true }
-            : reason === "poll" || reason === "focus"
-              ? { scanConfig: true, label: reason === "focus" ? "return to device" : "poll" }
+            : reason === "notified"
+              ? // A peer announced a revision (§4.14): pull it, but skip the config walk — this is
+                // a targeted "catch up now", and the poll still does the periodic scan.
+                { label: "notified" }
+              : reason === "poll" || reason === "focus"
+                ? { scanConfig: true, label: reason === "focus" ? "return to device" : "poll" }
               : reason === "background-flush"
                 ? // app backgrounded/closed: push the pending edit, don't scan (§4.4)
                   { label: "background flush" }
@@ -989,6 +1056,9 @@ class S3SyncSettingTab extends PluginSettingTab {
       await this.plugin.persistSettings();
       this.plugin.rebuildEngine();
       this.plugin.startPolling();
+      // Credentials, region, prefix and the endpoint all feed the notification socket — rebuild it
+      // so a changed setting can't leave a connection signed with the previous one (§4.14).
+      this.plugin.rebuildNotifier();
     };
 
     new Setting(containerEl)
@@ -1027,6 +1097,29 @@ class S3SyncSettingTab extends PluginSettingTab {
           const n = Number(v);
           if (Number.isFinite(n) && n >= 5) { s.pollIntervalSec = n; await save(); }
         }));
+    new Setting(containerEl)
+      .setName("Instant sync (push notifications)")
+      .setDesc(
+        "Subscribe to an AWS IoT Core topic so changes from other devices arrive in under a " +
+          "second instead of at the next poll. Needs the IoT endpoint below and the matching IAM " +
+          "permissions. Polling continues either way — a missed notification only costs latency.",
+      )
+      .addToggle((t) =>
+        t.setValue(s.pushNotifications).onChange(async (v) => {
+          s.pushNotifications = v;
+          await save();
+        }));
+    new Setting(containerEl)
+      .setName("IoT endpoint")
+      .setDesc("aws iot describe-endpoint --endpoint-type iot:Data-ATS")
+      .addText((t) =>
+        t
+          .setPlaceholder("xxxxxxxx-ats.iot.<region>.amazonaws.com")
+          .setValue(s.iotEndpoint)
+          .onChange(async (v) => {
+            s.iotEndpoint = v.trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+            await save();
+          }));
     new Setting(containerEl)
       .setName("Excluded folders")
       .setDesc("One per line. Local-only until re-enabled; re-enabling merges local and remote (union).")

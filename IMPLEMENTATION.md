@@ -56,11 +56,14 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/git-sync/src/main.ts` | The whole git-sync algorithm (state, diff, reconcile, compaction, push). |
 | `packages/git-sync/src/git.ts` | Thin `git` CLI wrapper via `execa`. |
 | `packages/git-sync/src/s3-adapter.ts` | `StorageAdapter` over AWS SDK v3. |
+| `packages/git-sync/src/notify.ts` | `createRevPublisher`: announce a rev over IoT Data (HTTPS). Shared with mcp-server (§4.14). |
 | `packages/obsidian-plugin/` | Vault ⇄ S3, desktop + mobile. |
 | `packages/obsidian-plugin/src/engine.ts` | `SyncEngine`: pull/push, merge, exclusions, offline scan, download cap, resync. |
 | `packages/obsidian-plugin/src/main.ts` | Plugin lifecycle, persistence, device identity, settings UI, commands. |
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
 | `packages/obsidian-plugin/src/poll-schedule.ts` | Pure adaptive-poll tier selection (§4.9a) — no DOM, unit-tested. |
+| `packages/obsidian-plugin/src/notify.ts` | `ChangeNotifier`: MQTT-over-WSS subscribe/publish, presign, backoff (§4.14). |
+| `packages/obsidian-plugin/src/mqtt.ts` | Hand-rolled QoS-0 MQTT 3.1.1 codec — pure, unit-tested (§4.14). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/history-modal.ts` | `VersionHistoryModal`: per-note revision list, diff, restore (§4.12). |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
@@ -890,6 +893,65 @@ into the new entry. So changing the floor means editing **`manifest.json` only**
 > confirm every device (including mobile, which often lags desktop) is at or above it; recover a
 > stranded device by updating Obsidian there, or by manually installing an older plugin build.
 
+## 4.14 Change notifications (`notify.ts`, `mqtt.ts`)
+
+Polling is a *floor* on latency: a change is invisible until the next tick. §4.9a made that floor
+adaptive; this removes it for the common case. **Off by default** (`pushNotifications`), and with it
+off nothing in this section runs.
+
+The insight is that **no one needs to watch S3**: every writer already knows the revision it just
+appended. So after a successful CAS append the writer publishes `{rev, by}` to one AWS IoT Core MQTT
+topic, and subscribers run the **same `listDeltasSince` cycle a poll would have run**.
+
+```
+plugin push  ─┐                        ┌─→ device B ─→ runSync("notified") ─→ listDeltasSince
+git-sync      ├─→ appendDelta ─→ IoT ──┤
+MCP server   ─┘   (then announce)      └─→ device C ─→ …
+```
+
+- **Topic** `vaultsync/<prefix-slug>/rev`, derived from the S3 prefix so vaults sharing an account
+  never cross streams. `revTopic()` is implemented in **both** legs (core stays pure — no AWS SDK,
+  no `fetch`), so it is a lockstep pair like the exclusion rules (§6); `packages/git-sync/test/notify.test.ts`
+  asserts the two agree for every prefix shape.
+- **Payload** is one integer and a device label — no paths, no hashes, no content. `by` drives echo
+  suppression on exactly the basis `Delta.by` already does (§2.4).
+- **QoS 0, retain off.** A retained rev would hand every reconnecting client a stale notification to
+  react to — noise, not safety. Losing a message is *supposed* to be harmless.
+- **Transport.** The plugin holds an MQTT-over-WSS socket because it also subscribes; git-sync and
+  the MCP server only announce, so they use one signed HTTPS call to the IoT Data plane
+  (`createRevPublisher`, in git-sync, imported by mcp-server). `mqtt.ts` is a hand-rolled QoS-0
+  codec — `mqtt.js` is ~150 KB, and we speak five packet types (same trade-off as the hand-parsed
+  `ListObjectsV2` XML, §3).
+- **Auth** reuses the existing credentials: a SigV4-presigned `wss://<endpoint>/mqtt` URL signed by
+  `aws4fetch` with service `iotdevicegateway`. WebSockets need no CORS preflight, so unlike every S3
+  call this path can't fail on bucket CORS. Client id = `deviceId`, which is already unique (§4.2).
+- **Lifecycle.** Connect after startup; drop on `visibilitychange → hidden` (the socket dies with a
+  suspended app anyway, and IoT bills connection-minutes) and re-establish on return; rebuild on any
+  settings change so a socket is never left signed with superseded credentials; disconnect while
+  sync is paused. Reconnects back off 1 s → 60 s, and a superseded socket is **fenced by generation**
+  so a late callback from a dying connection can't mutate live state — the same fencing the engine's
+  stall watchdog uses (§4.3).
+- **Health, not just connectedness.** A refused CONNACK, a refused SUBACK (connected but *deaf* is
+  worse than disconnected), a handshake that never completes, or 90 s of total silence all force a
+  reconnect rather than leaving a socket that looks fine and delivers nothing.
+- **Poll interaction.** While the socket is connected the idle baseline relaxes to
+  `PUSH_CONNECTED_POLL_MS` (60 s) — the poll becomes a safety net rather than the delivery path. It
+  keys on the socket being connected *at that moment*, so a dropped connection re-tightens the poll
+  on the very next tick with no state to reset (§4.9a).
+
+> [!important] A notification is a hint, never a source of truth
+> It carries no content, establishes no state, and changes no schema. `onPublished` fires **strictly
+> after** the append succeeds (a notification must never point at a revision the journal lacks) and
+> swallows its own failures — the delta is already durable, so announcing it must never be able to
+> fail a push that landed. Every failure path degrades to "the next poll gets it", which is why this
+> can be bolted onto a protocol whose expensive bugs have all been correctness bugs. Design
+> rationale, cost model and rejected alternatives: [[Change Notification Design.md|Change Notification Design.md]].
+
+**Setup** is `scripts/install/06-enable-push-notifications.sh` (resolves the ATS endpoint, grants
+`iot:Connect`/`Subscribe`/`Receive`/`Publish` scoped to the one topic, optionally grants publish to
+the git-sync OIDC role). Then set the endpoint per device, and `S3_SYNC_IOT_ENDPOINT` in the content
+repo if git-sync should announce too.
+
 ---
 
 # 5. git-sync — `packages/git-sync`
@@ -1036,6 +1098,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `verbose` | false | notice on every active cycle |
 | `mobileConcurrency` / `desktopConcurrency` | 8 / 50 | transfer parallelism |
 | `loggingEnabled` | **false** | disk + S3 diagnostic log (§4.11) |
+| `pushNotifications` | **false** | instant sync over IoT Core (§4.14) |
+| `iotEndpoint` | `""` | IoT ATS data endpoint host; required when the above is on |
 
 ## 7.2 git-sync env (set by the workflow)
 
@@ -1048,11 +1112,12 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `RETENTION_DAYS` | delta retention (default 30) |
 | `SNAPSHOT_MAX_AGE_HOURS` | rebuild snapshot at most this often (default 24, `0` = every run) |
 | `GIT_MAX_FILE_BYTES` | oversized cutoff (default 25 MB) |
+| `IOT_ENDPOINT` | optional: announce appended revs (§4.14). Unset = no announcement |
 
 ## 7.3 Content-repo variables (GitHub Actions)
 
 `S3_SYNC_BUCKET`, `S3_SYNC_REGION`, `S3_SYNC_ROLE_ARN`, `S3_SYNC_TOOL_REPO`, and optionally
-`S3_SYNC_PREFIX`. See **SETUP.md** for the full bootstrap (bucket + versioning + CORS, OIDC provider
+`S3_SYNC_PREFIX` / `S3_SYNC_IOT_ENDPOINT` (§4.14). See **SETUP.md** for the full bootstrap (bucket + versioning + CORS, OIDC provider
 + IAM role, workflow install, plugin install).
 
 ---
@@ -1068,6 +1133,10 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 - **Workflow** — `templates/s3-sync.yml` installed at the content repo's
   `.github/workflows/s3-sync.yml`; it checks out the content repo (full history) **and** the tool
   repo into `.sync-tool/`, then runs `tsx packages/git-sync/src/main.ts`.
+- **Change notifications (optional, §4.14)** — AWS **IoT Core**, no resources to create: an inline
+  `iot` policy on the plugin IAM user (connect/subscribe/receive/publish, scoped to one topic) and
+  an `iot:Publish` grant on the git-sync OIDC role. Installed by
+  `scripts/install/06-enable-push-notifications.sh`.
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
 - **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
   role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`
@@ -1092,6 +1161,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Oversized attachment | stays S3-only (git 25 MB guard; per-device download cap) |
 | `.gitignore`/metadata absent on one client | `GIT_META_FILES` exclusion on both legs prevents tombstoning it |
 | Sync loop | dual echo suppression: `by` field + `[skip ci]` bot commits |
+| Notification socket down / message lost | polling continues and re-tightens automatically (§4.9a, §4.14) — latency, never loss |
 | Corrupt S3 object | manifest hash mismatch on apply → skip/re-fetch |
 | "Resync pulled 0 files" | resync uses `fullPull` (no echo suppression) → restores own lost files |
 | Wrong content in one note (bad merge, unwanted edit, remote clobber) | **Version history** (§4.12): pick a revision, diff it, restore — attributed by device and rev |
@@ -1109,6 +1179,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
   private repo — an accepted trade-off, mitigated by repo privacy.
 - **Starter zip**: contains the secret key by necessity; treated as a credential (warned, meant to be
   deleted after use).
+- **Notification topic** (§4.14): carries a revision number and a device label — *that* the vault
+  changed and *which* device changed it, never what. Readable only with the same credentials that
+  already grant bucket access, so it widens nothing. IAM is scoped to the single topic.
 - **Encryption**: SSE-S3 (at rest) + TLS (in transit). Client-side encryption was rejected in the POC
   because the git repo holds a plaintext copy anyway.
 
@@ -1122,6 +1195,10 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Poll — ACTIVE tier / window | 5 s / 2 min | `ACTIVE_POLL_MS` / `ACTIVE_WINDOW_MS` (poll-schedule.ts) |
 | Poll — BACKGROUND tier | baseline × 4, floor 60 s | `BACKGROUND_POLL_FACTOR` / `BACKGROUND_POLL_MIN_MS` |
 | Return-to-device sync throttle | 5 s | `FOCUS_SYNC_MIN_GAP_MS` (main.ts) |
+| Poll baseline while push connected | 60 s | `PUSH_CONNECTED_POLL_MS` (poll-schedule.ts) |
+| MQTT keepalive / ping / silence cutoff | 60 s / 30 s / 90 s | `KEEPALIVE_SEC`, `PING_INTERVAL_MS`, `SILENCE_TIMEOUT_MS` (notify.ts) |
+| Notifier reconnect backoff | 1→60 s | `RECONNECT_BACKOFF_MS` (notify.ts) |
+| Notifier presign lifetime / handshake timeout | 300 s / 15 s | `PRESIGN_EXPIRES_SEC`, `HANDSHAKE_TIMEOUT_MS` |
 | Push debounce | 5 s | `PUSH_DEBOUNCE_MS` (main.ts) |
 | Offline-scan delay (desktop) | 30 s after launch | `OFFLINE_SCAN_DELAY_MS` (main.ts) |
 | Offline-scan yield batch | 250 files | `SCAN_CHUNK` (engine.ts) |

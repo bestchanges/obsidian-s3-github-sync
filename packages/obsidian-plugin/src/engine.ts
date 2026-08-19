@@ -212,6 +212,11 @@ export interface EngineOptions {
    * failures must not abort the write, so implementations swallow their own errors. */
   onBeforeOverwrite?: (path: string) => Promise<void>;
   onStateChanged: (state: SyncState) => Promise<void>;
+  /** Called with the revision this device just appended, so a notifier can announce it (§4.14).
+   * Best-effort and synchronous by contract: implementations must swallow their own failures —
+   * the delta is already durable by the time this runs, and nothing about announcing it may
+   * jeopardise a completed push. */
+  onPublished?: (rev: number) => void;
 }
 
 type Deferred = { resolve: () => void; reject: (err: unknown) => void };
@@ -1643,6 +1648,11 @@ export class SyncEngine {
       }
       this.state.lastSyncedRev = result.rev;
       this.pushed += Object.keys(files).length;
+      // Announce the revision we just published so peers pull it now instead of at their next poll
+      // (§4.14). Strictly after the append succeeded — a notification must never point at a
+      // revision the journal doesn't have — and best-effort by contract: the hook swallows its own
+      // failures, so a dead socket can never fail a push that already landed.
+      this.opts.onPublished?.(result.rev);
     } catch (err) {
       // Push failed — requeue everything not yet published (this batch and any batch after it) so the
       // next cycle retries them (§2.6). Batches already committed above are NOT requeued: their state
