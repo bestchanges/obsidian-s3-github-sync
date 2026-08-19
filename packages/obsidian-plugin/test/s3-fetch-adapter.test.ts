@@ -114,4 +114,54 @@ describe("S3FetchAdapter transient-failure handling", () => {
     await expect(makeAdapter().get("files/note.md")).rejects.toThrow(/aborted/);
     expect(calls).toHaveLength(3); // an abort is treated as transient, so it retries too
   });
+
+  /** Headers have arrived, so fetch() has already resolved — but the body never flows. This is the
+   * stall a per-attempt deadline has to cover: it is indistinguishable from a healthy response until
+   * you try to read the bytes, and reading them after the timer was cleared hangs with no error and
+   * no connection break. On a real device that held the engine's single-flight lock for 18 hours. */
+  function headersThenSilence(signal: AbortSignal): Response {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        signal.addEventListener("abort", () =>
+          controller.error(Object.assign(new Error("The operation was aborted"), { name: "AbortError" })),
+        );
+      },
+    });
+    return new Response(body, { status: 200 });
+  }
+
+  /** Real timers with a deliberately tiny deadline. Fake timers are not an option here: they stall
+   * aws4fetch's async signing, so the request is never even issued and nothing is under test. */
+  function stallingAdapter(): { adapter: S3FetchAdapter; calls: Request[] } {
+    const calls: Request[] = [];
+    vi.stubGlobal("fetch", async (req: Request) => {
+      calls.push(req);
+      return headersThenSilence(req.signal);
+    });
+    return {
+      adapter: new S3FetchAdapter({
+        accessKeyId: "AKIAEXAMPLE",
+        secretAccessKey: "secret",
+        region: "ap-southeast-1",
+        bucket: "test-bucket",
+        prefix: "vault/",
+        requestTimeoutMs: 40,
+      }),
+      calls,
+    };
+  }
+
+  it("bounds a body that never flows — the deadline covers the bytes, not just the headers", async () => {
+    const { adapter, calls } = stallingAdapter();
+    // Before the fix this never settles: fetch() resolved on the headers, the deadline was cleared,
+    // and the arrayBuffer() read waited on a stream nothing would ever feed or cancel.
+    await expect(adapter.get("files/note.md")).rejects.toThrow(/abort/i);
+    expect(calls).toHaveLength(3); // a stalled body is transient → the GET retries like any other
+  });
+
+  it("bounds a stalled LIST body too — a poll is LIST + GET, and LIST reads XML", async () => {
+    const { adapter, calls } = stallingAdapter();
+    await expect(adapter.list("deltas/")).rejects.toThrow(/abort/i);
+    expect(calls).toHaveLength(3);
+  });
 });

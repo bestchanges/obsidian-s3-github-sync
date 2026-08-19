@@ -1,5 +1,7 @@
 import {
   contentHash,
+  Delta,
+  DeltaEntry,
   decodeText,
   encodeText,
   FileEntry,
@@ -197,4 +199,39 @@ export async function reconcileFile(
   }
 
   return NOOP;
+}
+
+/**
+ * Handle a lost CAS race (§1.3) while appending this run's delta.
+ *
+ * Entries the winner touched that this run is NOT carrying are harmless to retry past: they fold
+ * into `remote` on the next run and nothing being published here contradicts them.
+ *
+ * A path the winner touched that this run is ALSO publishing is a different matter. Every entry in
+ * `files` was reconciled against `remote` as it stood at `baselineRev` — i.e. BEFORE the winner
+ * existed — so republishing it would overwrite an edit this run never saw, with no merge and no
+ * conflict recorded anywhere. That is the same last-writer-wins hole the plugin closes in its own
+ * onLostRace (engine.ts), and the two legs must not diverge on it (§6). git-sync cannot re-run
+ * reconcileFile from inside the CAS loop — the whole reconcile pass is derived from `remote` — so it
+ * does the other safe thing and declines to publish at all. The already-uploaded objects are left
+ * unreferenced by any delta (harmless, §1.4), and the next run reconciles both sides from the newer
+ * state. A failed run is visible and self-correcting; a silent revert is neither.
+ */
+export function onLostRace(
+  winner: Delta,
+  files: Record<string, DeltaEntry>,
+  baselineRev: number,
+  warn: (msg: string) => void,
+): void {
+  const collided = Object.keys(winner.files).filter((p) => p in files);
+  if (collided.length === 0) {
+    warn(`lost CAS race to ${winner.by}@${winner.rev}; retrying`);
+    return;
+  }
+  const shown = collided.slice(0, 5).join(", ") + (collided.length > 5 ? ", …" : "");
+  throw new Error(
+    `lost CAS race to ${winner.by}@${winner.rev} on ${collided.length} path(s) this run is also ` +
+      `publishing (${shown}). Refusing to overwrite them with content reconciled against ` +
+      `rev ${baselineRev}; the next run will reconcile from the newer state.`,
+  );
 }

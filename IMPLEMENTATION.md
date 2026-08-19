@@ -130,6 +130,25 @@ Files are PUT **before** the delta (the journal never references a missing objec
 gives total write ordering with no locks. Revisions come out **dense** — the read side relies on
 that for gap detection.
 
+**`onLostRace` must never discard a colliding entry.** CAS gives ordering, not freshness: claiming
+rev N+1 says nothing about whether the payload still makes sense against rev N. Everything a writer
+is publishing was reconciled against the revision it *started* from, so a winner that touched one of
+those same paths holds an edit this writer never saw. Skipping it — "we're already pushing that
+path, ignore theirs" — is plain last-writer-wins punched straight through the union merge, with no
+conflict recorded anywhere. It is how a slow cycle silently reverts another device. Both legs are
+kept in lockstep on this (§6):
+
+| | non-colliding winner entry | colliding winner entry |
+|---|---|---|
+| **plugin** (`engine.ts`) | apply as an ordinary pull | resolve via `applyRemote` (union merge / freshest-wins), **pinned to the winner's `s3VersionId`**, then rebuild the payload entry from the result |
+| **git-sync** (`reconcile.ts` `onLostRace`) | warn + retry | **refuse to publish** — throw; the next run reconciles from the newer state |
+
+The pin matters: by the time the race is lost this writer has already PUT its own bytes to
+`files/<path>`, so "latest" is *its own* content. Resolving against latest would compare local with
+local, find no conflict, and publish the revert. git-sync can't re-reconcile from inside the CAS loop
+(its whole pass derives from the `remote` state it loaded), so it takes the other safe option and
+fails the run — visible and self-correcting, unlike a silent revert.
+
 ## 2.4 Read / catch-up (`listDeltasSince`, `hasGap`, `foldDeltas`, `changedEntries`)
 
 One `LIST deltas/ start-after=<pad10(sinceRev)>` both answers "anything new?" and enumerates exactly
@@ -271,6 +290,25 @@ platform:
 > allowing those origins with `ETag` and `x-amz-version-id` exposed, or every request fails with
 > `TypeError: failed to fetch`. git-sync (server-side SDK) is unaffected.
 
+> [!important] The plugin's per-attempt deadline covers the **body**, not just the headers
+> Every `S3FetchAdapter` call goes through one `send()` funnel that bounds the attempt with an
+> `AbortController` (`REQUEST_TIMEOUT_MS`, 60 s) and, for **idempotent reads only**, retries a
+> network-level failure or a 403 twice. Writes are excluded deliberately: a PUT that failed at the
+> network layer may still have landed, and the delta PUTs are conditional, so re-issuing one would
+> race our own write.
+>
+> The subtle part is *when* the deadline is cleared. `fetch()` settles as soon as the response
+> **headers** arrive, so a caller that reads the body afterwards does so with the timer already
+> cleared — headers in 200 ms, then a body that never flows, and the request hangs indefinitely with
+> no error and no connection break, holding the engine's single-flight lock (§4.3). `send()`
+> therefore consumes the body *inside* the deadline (`get` → `arrayBuffer`, `list` → `text`, the two
+> verbs a poll uses); a stalled body surfaces as `AbortError` and retries like any other transient
+> failure. `requestTimeoutMs` overrides the ceiling — production leaves it unset; tests pin it low,
+> since fake timers stall `aws4fetch`'s async signing before a request is ever issued.
+>
+> Per-request bounds can never bound a *cycle*: 1690 objects at concurrency 8 with a 60 s ceiling is
+> ~3.5 h of entirely in-spec behaviour. Cycle-level protection is the stall watchdog in §4.3.
+
 ---
 
 # 4. Obsidian plugin — `packages/obsidian-plugin`
@@ -366,12 +404,50 @@ resets per-cycle counters, and persists state only when something changed or the
   re-populates `dirty` and is pushed next cycle instead of being wiped by a blanket clear — the fix
   for edits lost during a slow push); then hashes each drained file; **hash unchanged → dropped**
   (mtime-only touch, no traffic). Uploads changed files, then one `appendDelta` written
-  `by: deviceId`. On a lost CAS race it applies the winner's foreign entries before retrying.
+  `by: deviceId`. On a lost CAS race it folds the winner in rather than publishing past it (§2.3).
   Tombstones are emitted for dirty paths whose file is gone. On failure the drained paths are
   requeued for the next cycle.
 
 Echo suppression is **disabled during a full resync** (`excludeBy = undefined`) so a device can
 restore files *it* originally wrote but has since lost locally — the fix for "resync pulled 0 files".
+
+### Baseline revalidation before push
+
+The pull establishes what remote looked like **when it ran**, and every decision push makes — is this
+file changed? what is its merge base? which rev do we claim? — is measured against that. A cycle can
+easily outlive it: a large changeset over a slow link, or a mobile device suspended mid-pull and
+resumed hours later. push does **not** merge, so a stale baseline means it uploads local bytes and
+claims the next rev, silently reverting everything that landed in between.
+
+So when there is anything to push, the cycle runs **one more incremental pull immediately before
+push**, folding in whatever arrived through normal conflict resolution. Correctness stops depending
+on how long the cycle took — a slow cycle is allowed to be slow, it just re-reads before writing. The
+extra LIST is gated on a non-empty dirty set, so an idle poll (the common case) still costs exactly
+one LIST. What remains after this is the window between that LIST and the CAS PUT, i.e. genuinely
+concurrent writers, which is what `onLostRace` handles (§2.3).
+
+### Stall reclamation (the single-flight lock)
+
+One cycle runs at a time; concurrent triggers coalesce into a single queued slot. That makes a wedged
+cycle a **liveness** problem as well as a correctness one — while it holds the lock nothing else
+syncs. Observed in the field: one cycle held the lock for 18 h 15 m, during which the device did not
+sync at all, and then completed and published its 18-hour-old payload.
+
+A watchdog compares a **progress clock** — bumped by every *completed* storage operation, via a
+wrapper the engine installs over its `StorageAdapter`, so no I/O path can forget to tick — against
+`STALL_TIMEOUT_MS` (120 s). The threshold is deliberately about *inactivity*, never elapsed time: a
+big pull over a bad link ticks continuously and is left alone, however long it takes. 120 s is two
+back-to-back dead request attempts (the adapter bounds one at 60 s) with nothing advancing across
+8–50 concurrent slots.
+
+A stalled cycle cannot simply be cancelled — a promise hung inside `fetch` never settles — so it is
+**fenced** instead. Two counters advance (`cycleSeq` for the cycle, `loopToken` for the loop that owns
+the lock): the lock is released so queued work runs, waiters are rejected with `CycleAbandonedError`,
+and if the orphan ever does resume it fails its next ownership check and unwinds without writing.
+That second half is essential — releasing the lock *without* fencing would leave two writers inside
+one device, the second one publishing an ancient baseline, which is strictly worse than the stall.
+The plugin treats `CycleAbandonedError` on a background cycle as self-healing (WARN, no Notice); the
+engine has already logged what stalled and the next cycle picks the work up.
 
 ## 4.4 Change tracking & offline scan (`scanForOfflineChanges`)
 
@@ -563,9 +639,13 @@ to the download cap); local also changed → **conflict**. Conflict strategy dep
 > the current remote bytes instead of uploading the stale ones. The entry self-clears once the file
 > settles at `hash` (confirmed) or diverges to a genuine third state (a real edit still syncs), is
 > **not** armed during bootstrap / full-pull resync (bulk pulls, not the clobber case), and expires
-> after `PENDING_PULL_TTL_MS` (2 min). In-memory only — a clobber lands within seconds, same session.
-> Plugin-only: git-sync has no editor, so the union merge itself is unchanged and both legs stay in
-> lockstep.
+> after `PENDING_PULL_TTL_MS` (2 min) — but **only across cycles**. Each entry records the cycle that
+> armed it, and within that cycle the guard never expires however long the cycle runs: the pull arms
+> it and the push reads it, and a large changeset over a slow link puts far more than the TTL between
+> the two. Letting wall-clock time disarm the guard mid-cycle would switch off the push-leg protection
+> exactly when a cycle is most likely to re-publish stale bytes. In-memory only — a clobber lands
+> within seconds, same session. Plugin-only: git-sync has no editor, so the union merge itself is
+> unchanged and both legs stay in lockstep.
 
 > [!note] Deletes, renames & the delete-vs-edit tiebreak (`applyRemote`, protocol §2.8)
 > A tombstone whose target is still on disk and **diverges** from the baseline is resolved by

@@ -26,7 +26,7 @@ import {
 import { Git } from "./git";
 import { DEFAULT_SNAPSHOT_MAX_AGE_HOURS, shouldCompact } from "./compaction";
 import { S3SdkAdapter } from "./s3-adapter";
-import { reconcileFile, ReconcileIO, ReconcileOutcome, UploadAction } from "./reconcile";
+import { onLostRace, reconcileFile, ReconcileIO, ReconcileOutcome, UploadAction } from "./reconcile";
 import { makeMergeBaseResolver, resolveDiffBase } from "./merge-base";
 import { createLogger } from "./log";
 
@@ -337,7 +337,7 @@ async function main(): Promise<void> {
       storage,
       remote.revision + 1,
       (rev): Delta => ({ rev, by: WRITER_ID, at: new Date().toISOString(), files }),
-      (winner) => logger.warn(`lost CAS race to ${winner.by}@${winner.rev}; retrying`),
+      (winner) => onLostRace(winner, files, remote.revision, (m) => logger.warn(m)),
     );
     logger.info(`appended delta rev=${result.rev} (${uploads.size} entries)`);
   }

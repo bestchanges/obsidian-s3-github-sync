@@ -1,5 +1,5 @@
 import { Menu, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
-import { SyncEngine, SyncState, FileState } from "./engine";
+import { CycleAbandonedError, SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
 import { VersionHistoryModal } from "./history-modal";
@@ -851,7 +851,12 @@ export default class S3SyncPlugin extends Plugin {
       // usual post-resume one, which the next cycle recovers from) is only worth a WARN and a Notice
       // once it has actually persisted.
       const userInitiated = reason === "manual" || reason.startsWith("startup");
-      const quiet = !userInitiated && isTransientNetworkError(err);
+      // An abandoned cycle belongs in the same bucket as a transient network failure: the engine has
+      // already logged exactly what stalled, the lock is free again, and the very next cycle picks up
+      // the work. Reporting it as a sync FAILURE on every background poll would be noise about
+      // something already handled.
+      const selfHealing = isTransientNetworkError(err) || err instanceof CycleAbandonedError;
+      const quiet = !userInitiated && selfHealing;
       this.logger.log(quiet ? "warn" : "error", `${reason} failed: ${String(err)}`);
       const firstNotice = quiet ? TRANSIENT_QUIET_FAILURES : 1;
       if (userInitiated || this.syncFailures === firstNotice || this.syncFailures % 10 === 0) {
