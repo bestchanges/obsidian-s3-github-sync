@@ -9,6 +9,7 @@ import {
   DeltaEntry,
   encodeText,
   FileEntry,
+  GetResult,
   hasGap,
   isTombstone,
   listDeltasSince,
@@ -59,6 +60,15 @@ const LOG_LIST_CAP = 20;
  * short enough that a much-later legitimate revert-to-the-old-bytes isn't mistaken for a clobber and
  * that the tracking map can't accumulate. See pendingPull / phantomRevert (§2.6). */
 const PENDING_PULL_TTL_MS = 2 * 60 * 1000;
+/** No progress ANYWHERE in a cycle for this long ⇒ the cycle is wedged, not merely slow. The adapter
+ * bounds one request attempt at 60 s, so two minutes of complete silence means two dead attempts
+ * back-to-back with nothing advancing across 8–50 concurrent slots. A healthy sync of mostly-small
+ * notes ticks every few hundred ms, so a genuinely slow link never trips this — what it catches is a
+ * cycle holding the single-flight lock while making no headway (a suspended device, or a response
+ * whose body never flows), which used to block every later sync for hours (§4.4). */
+const STALL_TIMEOUT_MS = 2 * 60 * 1000;
+/** How often the watchdog compares the progress clock against STALL_TIMEOUT_MS. */
+const STALL_CHECK_MS = 15 * 1000;
 /** Files stat/hashed per batch by the offline walk before it yields to the event loop. The walk runs
  * OFF the reconcile lock (§4.4), so yielding keeps the mobile UI smooth AND lets a concurrent poll/pull
  * cycle interleave — the whole point of decoupling the scan from the fast path. */
@@ -86,11 +96,51 @@ interface PendingPull {
   priorHash: string | null;
   /** Date.now() when armed, for TTL expiry */
   at: number;
+  /** Cycle that armed this entry. Within that same cycle the guard never expires, however long the
+   * cycle takes: pull arms it and push reads it, and a large changeset over a slow link can easily
+   * put more than PENDING_PULL_TTL_MS between the two. Letting wall-clock time disarm the guard
+   * mid-cycle is what allowed a stale local copy to be re-published over a just-pulled file. The TTL
+   * exists to bound the map ACROSS cycles (the real clobber lands a poll or two later), so it only
+   * applies once a later cycle is reading. */
+  cycle: number;
 }
 
 export interface SyncState {
   lastSyncedRev: number;
   files: Record<string, FileState>;
+}
+
+/** Raised when a cycle is disowned mid-flight by the stall watchdog. A distinct type so runLoop can
+ * report a reclaimed stall rather than a sync failure, and so an orphan that resumes hours later
+ * unwinds quietly at its next ownership check instead of finishing and writing. */
+export class CycleAbandonedError extends Error {
+  constructor(label: string) {
+    super(`sync cycle (${label}) abandoned — no progress for ${STALL_TIMEOUT_MS / 1000}s`);
+    this.name = "CycleAbandonedError";
+  }
+}
+
+/** Wrap the adapter so every COMPLETED operation ticks the cycle's progress clock. Wrapping rather
+ * than sprinkling ticks through the engine guarantees no I/O path is missed — the watchdog's whole
+ * job is to tell "slow but advancing" from "wedged", and a heartbeat it never receives reads as
+ * wedged, so a gap here would abandon healthy cycles. Ticking on COMPLETION (not on issue) is the
+ * point: an operation that was issued and never came back is precisely the stall being caught. */
+function withProgress(inner: StorageAdapter, tick: () => void): StorageAdapter {
+  const t = async <R>(p: Promise<R>): Promise<R> => {
+    const r = await p;
+    tick();
+    return r;
+  };
+  return {
+    get: (k, o) => t(inner.get(k, o)),
+    head: (k) => t(inner.head(k)),
+    put: (k, b, o) => t(inner.put(k, b, o)),
+    list: (p, s) => t(inner.list(p, s)),
+    delete: (k) => t(inner.delete(k)),
+    // Preserve the optional copy() as optional: callers probe `storage.copy &&` to decide between a
+    // server-side rename and a re-upload, so synthesizing one here would change that decision.
+    ...(inner.copy ? { copy: (s: string, d: string, v?: string) => t(inner.copy!(s, d, v)) } : {}),
+  };
 }
 
 /** Outcome of a "force download" request (the linked-files command). Counts + the candidates that
@@ -232,6 +282,20 @@ export class SyncEngine {
   private running = false;
   private queuedReq: CycleReq | null = null;
   private queuedWaiters: Deferred[] = [];
+  // Stall reclamation (§4.4). A cycle that makes no progress for STALL_TIMEOUT_MS is DISOWNED: the
+  // lock is released so later triggers can sync again, and the stalled cycle — which may never settle
+  // at all, since a hung promise cannot be cancelled from outside — is fenced off by these two
+  // counters so it can never write if it does come back. `cycleSeq` fences the cycle (checked before
+  // every commit); `loopToken` fences the runLoop that owns `running` and drains the queue. Both are
+  // bumped on abandonment, so the orphan fails its next ownership check and unwinds.
+  private cycleSeq = 0;
+  private loopToken = 0;
+  /** Date.now() of the last completed storage operation in the running cycle (see withProgress). */
+  private progressAt = 0;
+  private stallTimer: ReturnType<typeof setInterval> | undefined;
+  /** Waiters of the currently-running cycle, so the watchdog can settle them when it disowns it —
+   * otherwise an awaited sync() (a manual "Sync now") would hang on a promise nothing will resolve. */
+  private activeWaiters: Deferred[] = [];
   // per-cycle activity counters (for the verbose summary)
   private pulled = 0;
   private pushed = 0;
@@ -284,6 +348,20 @@ export class SyncEngine {
     if (more > 0) this.opts.log("info", `${verb} …and ${more} more`);
   }
 
+  /** Fetch a path's remote bytes — pinned to the version the entry names when `pin`, else whatever is
+   * currently live. See applyRemote's `pin` for why the distinction matters. Falls back to live when
+   * the entry carries no `s3VersionId` (entries written before the field existed). */
+  private fetchRemote(
+    path: string,
+    remote: FileEntry & SnapshotEntry,
+    pin: boolean,
+  ): Promise<GetResult | null> {
+    return this.storage.get(
+      `files/${path}`,
+      pin && remote.s3VersionId ? { versionId: remote.s3VersionId } : undefined,
+    );
+  }
+
   /** Per-device download gate: 0 = unlimited. Unknown size → allow (correctness over space). */
   private downloadAllowed(size: number | undefined): boolean {
     const limit = this.opts.maxDownloadBytes;
@@ -299,6 +377,74 @@ export class SyncEngine {
     this.bootstrap = opts.firstRun ?? false;
     this.adoptedState = opts.adoptedForeignState ?? false;
     this.deferConflicts = opts.deferConflicts ?? false;
+    // Swap in the progress-ticking wrapper once, here, so EVERY `this.storage.*` in the engine feeds
+    // the stall watchdog without each call site having to remember to.
+    this.storage = withProgress(storage, () => {
+      this.progressAt = Date.now();
+    });
+  }
+
+  /** True while this cycle still owns the engine. False once the watchdog disowned it (or a later
+   * cycle started), which happens only to a cycle that stalled — see cycleSeq. */
+  private owns(seq: number): boolean {
+    return this.cycleSeq === seq;
+  }
+
+  /** Cooperative cancellation point. Called wherever a cycle is about to do something it must not do
+   * after being disowned — above all, anything that writes. A stalled cycle whose awaits do finally
+   * settle unwinds from here instead of committing work computed against a long-dead baseline. */
+  private assertOwner(seq: number, label: string): void {
+    if (!this.owns(seq)) throw new CycleAbandonedError(label);
+  }
+
+  /** Arm the watchdog for the cycle identified by `seq`. Fires on the wall clock, so a device frozen
+   * mid-cycle is caught the moment it thaws (no progress for hours), as is a live-but-hung request. */
+  private startStallWatchdog(seq: number, label: string): void {
+    this.stopStallWatchdog();
+    // Clear THIS interval by handle rather than via stopStallWatchdog(): if a stale tick ever ran
+    // after another cycle armed its own watchdog, clearing the shared field would disarm that one.
+    const timer = setInterval(() => {
+      if (!this.owns(seq)) return void clearInterval(timer);
+      if (Date.now() - this.progressAt < STALL_TIMEOUT_MS) return;
+      this.abandonCycle(seq, label);
+    }, STALL_CHECK_MS);
+    this.stallTimer = timer;
+  }
+
+  private stopStallWatchdog(): void {
+    if (this.stallTimer !== undefined) clearInterval(this.stallTimer);
+    this.stallTimer = undefined;
+  }
+
+  /** Reclaim the engine from a stalled cycle. The cycle itself cannot be cancelled — a promise hung
+   * inside fetch never settles — so instead it is FENCED: both counters advance, which (a) frees the
+   * lock for new cycles and (b) guarantees the orphan fails assertOwner before any write, should it
+   * ever resume. Without (b) this would be strictly worse than the stall: two writers inside one
+   * device, the second one publishing an ancient baseline. */
+  private abandonCycle(seq: number, label: string): void {
+    this.stopStallWatchdog();
+    this.cycleSeq++;
+    this.loopToken++;
+    this.running = false;
+    const waiters = this.activeWaiters;
+    this.activeWaiters = [];
+    const err = new CycleAbandonedError(label);
+    this.opts.log(
+      "warn",
+      `Sync: ${label} made no progress for ${STALL_TIMEOUT_MS / 1000}s — abandoned, lock released`,
+    );
+    for (const w of waiters) w.reject(err);
+    // Whatever was queued behind the stall still deserves to run, and nothing owns the lock now.
+    const queued = this.queuedReq;
+    if (queued) {
+      this.queuedReq = null;
+      const qw = this.queuedWaiters;
+      this.queuedWaiters = [];
+      this.running = true;
+      // loopToken was already bumped above, so this value is unique to the replacement loop and the
+      // orphan's `this.loopToken === token` check has already gone false.
+      void this.runLoop(this.loopToken, queued, qw);
+    }
   }
 
   // --------------------------------------------- deferred conflicts (§4.2a)
@@ -667,7 +813,7 @@ export class SyncEngine {
         }
       } else {
         this.running = true;
-        void this.runLoop(req, [waiter]);
+        void this.runLoop(++this.loopToken, req, [waiter]);
       }
     });
   }
@@ -702,30 +848,50 @@ export class SyncEngine {
 
   /** Drain cycles one at a time until the queue empties, then release the lock. Each cycle settles
    * its own waiters (resolve on success, reject on failure) without stalling the ones behind it. */
-  private async runLoop(firstReq: CycleReq, firstWaiters: Deferred[]): Promise<void> {
+  private async runLoop(token: number, firstReq: CycleReq, firstWaiters: Deferred[]): Promise<void> {
     let req: CycleReq | null = firstReq;
     let waiters = firstWaiters;
     try {
       while (req) {
+        this.activeWaiters = waiters;
         try {
           await this.runCycle(req);
           for (const w of waiters) w.resolve();
         } catch (err) {
           for (const w of waiters) w.reject(err);
         }
+        this.activeWaiters = [];
+        // Disowned while that cycle ran (stall watchdog): a newer loop owns `running` and the queue
+        // now. Returning WITHOUT touching either is the whole point — draining the queue here would
+        // run a second cycle concurrently with the loop that replaced us. Waiters were already
+        // rejected by abandonCycle; settling them again above is a no-op on a settled promise.
+        if (this.loopToken !== token) return;
         req = this.queuedReq;
         waiters = this.queuedWaiters;
         this.queuedReq = null;
         this.queuedWaiters = [];
       }
     } finally {
-      this.running = false;
+      if (this.loopToken === token) this.running = false;
     }
   }
 
   /** One reconcile pass: optional pre-scan, then pull remote changes (merge conflicts) and push the
    * dirty set. Only ever invoked by runLoop (single-flight), so it owns the shared state alone. */
   private async runCycle(req: CycleReq): Promise<void> {
+    const seq = ++this.cycleSeq;
+    this.progressAt = Date.now();
+    this.startStallWatchdog(seq, req.label);
+    try {
+      await this.reconcile(req, seq);
+    } finally {
+      // Only if we still own the engine: an abandoned cycle unwinding here would otherwise clear the
+      // watchdog armed by the cycle that replaced it, leaving that one unguarded.
+      if (this.owns(seq)) this.stopStallWatchdog();
+    }
+  }
+
+  private async reconcile(req: CycleReq, seq: number): Promise<void> {
     this.pulled = this.pushed = this.merged = this.skipped = 0;
     this.detail = { pulled: [], pushed: [], deletedLocal: [], deletedRemote: [], mergedPaths: [] };
     this.mergedSet.clear();
@@ -759,7 +925,21 @@ export class SyncEngine {
     // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
     // dirty) and so a delete-vs-edit re-push it triggers is flushed in the same cycle.
     if (req.forcePaths.length) this.forceResult = await this.forceDownload(req.forcePaths);
-    await this.push();
+    // Revalidate the write baseline (§2.3). The pull above established what remote looked like when
+    // it ran; everything push() decides — is this file changed? what is its merge base? which rev do
+    // we claim? — is measured against that. A cycle that took a while (large changeset, slow link,
+    // a device suspended mid-pull) can reach here with a baseline many revisions stale, and push()
+    // does not merge: it uploads local bytes and claims the next rev, silently reverting whatever
+    // landed in between. One more incremental pull re-reads the journal and folds in anything new
+    // through the normal conflict resolution, so the push is always measured against current remote
+    // no matter how long the cycle took. Gated on having something to push: an idle poll (the common
+    // case) skips the extra LIST entirely.
+    if (this.dirty.size > 0) {
+      this.assertOwner(seq, req.label);
+      await this.pull();
+    }
+    this.assertOwner(seq, req.label);
+    await this.push(seq, req.label);
 
     const activity = this.pulled + this.pushed + this.merged;
     // Persist when state changed — and always after a resync, so the reset sticks even if S3 was
@@ -834,7 +1014,13 @@ export class SyncEngine {
     return rev > this.state.lastSyncedRev;
   }
 
-  private async applyRemote(path: string, entry: SnapshotEntry): Promise<void> {
+  /** `pin`: fetch the exact bytes the entry names (`?versionId=`) rather than whatever is currently
+   * live at the key. Ordinary pulls leave this off — latest IS the entry they just read from the
+   * journal, and pinning would fail on legacy entries that predate `s3VersionId`. push()'s lost-CAS
+   * path MUST set it: by then this device has already uploaded its own bytes to that key (files are
+   * PUT before the delta, §2.3), so "latest" is our own stale content and merging against it would
+   * compare local with local and quietly conclude there was no conflict. */
+  private async applyRemote(path: string, entry: SnapshotEntry, pin = false): Promise<void> {
     const st = this.state.files[path];
 
     if (isTombstone(entry)) {
@@ -914,7 +1100,7 @@ export class SyncEngine {
         return;
       }
       // clean local (or absent) → take remote as-is
-      const obj = await this.storage.get(`files/${path}`);
+      const obj = await this.fetchRemote(path, remote, pin);
       if (!obj) return;
       await this.write(path, obj.body, remote.mtime);
       // Arm the phantom-revert guard: the write can be silently clobbered before the next reconcile,
@@ -931,6 +1117,7 @@ export class SyncEngine {
           mtime: remote.mtime,
           priorHash: prior?.priorHash ?? st?.hash ?? localHash,
           at: Date.now(),
+          cycle: this.cycleSeq,
         });
       }
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
@@ -957,13 +1144,13 @@ export class SyncEngine {
         this.recordMerged(path);
         return;
       }
-      await this.resolveFreshestWins(path, remote);
+      await this.resolveFreshestWins(path, remote, pin);
       return;
     }
     const baseObj = st?.s3VersionId
       ? await this.storage.get(`files/${path}`, { versionId: st.s3VersionId })
       : null;
-    const remoteObj = await this.storage.get(`files/${path}`);
+    const remoteObj = await this.fetchRemote(path, remote, pin);
     if (!remoteObj) {
       this.dirty.add(path);
       return;
@@ -1065,13 +1252,17 @@ export class SyncEngine {
   /** Resolve a conflict by taking whichever side has the newer mtime — no bytes are synthesized, so
    * both sync legs stay convergent even if clock skew makes them pick different sides on one pass.
    * Remote newer → download and record it; local newer (or a tie) → keep local and re-push. */
-  private async resolveFreshestWins(path: string, remote: FileEntry & SnapshotEntry): Promise<void> {
+  private async resolveFreshestWins(
+    path: string,
+    remote: FileEntry & SnapshotEntry,
+    pin = false,
+  ): Promise<void> {
     const stat = await this.vault.adapter.stat(path);
     const localMtime = stat ? new Date(stat.mtime).toISOString() : "";
     // Chronological (parsed) compare, not lexicographic — the two legs emit mtimes in different ISO
     // shapes/timezones and string order diverges from real time order (remoteIsFresher, §2.6).
     if (remoteIsFresher(remote.mtime, localMtime)) {
-      const obj = await this.storage.get(`files/${path}`);
+      const obj = await this.fetchRemote(path, remote, pin);
       if (!obj) {
         this.dirty.add(path); // remote vanished mid-resolve — keep local, re-push
         return;
@@ -1157,7 +1348,7 @@ export class SyncEngine {
     return matches.sort((a, b) => a.length - b.length)[0];
   }
 
-  private async push(): Promise<void> {
+  private async push(seq: number, label: string): Promise<void> {
     // Snapshot the dirty set and DRAIN it now. Vault events call markDirty() synchronously, so an
     // edit saved DURING this (possibly multi-second) cycle then re-populates this.dirty and is
     // pushed next cycle — the old blanket this.dirty.clear() at the end silently wiped such edits.
@@ -1175,7 +1366,7 @@ export class SyncEngine {
       const renameSrc = new Map<string, string>();
       for (const [oldP, newP] of this.renames) renameSrc.set(newP, oldP);
 
-      await mapPool(paths, this.opts.concurrency, async (path) => {
+      const buildEntry = async (path: string): Promise<void> => {
         // A path Obsidian's `rename` event told us was renamed away (this.renames) is tombstoned with
         // `renamedTo`, WITHOUT consulting stat(). This is the whole case-only-rename story: on a
         // case-INSENSITIVE filesystem (macOS/Windows/iOS/Android) stat(oldPath) of a rename that only
@@ -1255,21 +1446,48 @@ export class SyncEngine {
         newStates.set(path, { hash, s3VersionId: versionId, mtime });
         // A conflict-resolved file is re-pushed here too — it's already in the merged list, so don't
         // list it a second time as a plain push.
-        if (!this.mergedSet.has(path)) this.detail.pushed.push(path);
-      });
+        if (!this.mergedSet.has(path) && !this.detail.pushed.includes(path)) {
+          this.detail.pushed.push(path);
+        }
+      };
+
+      await mapPool(paths, this.opts.concurrency, buildEntry);
 
       if (Object.keys(files).length === 0) return;
+      this.assertOwner(seq, label);
 
       const result = await appendDelta(
         this.storage,
         this.state.lastSyncedRev + 1,
         (rev): Delta => ({ rev, by: this.opts.deviceId, at: new Date().toISOString(), files }),
         async (winner) => {
-          // lost the CAS race — apply the winner's entries before retrying (§1.3)
+          // Lost the CAS race (§1.3): someone else claimed this rev. Their delta has to be folded in
+          // before retrying, or the delta we go on to publish is measured against a baseline that is
+          // already stale — which is exactly how a slow cycle silently reverts other devices.
+          if (winner.by === this.opts.deviceId) return; // our own write echoing back
           for (const [path, entry] of Object.entries(winner.files)) {
-            if (winner.by !== this.opts.deviceId && !(path in files)) {
-              await this.applyRemote(path, { ...entry, rev: winner.rev, by: winner.by, at: winner.at });
+            this.assertOwner(seq, label);
+            const remote: SnapshotEntry = { ...entry, rev: winner.rev, by: winner.by, at: winner.at };
+            if (!(path in files)) {
+              await this.applyRemote(path, remote);
+              continue;
             }
+            // COLLISION: the winner touched a path this push is carrying. Skipping it — the old
+            // behavior — is a last-writer-wins hole punched straight through the union merge: our
+            // bytes go up unmodified and the winner's edit is gone, with no conflict recorded
+            // anywhere. Resolve it the way a pull would instead, PINNED to the winner's own bytes
+            // (ours are already live at that key, since files are PUT before the delta), then rebuild
+            // our payload entry from whatever the resolution left on disk.
+            delete files[path];
+            newStates.delete(path);
+            const listed = this.detail.pushed.indexOf(path);
+            if (listed >= 0) this.detail.pushed.splice(listed, 1);
+            this.dirty.delete(path);
+            await this.applyRemote(path, remote, true);
+            // applyRemote re-dirties a path whose local side survived resolution (a union merge, a
+            // freshest-wins local win, an edit that beat a delete) and leaves it clean when remote won
+            // outright. Only the former still has anything of ours left to publish.
+            if (this.dirty.delete(path)) await buildEntry(path);
           }
         },
       );
@@ -1386,7 +1604,12 @@ export class SyncEngine {
     if (localHash === null) return null;
     const p = this.pendingPull.get(path);
     if (!p) return null;
-    if (Date.now() - p.at > PENDING_PULL_TTL_MS) {
+    // Within the cycle that armed it the guard never expires (see PendingPull.cycle): pull arms it and
+    // push reads it, and a big changeset over a slow link puts far more than the TTL between the two —
+    // expiring there would disarm the guard exactly when the cycle is most likely to re-publish stale
+    // bytes. The TTL is for LATER cycles, where a revert really has become indistinguishable from an
+    // edit.
+    if (p.cycle !== this.cycleSeq && Date.now() - p.at > PENDING_PULL_TTL_MS) {
       this.pendingPull.delete(path); // stale — a real edit by now, not a clobber
       return null;
     }
@@ -1399,7 +1622,9 @@ export class SyncEngine {
     return null;
   }
 
-  /** Drop pending-pull entries past their TTL so the map can't accumulate across cycles. */
+  /** Drop pending-pull entries past their TTL so the map can't accumulate across cycles. Runs at the
+   * START of a cycle, so `p.cycle` is always an earlier one and the TTL applies unconditionally — the
+   * in-cycle exemption in phantomRevert is about reads made later in the SAME cycle. */
   private prunePendingPulls(): void {
     if (this.pendingPull.size === 0) return;
     const cutoff = Date.now() - PENDING_PULL_TTL_MS;

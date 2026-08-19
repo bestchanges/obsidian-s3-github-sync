@@ -17,6 +17,10 @@ export interface S3FetchConfig {
   bucket: string;
   /** key prefix inside the bucket, e.g. "vault/" */
   prefix?: string;
+  /** Per-attempt deadline override. Production leaves this unset and gets REQUEST_TIMEOUT_MS; tests
+   * pin it low so the timeout path can be exercised in real time (fake timers can't be used here —
+   * they stall aws4fetch's async signing before the request is ever issued). */
+  requestTimeoutMs?: number;
 }
 
 /** Per-attempt ceiling. Mobile suspends the WebView mid-request: the socket dies but the promise is
@@ -49,6 +53,7 @@ export class S3FetchAdapter implements StorageAdapter {
   private base: string;
   private prefix: string;
   private bucket: string;
+  private timeoutMs: number;
 
   constructor(cfg: S3FetchConfig) {
     this.aws = new AwsClient({
@@ -60,6 +65,7 @@ export class S3FetchAdapter implements StorageAdapter {
     this.bucket = cfg.bucket;
     this.base = `https://${cfg.bucket}.s3.${cfg.region}.amazonaws.com`;
     this.prefix = cfg.prefix ?? "";
+    this.timeoutMs = cfg.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   }
 
   private url(key: string, query?: Record<string, string>): string {
@@ -76,17 +82,34 @@ export class S3FetchAdapter implements StorageAdapter {
    * re-issuing one would turn our own write into a lost-CAS race against itself. Reads have no such
    * hazard, and they are where the resume failures actually happen (poll = LIST + GET).
    *
+   * `read` consumes the response body **inside** the deadline. `fetch()` settles as soon as the
+   * response HEADERS arrive, so a caller that reads the body afterwards does so with the abort timer
+   * already cleared by the `finally` below — headers in 200 ms, then a body that never flows, and the
+   * request hangs forever holding the engine's single-flight lock. That is the exact stall
+   * REQUEST_TIMEOUT_MS exists to prevent, so the bytes have to be pulled under the same timer. A body
+   * that stalls therefore raises AbortError and, for an idempotent request, is retried like any other
+   * transient failure.
+   *
    * Errors and non-ok responses are returned/thrown exactly as an un-retried call would, so callers
    * (and the log lines they produce) are unchanged. This layer only covers what aws4fetch does NOT:
    * it retries 5xx/429 internally but propagates network-level rejections and 403s straight up. */
-  private async request(url: string, init: RequestInit = {}, retry = false): Promise<Response> {
+  private async send<T>(
+    url: string,
+    init: RequestInit,
+    retry: boolean,
+    read?: (res: Response) => Promise<T>,
+  ): Promise<{ res: Response; body?: T }> {
     for (let attempt = 0; ; attempt++) {
       const last = !retry || attempt >= RETRY_BACKOFF_MS.length;
       const timer = new AbortController();
-      const cancel = setTimeout(() => timer.abort(), REQUEST_TIMEOUT_MS);
+      const cancel = setTimeout(() => timer.abort(), this.timeoutMs);
       try {
         const res = await this.aws.fetch(url, { ...init, signal: timer.signal });
-        if (last || !isTransientStatus(res.status)) return res;
+        if (last || !isTransientStatus(res.status)) {
+          // Only ok responses carry a body worth reading; 404/error statuses are the caller's to
+          // interpret, and draining them here would just be another chance to hang.
+          return read && res.ok ? { res, body: await read(res) } : { res };
+        }
       } catch (err) {
         if (last || !isTransientError(err)) throw err;
       } finally {
@@ -94,6 +117,11 @@ export class S3FetchAdapter implements StorageAdapter {
       }
       await sleep(RETRY_BACKOFF_MS[attempt]);
     }
+  }
+
+  /** `send` for the verbs whose response body we never read (HEAD/PUT/DELETE/COPY). */
+  private async request(url: string, init: RequestInit = {}, retry = false): Promise<Response> {
+    return (await this.send(url, init, retry)).res;
   }
 
   private static metaFromHeaders(headers: Headers): Record<string, string> {
@@ -105,15 +133,16 @@ export class S3FetchAdapter implements StorageAdapter {
   }
 
   async get(key: string, opts?: GetOptions): Promise<GetResult | null> {
-    const res = await this.request(
+    const { res, body } = await this.send(
       this.url(key, opts?.versionId ? { versionId: opts.versionId } : undefined),
       {},
       true,
+      (r) => r.arrayBuffer(),
     );
     if (res.status === 404) return null;
     if (!res.ok) throw new Error(`S3 GET ${key}: ${res.status}`);
     return {
-      body: new Uint8Array(await res.arrayBuffer()),
+      body: new Uint8Array(body!),
       etag: res.headers.get("etag") ?? undefined,
       versionId: res.headers.get("x-amz-version-id") ?? undefined,
       metadata: S3FetchAdapter.metaFromHeaders(res.headers),
@@ -158,9 +187,14 @@ export class S3FetchAdapter implements StorageAdapter {
       };
       if (startAfter) query["start-after"] = this.prefix + startAfter;
       if (token) query["continuation-token"] = token;
-      const res = await this.request(`${this.base}/?${new URLSearchParams(query)}`, {}, true);
+      const { res, body } = await this.send<string>(
+        `${this.base}/?${new URLSearchParams(query)}`,
+        {},
+        true,
+        (r) => r.text(),
+      );
       if (!res.ok) throw new Error(`S3 LIST: ${res.status}`);
-      const xml = new DOMParser().parseFromString(await res.text(), "text/xml");
+      const xml = new DOMParser().parseFromString(body!, "text/xml");
       for (const node of Array.from(xml.getElementsByTagName("Contents"))) {
         const key = node.getElementsByTagName("Key")[0]?.textContent ?? "";
         const lm = node.getElementsByTagName("LastModified")[0]?.textContent;

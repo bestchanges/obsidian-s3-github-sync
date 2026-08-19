@@ -113,14 +113,24 @@ describe("SyncEngine deferred offline scan", () => {
     expect(storage.listCalls).toBe(1); // …and its finalize did NOT start reconciling (A still holds lock)
     expect(storage.pending).toBe(1);
 
-    // Release A → the queued finalize cycle runs and pushes the dirty file the walk found.
+    // Release A's pull. The walk has already marked a.md dirty (off-lock, into the same set), so A
+    // now has something to publish — which means it revalidates its baseline with a SECOND list()
+    // before writing, rather than pushing against the view it read before the gate (§2.3).
     storage.releaseOne();
     await settle();
     expect(storage.listCalls).toBe(2);
-    storage.releaseOne(); // let the finalize's own pull unblock
+
+    // Release the revalidation pull → A pushes the dirty file the walk found.
+    storage.releaseOne();
+    await settle();
+    expect(storage.putCalls).toContain("files/a.md");
+
+    // Then the queued finalize cycle runs its own pull; nothing is dirty by now, so it needs no
+    // revalidation and no further gate beyond this one.
+    expect(storage.listCalls).toBe(3);
+    storage.releaseOne();
     await settle();
     await Promise.all([pA, pScan]);
-    expect(storage.putCalls).toContain("files/a.md");
   });
 
   it("re-verifies against the live disk, so a file present at finalize time is never tombstoned", async () => {
