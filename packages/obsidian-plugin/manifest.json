@@ -1,7 +1,7 @@
 {
   "id": "vault-s3-sync",
   "name": "S3 Vault Sync",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "minAppVersion": "1.12.2",
   "description": "Two-way vault sync via S3 (delta-journal protocol, union-merge conflicts).",
   "author": "Egor",
