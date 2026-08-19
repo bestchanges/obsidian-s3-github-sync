@@ -133,7 +133,10 @@ IoT Core needs no resources created — only permissions — so this is a grant 
 scripts/install/06-enable-push-notifications.sh --vault <name> [--role <git-sync OIDC role>]
 ```
 
-It prints the IoT **ATS data endpoint**. Then:
+It prints the IoT **ATS data endpoint**. (Vaults created after this feature landed already carry
+the IAM grant from step 6 — the script is then only endpoint discovery plus the git-sync role. If
+your operator identity lacks `iot:DescribeEndpoint`, pass `--endpoint <host>`: find it under IoT
+Core → Settings → Device data endpoint.) Then:
 
 - **each device** → plugin settings → *Instant sync (push notifications)* **on**, *IoT endpoint* =
   that host;
