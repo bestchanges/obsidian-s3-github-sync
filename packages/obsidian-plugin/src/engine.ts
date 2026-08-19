@@ -69,6 +69,13 @@ const PENDING_PULL_TTL_MS = 2 * 60 * 1000;
 const STALL_TIMEOUT_MS = 2 * 60 * 1000;
 /** How often the watchdog compares the progress clock against STALL_TIMEOUT_MS. */
 const STALL_CHECK_MS = 15 * 1000;
+/** Entries a pull applies — or a push publishes — before committing progress and looking up (§4.3).
+ * A catch-up of thousands of files used to be one indivisible unit of work: the cursor advanced only
+ * at the very end, so an interruption anywhere threw the whole thing away and the next attempt
+ * started from zero, and a queued "Sync now" waited behind all of it. Chunking makes progress
+ * durable at each boundary and gives the cycle regular points at which it can hand the lock over.
+ * Sized so an ordinary cycle (a handful of files) is entirely unaffected — only bulk catch-up splits. */
+const CYCLE_CHUNK_FILES = 500;
 /** Files stat/hashed per batch by the offline walk before it yields to the event loop. The walk runs
  * OFF the reconcile lock (§4.4), so yielding keeps the mobile UI smooth AND lets a concurrent poll/pull
  * cycle interleave — the whole point of decoupling the scan from the fast path. */
@@ -165,6 +172,9 @@ export interface EngineOptions {
    * device (they stay in the cloud), keeping mobile vaults small. 0 = no limit. Uploads are never
    * capped — a file this device creates/edits always syncs up regardless of size. */
   maxDownloadBytes: number;
+  /** Entries applied per pull chunk / published per push delta before progress is committed and the
+   * cycle looks up (§4.3). Defaults to CYCLE_CHUNK_FILES; tunable like `concurrency`. */
+  chunkFiles?: number;
   /** verbose: surface a Notice after every sync cycle that did something (§success feedback) */
   verbose: boolean;
   /** Persistent logger sink — the plugin routes this to disk + S3 (SyncLogger). Every Notice the
@@ -296,6 +306,9 @@ export class SyncEngine {
   /** Waiters of the currently-running cycle, so the watchdog can settle them when it disowns it —
    * otherwise an awaited sync() (a manual "Sync now") would hang on a promise nothing will resolve. */
   private activeWaiters: Deferred[] = [];
+  /** Set when a cycle handed the lock back mid-catch-up (§4.3): runLoop keeps draining until the
+   * journal is caught up rather than leaving the rest to whenever the next poll happens to fire. */
+  private pendingResume: CycleReq | null = null;
   // per-cycle activity counters (for the verbose summary)
   private pulled = 0;
   private pushed = 0;
@@ -360,6 +373,10 @@ export class SyncEngine {
       `files/${path}`,
       pin && remote.s3VersionId ? { versionId: remote.s3VersionId } : undefined,
     );
+  }
+
+  private get chunkFiles(): number {
+    return this.opts.chunkFiles ?? CYCLE_CHUNK_FILES;
   }
 
   /** Per-device download gate: 0 = unlimited. Unknown size → allow (correctness over space). */
@@ -846,6 +863,23 @@ export class SyncEngine {
     };
   }
 
+  /** A cycle that continues an interrupted catch-up. Deliberately minimal — the disk was already
+   * scanned by the cycle that began the catch-up, and there is no cursor to reset (resuming from the
+   * committed one is the entire point). `fullPull` IS carried over: it disables echo suppression, so
+   * dropping it mid-resync would silently stop restoring the files this device itself once wrote. */
+  private resumeReqFrom(req: CycleReq): CycleReq {
+    return {
+      resetCursor: false,
+      scanOffline: false,
+      scanConfig: false,
+      fullPull: req.fullPull,
+      label: "catch-up",
+      announce: false,
+      force: false,
+      forcePaths: [],
+    };
+  }
+
   /** Drain cycles one at a time until the queue empties, then release the lock. Each cycle settles
    * its own waiters (resolve on success, reject on failure) without stalling the ones behind it. */
   private async runLoop(token: number, firstReq: CycleReq, firstWaiters: Deferred[]): Promise<void> {
@@ -870,6 +904,13 @@ export class SyncEngine {
         waiters = this.queuedWaiters;
         this.queuedReq = null;
         this.queuedWaiters = [];
+        // Nothing queued but a catch-up was handed back mid-flight — carry on with it rather than
+        // idling until the next poll. Synthesized, so it has no waiters of its own: the caller whose
+        // request triggered the yield has already been served by the cycle that just ran.
+        if (!req && this.pendingResume) {
+          req = this.pendingResume;
+          waiters = [];
+        }
       }
     } finally {
       if (this.loopToken === token) this.running = false;
@@ -893,6 +934,9 @@ export class SyncEngine {
 
   private async reconcile(req: CycleReq, seq: number): Promise<void> {
     this.pulled = this.pushed = this.merged = this.skipped = 0;
+    // Cleared up front so a cycle that throws (abandoned, network) can't leave a stale resume armed;
+    // it is re-set below only if THIS cycle actually yields mid-catch-up.
+    this.pendingResume = null;
     this.detail = { pulled: [], pushed: [], deletedLocal: [], deletedRemote: [], mergedPaths: [] };
     this.mergedSet.clear();
     const rev0 = this.state.lastSyncedRev;
@@ -916,7 +960,9 @@ export class SyncEngine {
     else if (req.scanConfig) await this.scanConfigDir();
 
     this.prunePendingPulls();
-    await this.pull(req.fullPull);
+    // A pull that stopped at a chunk boundary to let a queued request through leaves catch-up work
+    // behind; the cycle records that so it can requeue a follow-up once the queue has drained.
+    const partialPull = await this.pull(req.fullPull);
     this.bootstrap = false; // first pull is done — later collisions are real edits again
     // Deferral is a one-cycle guard too: whatever this pull collected is handed to the prompt now,
     // and ordinary cycles (polls, edits) must resolve their conflicts normally rather than pile up
@@ -934,12 +980,21 @@ export class SyncEngine {
     // through the normal conflict resolution, so the push is always measured against current remote
     // no matter how long the cycle took. Gated on having something to push: an idle poll (the common
     // case) skips the extra LIST entirely.
-    if (this.dirty.size > 0) {
+    // A pull that yielded mid-catch-up does NOT push. Its cursor sits at a chunk boundary with known
+    // revisions still unapplied, so pushing would claim a rev the journal already has and CAS-walk
+    // through everything it just chose to defer. The dirty set is left untouched (push drains it, so
+    // not calling push is what preserves it) and the resumed cycle publishes it against a complete
+    // baseline moments later.
+    if (!partialPull) {
+      if (this.dirty.size > 0) {
+        this.assertOwner(seq, req.label);
+        await this.pull();
+      }
       this.assertOwner(seq, req.label);
-      await this.pull();
+      await this.push(seq, req.label);
     }
-    this.assertOwner(seq, req.label);
-    await this.push(seq, req.label);
+    // Unfinished catch-up must not wait for the next poll — resuming it is this cycle's business.
+    this.pendingResume = partialPull ? this.resumeReqFrom(req) : null;
 
     const activity = this.pulled + this.pushed + this.merged;
     // Persist when state changed — and always after a resync, so the reset sticks even if S3 was
@@ -959,7 +1014,8 @@ export class SyncEngine {
     this.logCycleDetail();
   }
 
-  private async pull(fullPull = false): Promise<void> {
+  /** Returns true when it stopped early with entries still to apply (see applyChunked). */
+  private async pull(fullPull = false): Promise<boolean> {
     let deltas: Delta[];
     let changed: Map<string, SnapshotEntry>;
     let targetRev: number;
@@ -971,7 +1027,7 @@ export class SyncEngine {
     if (hasGap(this.state.lastSyncedRev, deltas) || (await this.behindSnapshot(deltas))) {
       // cold path (§1.4): journal pruned past us — diff against the snapshot
       const snap = await readSnapshot(this.storage);
-      if (!snap) return;
+      if (!snap) return false;
       changed = new Map(
         Object.entries(snap.snapshot.files).filter(
           ([, e]) => e.rev > this.state.lastSyncedRev && (fullPull || e.by !== this.opts.deviceId),
@@ -982,28 +1038,97 @@ export class SyncEngine {
         changed.set(path, entry);
       }
     } else {
-      if (deltas.length === 0) return;
+      if (deltas.length === 0) return false;
       changed = changedEntries(deltas, this.state.lastSyncedRev, excludeBy);
       targetRev = deltas.at(-1)!.rev;
     }
 
-    // Apply live entries BEFORE tombstones so a rename's destination (`new`) is materialized before
-    // its old-side tombstone folds a divergent local `old` onto it. Ordering is otherwise
-    // irrelevant to correctness — a delete after applying lives is always safe.
     const applicable = [...changed.entries()].filter(
       ([path]) => !this.isExcluded(path) && this.isSafePath(path),
     );
-    const lives = applicable.filter(([, e]) => !isTombstone(e));
-    const tombstones = applicable.filter(([, e]) => isTombstone(e));
     // Index tracked paths by canonical identity so applyRemote can spot a node that already exists
     // locally under a DIFFERENT case/NFC form and rename the on-disk file to the winning name
     // (display-case propagation, §1.2a). Built once per pull, read-only during the concurrent apply.
     this.nodeIndex = new Map();
     for (const k of Object.keys(this.state.files)) this.nodeIndex.set(canonicalKey(k), k);
-    await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
-    await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
-    this.nodeIndex = undefined;
-    this.state.lastSyncedRev = targetRev;
+    try {
+      return await this.applyChunked(applicable, targetRev);
+    } finally {
+      this.nodeIndex = undefined;
+    }
+  }
+
+  /**
+   * Apply `applicable` in **revision order**, committing the cursor at each chunk boundary.
+   *
+   * Chunks are cut on a revision boundary, never mid-revision, because `lastSyncedRev` is a single
+   * integer: it may only advance to a rev whose entries are ALL applied. Cutting on the boundary
+   * makes each committed cursor exactly as trustworthy as the old commit-once-at-the-end, while a
+   * catch-up that dies (killed app, watchdog, closed laptop) keeps everything up to the last
+   * boundary instead of starting over.
+   *
+   * This works for the cold path too: entries folded out of a snapshot carry their authoring `rev`,
+   * and the cold path selects on `e.rev > lastSyncedRev`, so committing a partial cursor correctly
+   * narrows what the next pass reconsiders.
+   *
+   * Returns true if it stopped early with work left — the cycle then requeues a follow-up.
+   */
+  private async applyChunked(
+    applicable: [string, SnapshotEntry][],
+    targetRev: number,
+  ): Promise<boolean> {
+    // Group by authoring rev so a chunk can never split one revision across two commits.
+    const byRev = new Map<number, [string, SnapshotEntry][]>();
+    for (const item of applicable) {
+      const rev = item[1].rev ?? targetRev;
+      const bucket = byRev.get(rev);
+      if (bucket) bucket.push(item);
+      else byRev.set(rev, [item]);
+    }
+    const revs = [...byRev.keys()].sort((a, b) => a - b);
+
+    let i = 0;
+    while (i < revs.length) {
+      const chunk: [string, SnapshotEntry][] = [];
+      let lastRev = revs[i];
+      // Take whole revisions until the chunk is full. At least one revision always goes in, so a
+      // single oversized revision still makes progress rather than deadlocking.
+      while (i < revs.length && (chunk.length === 0 || chunk.length + byRev.get(revs[i])!.length <= this.chunkFiles)) {
+        chunk.push(...byRev.get(revs[i])!);
+        lastRev = revs[i];
+        i++;
+      }
+
+      // Live entries BEFORE tombstones so a rename's destination (`new`) is materialized before its
+      // old-side tombstone folds a divergent local `old` onto it (§2.8). A rename emits both sides in
+      // ONE delta, so both always land in the same chunk and the ordering survives chunking intact.
+      const lives = chunk.filter(([, e]) => !isTombstone(e));
+      const tombstones = chunk.filter(([, e]) => isTombstone(e));
+      await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
+      await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
+
+      const done = i >= revs.length;
+      // On the last chunk take `targetRev` — it can exceed the highest rev that carried an applicable
+      // entry (revisions this device authored, or ones filtered out as excluded/unsafe), and stopping
+      // short of it would re-list those forever.
+      this.state.lastSyncedRev = done ? targetRev : lastRev;
+      if (done) return false;
+
+      // Commit what this chunk achieved before starting the next one: that write is the whole point
+      // of chunking — it is what an interrupted catch-up resumes from.
+      await this.opts.onStateChanged(this.state);
+      // Somebody is waiting (a manual sync, an edit save). Hand the lock over at this clean boundary
+      // rather than making them wait out the entire catch-up; the follow-up cycle resumes from the
+      // cursor just committed.
+      if (this.queuedReq !== null) {
+        this.opts.log(
+          "info",
+          `catch-up paused at rev ${lastRev} (${revs.length - i} revisions still to apply) — yielding to queued work`,
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   private async behindSnapshot(deltas: Delta[]): Promise<boolean> {
@@ -1357,14 +1482,34 @@ export class SyncEngine {
     for (const p of snapshot) this.dirty.delete(p);
     if (paths.length === 0) return;
 
+    // Reverse rename map (destination → source), captured BEFORE any batch drains this.renames.
+    // A rename whose content is unchanged is pushed with a server-side S3 copy from the OLD object
+    // instead of re-uploading the bytes (rename-without-edit optimization).
+    const renameSrc = new Map<string, string>();
+    for (const [oldP, newP] of this.renames) renameSrc.set(newP, oldP);
+
+    // Publish in batches, each its own delta. A bulk push (first sync, a big offline catch-up) used
+    // to be one enormous delta that either landed whole or was retried whole; batching commits state
+    // as it goes, so an interruption keeps everything already published instead of redoing it. An
+    // ordinary cycle is far below the cap and still produces exactly one delta, as before.
+    for (let start = 0; start < paths.length; start += this.chunkFiles) {
+      const batch = paths.slice(start, start + this.chunkFiles);
+      // Anything not yet published stays this cycle's responsibility to requeue on failure.
+      await this.pushBatch(batch, paths.slice(start), renameSrc, seq, label);
+    }
+  }
+
+  private async pushBatch(
+    batch: string[],
+    remaining: string[],
+    renameSrc: Map<string, string>,
+    seq: number,
+    label: string,
+  ): Promise<void> {
     try {
       const files: Record<string, DeltaEntry> = {};
       const newStates = new Map<string, FileState | null>();
-      // Reverse rename map (destination → source), captured BEFORE the mapPool drains this.renames.
-      // A rename whose content is unchanged is pushed with a server-side S3 copy from the OLD object
-      // instead of re-uploading the bytes (rename-without-edit optimization).
-      const renameSrc = new Map<string, string>();
-      for (const [oldP, newP] of this.renames) renameSrc.set(newP, oldP);
+      const paths = batch;
 
       const buildEntry = async (path: string): Promise<void> => {
         // A path Obsidian's `rename` event told us was renamed away (this.renames) is tombstoned with
@@ -1499,9 +1644,12 @@ export class SyncEngine {
       this.state.lastSyncedRev = result.rev;
       this.pushed += Object.keys(files).length;
     } catch (err) {
-      // Push failed — requeue the paths we drained so the next cycle retries them (§2.6). Edits
-      // that arrived mid-cycle are already back in this.dirty; re-adding is a harmless Set no-op.
-      for (const p of paths) this.dirty.add(p);
+      // Push failed — requeue everything not yet published (this batch and any batch after it) so the
+      // next cycle retries them (§2.6). Batches already committed above are NOT requeued: their state
+      // is recorded, so re-listing them would only make the next cycle re-hash files it knows are
+      // current. Edits that arrived mid-cycle are already back in this.dirty; re-adding is a harmless
+      // Set no-op.
+      for (const p of remaining) this.dirty.add(p);
       throw err;
     }
   }
