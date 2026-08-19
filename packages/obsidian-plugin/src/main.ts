@@ -6,6 +6,7 @@ import { VersionHistoryModal } from "./history-modal";
 import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
+import { pollDelayMs } from "./poll-schedule";
 import { decodeJsonGz, encodeJsonGz, readFileHistory } from "@vault-sync/core";
 
 interface Settings {
@@ -18,7 +19,7 @@ interface Settings {
   /** machine the deviceId/state were minted on — recomputed each load, never trusted from disk;
    * a mismatch means data.json was copied from another device (regenerate id + full resync) */
   machineFingerprint: string;
-  pollIntervalSec: number; // default 15 (§2.3)
+  pollIntervalSec: number; // default 15 — the BASELINE of the adaptive poll (§4.9a)
   excludedFolders: string[]; // local-only until re-enabled (§2.2)
   /** per-device download cap in MB; files larger than this stay in the cloud on THIS device to
    * save space (uploads always sync). 0 = no limit. Lives in per-device data.json, so each device
@@ -101,6 +102,10 @@ const OFFLINE_SCAN_DELAY_MS = 30_000;
 const POLL_LATE_FACTOR = 2;
 /** How long to let the network settle after a resume before the catch-up cycle. */
 const RESUME_GRACE_MS = 1_500;
+
+/** Returning to a device syncs immediately instead of waiting out the pending tick — that wait is
+ * exactly the latency people notice. Throttled so alt-tabbing doesn't cost a cycle each time. */
+const FOCUS_SYNC_MIN_GAP_MS = 5_000;
 /** Consecutive background failures before a transient network error is worth a Notice. Resume
  * failures come in ones and recover on the next cycle; a real outage keeps counting. */
 const TRANSIENT_QUIET_FAILURES = 3;
@@ -129,6 +134,12 @@ export default class S3SyncPlugin extends Plugin {
    * normal tick from one that fired after the device was frozen (§resume handling in startPolling). */
   private lastPollTick = 0;
   private pollIntervalMs = 0;
+  /** True once the poll loop has been armed — the tier helpers and the focus trigger are no-ops
+   * before that (unconfigured vault, or startup still waiting on the vault index). */
+  private polling = false;
+  /** Wall clock of the last observed movement (local edit, or a cycle that changed state). Drives
+   * the ACTIVE poll tier; 0 means "nothing yet this session", which reads as idle. */
+  private lastActivityAt = 0;
   /** Armed catch-up cycle after a resume; non-null means one is already pending, so the drift check
    * and the visibility event coalesce into a single sync instead of racing each other. */
   private resumeTimer: number | null = null;
@@ -256,10 +267,21 @@ export default class S3SyncPlugin extends Plugin {
         return;
       }
       if (this.pollTimer === null) return;
-      if (Date.now() - this.lastPollTick < this.pollIntervalMs) return;
+      // Visible again: re-arm so the loop leaves the BACKGROUND tier immediately rather than after
+      // one more long tick (§4.9a). Only sync from here when a poll is genuinely due — a quick app
+      // switch shouldn't trigger an extra cycle, and `focus` covers the desktop case anyway.
+      if (Date.now() - this.lastPollTick < this.pollIntervalMs) {
+        this.startPolling();
+        return;
+      }
       this.lastPollTick = Date.now();
       this.scheduleResumeSync();
+      this.startPolling();
     });
+
+    // Desktop app-switching raises `focus` without ever changing visibilityState, so this is the
+    // only signal for "the user came back to this window" (§4.9a).
+    this.registerDomEvent(window, "focus", () => this.onReturnToDevice());
 
     // defer startup sync until the vault index is ready
     this.app.workspace.onLayoutReady(() => void this.startup());
@@ -270,7 +292,8 @@ export default class S3SyncPlugin extends Plugin {
     // Kick it BEFORE clearing pushTimer (flushPendingPush cancels the debounce and syncs now).
     this.flushPendingPush();
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
-    if (this.pollTimer) window.clearInterval(this.pollTimer);
+    this.polling = false;
+    if (this.pollTimer) window.clearTimeout(this.pollTimer); // self-rescheduling timeout, not an interval
     if (this.resumeTimer) window.clearTimeout(this.resumeTimer);
     this.clearOfflineScan();
     void this.logger?.flush(); // best-effort: land any buffered lines before teardown
@@ -649,6 +672,10 @@ export default class S3SyncPlugin extends Plugin {
         // pushed those bytes (the journal only has what reached S3).
         onBeforeOverwrite: (path) => this.recoverySnapshot(path),
         onStateChanged: async (state) => {
+          // The engine persists only when a cycle actually moved something or the cursor advanced
+          // (§4.3), which makes this the cheapest honest "the vault is in motion" signal available —
+          // no engine API change, and it covers remote pulls as well as our own pushes (§4.9a).
+          this.lastActivityAt = Date.now();
           this.syncState = state;
           await this.persistState();
         },
@@ -778,11 +805,21 @@ export default class S3SyncPlugin extends Plugin {
     return choice;
   }
 
+  /** (Re)arm the poll loop. A self-rescheduling timeout rather than a fixed `setInterval`, so every
+   * tick re-picks the tier that fits the moment (§4.9a) — a `setInterval` would freeze whichever
+   * cadence happened to be current when polling started. Idempotent: the pending tick is always
+   * cleared first, so settings changes and resumes can call it freely. */
   startPolling(): void {
-    if (this.pollTimer) window.clearInterval(this.pollTimer);
-    this.pollIntervalMs = Math.max(5, this.settings.pollIntervalSec) * 1000;
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer);
+    this.polling = true;
     this.lastPollTick = Date.now();
-    this.pollTimer = window.setInterval(() => {
+    this.armPoll();
+  }
+
+  private armPoll(): void {
+    this.pollIntervalMs = this.pollDelayMs();
+    this.pollTimer = window.setTimeout(() => {
+      this.pollTimer = null;
       const now = Date.now();
       // A tick that is this late means the clock ran on while the WebView didn't: the device was
       // suspended. Its network stack comes back a beat after the JS does, so let it settle rather
@@ -791,8 +828,33 @@ export default class S3SyncPlugin extends Plugin {
       this.lastPollTick = now;
       if (resumed) this.scheduleResumeSync();
       else void this.runSync("poll");
+      this.armPoll(); // re-arm first thing: the cycle above is fire-and-forget and may outlive a tick
     }, this.pollIntervalMs);
-    this.registerInterval(this.pollTimer);
+  }
+
+  /** The delay this tick should use — tier choice lives in `poll-schedule.ts` (pure, tested). */
+  private pollDelayMs(): number {
+    return pollDelayMs({
+      baseMs: Math.max(5, this.settings.pollIntervalSec) * 1000,
+      hidden: document.visibilityState === "hidden",
+      msSinceActivity: this.lastActivityAt ? Date.now() - this.lastActivityAt : Infinity,
+    });
+  }
+
+  /** The user just came back to this device (desktop window focus, or the app returning to the
+   * foreground). Desktop app-switching raises `focus` without ever touching `visibilityState`, so
+   * the tick alone can leave a just-focused window a full interval stale — sync now instead. A gap
+   * long enough to look like a suspend goes through the resume path's grace period instead, since
+   * the network is usually not up yet. */
+  private onReturnToDevice(): void {
+    if (!this.polling) return;
+    const now = Date.now();
+    if (now - this.lastPollTick < FOCUS_SYNC_MIN_GAP_MS) return;
+    const resumed = now - this.lastPollTick > this.pollIntervalMs * POLL_LATE_FACTOR;
+    this.lastPollTick = now;
+    if (resumed) this.scheduleResumeSync();
+    else void this.runSync("focus");
+    this.startPolling(); // re-arm: the foreground tier is likely shorter than the pending tick
   }
 
   /** Arm the one catch-up cycle that follows a resume. Idempotent while pending, so the drift check
@@ -807,6 +869,7 @@ export default class S3SyncPlugin extends Plugin {
   }
 
   private schedulePush(): void {
+    this.lastActivityAt = Date.now(); // a local edit puts this device in the ACTIVE tier (§4.9a)
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     this.pushTimer = window.setTimeout(() => void this.runSync("debounced-edit"), PUSH_DEBOUNCE_MS);
   }
@@ -835,8 +898,8 @@ export default class S3SyncPlugin extends Plugin {
             ? // force: the user asked for this cycle, so it reports start/finish (and any conflict
               // or queued-behind notice) whether or not verbose mode is on.
               { scanConfig: true, label: "manual sync", announce: true, force: true }
-            : reason === "poll"
-              ? { scanConfig: true, label: "poll" }
+            : reason === "poll" || reason === "focus"
+              ? { scanConfig: true, label: reason === "focus" ? "return to device" : "poll" }
               : reason === "background-flush"
                 ? // app backgrounded/closed: push the pending edit, don't scan (§4.4)
                   { label: "background flush" }
@@ -954,7 +1017,11 @@ class S3SyncSettingTab extends PluginSettingTab {
       t.setValue(s.prefix).onChange(async (v) => { s.prefix = v.trim(); await save(); }));
     new Setting(containerEl)
       .setName("Poll interval (seconds)")
-      .setDesc("Default 15. One cheap LIST per interval.")
+      .setDesc(
+        "Default 15. One cheap LIST per interval — and a baseline, not a fixed rate: the plugin " +
+          "polls every 5 s for two minutes after any change, backs off to a minute while this " +
+          "window is in the background, and syncs immediately when you return to it.",
+      )
       .addText((t) =>
         t.setValue(String(s.pollIntervalSec)).onChange(async (v) => {
           const n = Number(v);
