@@ -3,6 +3,7 @@ import {
   ACTIVE_POLL_MS,
   ACTIVE_WINDOW_MS,
   BACKGROUND_POLL_MIN_MS,
+  PUSH_CONNECTED_POLL_MS,
   pollDelayMs,
 } from "../src/poll-schedule";
 
@@ -46,5 +47,37 @@ describe("adaptive poll tiers (§4.9a)", () => {
 
   it("scales the background tier with a long baseline rather than capping it", () => {
     expect(pollDelayMs({ baseMs: 60_000, hidden: true, msSinceActivity: Infinity })).toBe(240_000);
+  });
+});
+
+describe("push-connected tier (§4.14)", () => {
+  it("relaxes the idle baseline while a notification socket is live", () => {
+    expect(
+      pollDelayMs({ baseMs: BASE, hidden: false, msSinceActivity: Infinity, pushConnected: true }),
+    ).toBe(PUSH_CONNECTED_POLL_MS);
+  });
+
+  it("re-tightens the moment the socket drops — no state to reset", () => {
+    const args = { baseMs: BASE, hidden: false, msSinceActivity: Infinity };
+    expect(pollDelayMs({ ...args, pushConnected: true })).toBe(PUSH_CONNECTED_POLL_MS);
+    expect(pollDelayMs({ ...args, pushConnected: false })).toBe(BASE);
+  });
+
+  it("still honours the ACTIVE tier — a local burst is about pushing, not listening", () => {
+    expect(
+      pollDelayMs({ baseMs: BASE, hidden: false, msSinceActivity: 1_000, pushConnected: true }),
+    ).toBe(ACTIVE_POLL_MS);
+  });
+
+  it("never shortens a deliberately longer baseline", () => {
+    expect(
+      pollDelayMs({ baseMs: 300_000, hidden: false, msSinceActivity: Infinity, pushConnected: true }),
+    ).toBe(300_000);
+  });
+
+  it("keeps backing off while hidden, connected or not", () => {
+    expect(
+      pollDelayMs({ baseMs: BASE, hidden: true, msSinceActivity: 0, pushConnected: true }),
+    ).toBe(BASE * 4);
   });
 });

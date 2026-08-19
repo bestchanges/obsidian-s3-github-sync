@@ -28,6 +28,7 @@ import { DEFAULT_SNAPSHOT_MAX_AGE_HOURS, shouldCompact } from "./compaction";
 import { S3SdkAdapter } from "./s3-adapter";
 import { onLostRace, reconcileFile, ReconcileIO, ReconcileOutcome, UploadAction } from "./reconcile";
 import { makeMergeBaseResolver, resolveDiffBase } from "./merge-base";
+import { createRevPublisher } from "./notify";
 import { createLogger } from "./log";
 
 const WRITER_ID = "git-sync";
@@ -120,6 +121,14 @@ async function main(): Promise<void> {
   const retentionDays = Number(process.env.RETENTION_DAYS ?? "30");
   const storage = new S3SdkAdapter(bucket, process.env.PREFIX ?? "", process.env.AWS_REGION);
   const git = new Git(repoDir);
+  // Optional (§4.14): with IOT_ENDPOINT unset this is a no-op and nothing about the run changes.
+  const revPublisher = createRevPublisher({
+    endpoint: process.env.IOT_ENDPOINT,
+    region: process.env.AWS_REGION,
+    prefix: process.env.PREFIX ?? "",
+    by: WRITER_ID,
+    log: (m) => logger.info(m),
+  });
 
   // ---- refresh to the real remote tip ------------------------------------
   // The workflow checks out github.sha — the commit that *triggered* the run, frozen at trigger
@@ -340,6 +349,9 @@ async function main(): Promise<void> {
       (winner) => onLostRace(winner, files, remote.revision, (m) => logger.warn(m)),
     );
     logger.info(`appended delta rev=${result.rev} (${uploads.size} entries)`);
+    // Tell the devices now instead of leaving them to notice on their next poll (§4.14). Strictly
+    // after the append, and best-effort inside — an announcement can never fail the run.
+    await revPublisher.publish(result.rev);
   }
 
   // ---- compaction (§3.3 step 8), age-gated (§2.5) ---------------------------

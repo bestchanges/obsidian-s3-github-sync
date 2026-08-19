@@ -9,6 +9,7 @@ import {
   type Snapshot,
   type StorageAdapter,
 } from "@vault-sync/core";
+import type { RevPublisher } from "@vault-sync/git-sync/src/notify";
 
 /** Writer id in the delta journal — the other legs echo-suppress only their OWN id, so a constant works. */
 export const WRITER_ID = "mcp";
@@ -54,6 +55,9 @@ export class VaultClient {
   constructor(
     private storage: StorageAdapter,
     private concurrency = 16,
+    /** Announces appended revisions so devices pull them immediately (§4.14). Defaults to a no-op,
+     * which is what an unconfigured deployment gets — announcing is optional by design. */
+    private revPublisher: RevPublisher = { publish: async () => {} },
   ) {}
 
   private async state(): Promise<Snapshot> {
@@ -124,14 +128,18 @@ export class VaultClient {
     return { rev };
   }
 
-  private append(startRev: number, path: string, entry: DeltaEntry) {
+  private async append(startRev: number, path: string, entry: DeltaEntry) {
     // No onLostRace handler: a lost CAS race just retries at rev+1 — this client has no local
     // state to reconcile the winner into, and a later rev already means "we win the fold".
-    return appendDelta(this.storage, startRev, (rev): Delta => ({
+    const result = await appendDelta(this.storage, startRev, (rev): Delta => ({
       rev,
       by: WRITER_ID,
       at: new Date().toISOString(),
       files: { [path]: entry },
     }));
+    // Strictly after the append, and best-effort inside the publisher: an edit made through MCP
+    // reaches the user's devices in milliseconds instead of at their next poll (§4.14).
+    await this.revPublisher.publish(result.rev);
+    return result;
   }
 }

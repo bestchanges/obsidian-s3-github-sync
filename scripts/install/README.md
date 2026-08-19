@@ -2,7 +2,7 @@
 
 Provision a vault-sync setup from the command line. Five small, idempotent scripts, split so each
 concern runs on its own — and so the **GitHub leg is optional** (an S3-only vault needs just 01, 02, 04)
-and the **MCP leg is optional** (05).
+and the **MCP leg** (05) and **instant sync** (06) are optional.
 
 ```
 01-create-bucket.sh      shared S3 bucket (versioning, block-public, SSE-S3, CORS)   ── once per bucket
@@ -10,6 +10,7 @@ and the **MCP leg is optional** (05).
 03-create-vault-repo.sh  per-vault GitHub repo + OIDC Actions role (git leg)         ── per vault, OPTIONAL
 04-init-vault-zip.sh      per-vault <vault>.zip for a device                          ── per vault
 05-create-mcp-server.sh  per-vault remote MCP server (Lambda + Function URL)         ── per vault, OPTIONAL
+06-enable-push-notifications.sh  instant sync via IoT Core (IAM grants only)         ── per vault, OPTIONAL
 ```
 
 Layout on S3: `s3://<bucket>/<user>/vaults/<vault>/…` where **`user` is your AWS IAM username**
@@ -53,6 +54,15 @@ cp .env.shadow .env      # then edit .env
 It prints the endpoint and a ready-to-paste `claude mcp add …` command. Re-running reconciles
 config and redeploys the current build; `--rotate-token` replaces the bearer token. Component
 design and details: [`packages/mcp-server/README.md`](../../packages/mcp-server/README.md).
+
+**Instant sync for a vault (optional — sub-second cross-device delivery instead of polling):**
+```bash
+./06-enable-push-notifications.sh --vault work --role vault-sync-work   # IAM grants + endpoint
+```
+Creates nothing: IoT Core needs no resources for a plain MQTT topic, so this only attaches an `iot`
+policy to the plugin user (scoped to `vaultsync/<slug>/rev`) and an `iot:Publish` grant to the
+git-sync role, then prints the ATS endpoint to paste into each device's settings and
+`S3_SYNC_IOT_ENDPOINT`. Safe to skip — sync falls back to polling. Details: IMPLEMENTATION.md §4.14.
 
 Add a second vault for the same user: just `03` (optional) + `04` with a new `--vault`.
 Every script takes `--dry-run` (print, don't mutate) and `--yes` (skip confirmations).

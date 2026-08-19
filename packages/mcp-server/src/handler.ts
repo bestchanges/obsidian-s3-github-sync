@@ -1,10 +1,11 @@
 import { JSONRPCMessageSchema, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { S3SdkAdapter } from "@vault-sync/git-sync/src/s3-adapter";
+import { createRevPublisher } from "@vault-sync/git-sync/src/notify";
 import { checkBearer } from "./auth";
 import { buildServer, type ServerDeps } from "./mcp";
 import { makePresigner } from "./presign";
 import { SingleShotTransport } from "./transport";
-import { VaultClient } from "./vault";
+import { VaultClient, WRITER_ID } from "./vault";
 
 /** Lambda Function URL event (payload format 2.0) — the few fields we use, typed inline. */
 export interface FunctionUrlEvent {
@@ -45,7 +46,18 @@ function init(): { config: Config; deps: ServerDeps } {
   cached = {
     config,
     deps: {
-      vault: new VaultClient(new S3SdkAdapter(config.bucket, config.prefix, config.region)),
+      vault: new VaultClient(
+        new S3SdkAdapter(config.bucket, config.prefix, config.region),
+        undefined,
+        // Optional (§4.14): with IOT_ENDPOINT unset this is a no-op publisher and writes behave
+        // exactly as before — devices simply learn about them on their next poll.
+        createRevPublisher({
+          endpoint: process.env.IOT_ENDPOINT,
+          region: config.region,
+          prefix: config.prefix,
+          by: WRITER_ID,
+        }),
+      ),
       presignGet: makePresigner(config.bucket, config.prefix, config.region),
     },
   };

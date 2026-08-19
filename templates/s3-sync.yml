@@ -67,5 +67,8 @@ jobs:
           REPO_DIR: ${{ github.workspace }}
           RETENTION_DAYS: "30"
           SNAPSHOT_MAX_AGE_HOURS: "24" # rebuild snapshot.json.gz at most this often (0 = every run)
+          # Optional (§4.14): announce each appended revision so devices pull it immediately instead
+          # of at their next poll. Unset = no announcement, everything else unchanged.
+          IOT_ENDPOINT: ${{ vars.S3_SYNC_IOT_ENDPOINT }}
           LOG_LEVEL: "info" # debug|info|warn|error — bump to debug for per-file no-op/skip diagnostics
         run: npx --prefix .sync-tool tsx .sync-tool/packages/git-sync/src/main.ts

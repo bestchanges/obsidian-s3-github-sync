@@ -1,14 +1,15 @@
 ---
 title: Change Notification Design — push instead of polling
 tags: [design, sync, s3, iot, latency]
-status: proposed
+status: implemented
 created: 2026-08-20
 ---
 
 # Change Notification Design
 
-How a device learns that the journal advanced. Tier 0 (**adaptive polling**) is **implemented** —
-IMPLEMENTATION.md §4.9a. Tier 1 (**publisher-announce push**) is **proposed** and specified here.
+How a device learns that the journal advanced. **Both tiers are now implemented** — Tier 0
+(**adaptive polling**) as IMPLEMENTATION.md §4.9a, Tier 1 (**publisher-announce push**) as §4.14.
+This document is the rationale, cost model and rejected alternatives; §4.14 is what the code does.
 
 > [!summary] One paragraph
 > Every writer already knows the revision it just appended, so nothing needs to watch S3. After a
@@ -174,19 +175,22 @@ whose expensive bugs have all been correctness bugs.
 
 ---
 
-# 7. Implementation checklist
+# 7. Implementation checklist (done)
 
-1. `scripts/install/` — resolve the ATS endpoint (`aws iot describe-endpoint --endpoint-type
+1. ✅ `scripts/install/06-enable-push-notifications.sh` — resolve the ATS endpoint (`aws iot describe-endpoint --endpoint-type
    iot:Data-ATS`), extend the plugin IAM user's policy and the git-sync OIDC role with the four
    `iot:*` actions, scoped to the vault topic; record the endpoint in SETUP.md.
-2. `packages/obsidian-plugin/src/mqtt.ts` — minimal QoS-0 MQTT-over-WSS client (packet codec +
+2. ✅ `packages/obsidian-plugin/src/mqtt.ts` — minimal QoS-0 MQTT-over-WSS client (packet codec +
    connect/subscribe/publish/ping), unit-tested against captured packet fixtures.
-3. `packages/obsidian-plugin/src/notify.ts` — presign, connect, backoff, lifecycle; `onRev` callback
+3. ✅ `packages/obsidian-plugin/src/notify.ts` — presign, connect, backoff, lifecycle; `onRev` callback
    into `runSync("notified")`.
-4. `main.ts` — wire lifecycle to the existing poll/focus/visibility handling; add the two settings;
+4. ✅ `main.ts` — wire lifecycle to the existing poll/focus/visibility handling; add the two settings;
    relax the baseline to 60 s when notifications are connected.
-5. `packages/git-sync` + `packages/mcp-server` — publish after append; failure logs and continues.
-6. Docs: IMPLEMENTATION.md §4.9a (Tier 1 section + constants), §7.1 settings, §8 infra, §10 security.
+5. ✅ `packages/git-sync` + `packages/mcp-server` — publish after append; failure logs and continues.
+6. ✅ Docs: IMPLEMENTATION.md §4.14 + §1/§7.1/§7.2/§7.3/§8/§9/§10/§11.
 
-Staging: ship subscriber-only first with the poll baseline **unchanged**, confirm messages arrive in
-the field via the existing per-device logs (§4.11), and only then relax the baseline.
+**Staging as shipped:** the whole feature is **off by default** (`pushNotifications`), which is the
+safer form of the original staging plan — a device opts in, and the baseline relaxation keys on the
+socket being *connected right now*, so it reverts by itself the moment push stops working rather
+than needing a second rollout to undo. Verify in the field with plugin logging on two devices: edit
+on one, look for `notify: rev <n> from <device>` on the other.
