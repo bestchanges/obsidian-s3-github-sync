@@ -65,6 +65,7 @@ function makeVault(
 
 function makeEngine(vault: any, storage: GatedStorage, state: SyncState) {
   const persisted: SyncState[] = [];
+  const logs: string[] = [];
   const engine = new SyncEngine(vault, storage as unknown as StorageAdapter, state, {
     deviceId: "dev-test",
     selfDir: ".obsidian/plugins/vault-s3-sync",
@@ -72,10 +73,10 @@ function makeEngine(vault: any, storage: GatedStorage, state: SyncState) {
     concurrency: 4,
     maxDownloadBytes: 0,
     verbose: false,
-    log: () => {},
+    log: (_level, msg) => void logs.push(msg),
     onStateChanged: async (s) => void persisted.push(s),
   });
-  return { engine, persisted };
+  return { engine, persisted, logs };
 }
 
 async function settle(): Promise<void> {
@@ -170,5 +171,36 @@ describe("SyncEngine deferred offline scan", () => {
 
     expect(state.lastSyncedRev).toBe(0); // cursor reset → cold re-pull restores the "missing" files
     expect(storage.putCalls).toHaveLength(0); // restored from S3, never tombstoned
+  });
+
+  it("tombstones a bulk delete below the fraction — 60% missing is trusted, not restored", async () => {
+    // 20 tracked files, 12 of them gone (60%): over MASS_MISSING_MIN but under the 80% fraction, so
+    // these count as genuine offline deletes and propagate. Pins the threshold — at the old 50% this
+    // band was restored instead, and the constant is otherwise unguarded by anything.
+    const disk = new Map<string, Uint8Array>();
+    const files: Record<string, { hash: string; mtime: string }> = {};
+    for (let i = 0; i < 20; i++) files[`n${i}.md`] = { hash: `h${i}`, mtime: "t" };
+    for (let i = 0; i < 8; i++) disk.set(`n${i}.md`, new Uint8Array([1])); // the survivors
+    const state: SyncState = { lastSyncedRev: 7, files };
+    const { engine, logs } = makeEngine(
+      makeVault(disk, { existsFor: (p) => disk.has(p) }),
+      storage,
+      state,
+    );
+
+    const p = engine.scanForOfflineChanges();
+    await settle();
+    storage.releaseOne(); // finalize's pull
+    await settle();
+    storage.releaseOne(); // revalidation pull (there is now something to push)
+    await settle();
+    await p;
+
+    // The guard announces itself when it fires; its silence is the assertion. (The cursor is NOT a
+    // usable signal here — the guard resets it to 0, but the same cycle's push then advances it
+    // again, so it ends up non-zero either way.)
+    expect(logs.some((m) => m.includes("state mismatch"))).toBe(false);
+    // The 12 absences propagated as tombstones instead of being restored.
+    expect(logs.filter((m) => m.startsWith("↑ deleted"))).toHaveLength(12);
   });
 });

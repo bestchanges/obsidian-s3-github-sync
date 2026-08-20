@@ -50,7 +50,12 @@ const LWW_SIZE_LIMIT = 5 * 1024 * 1024; // >5 MB: never union-merge (§2.6)
  * state looks identical to a mass delete). Below the floor we trust it as genuine offline deletes;
  * above the fraction we treat it as a state mismatch and RESTORE from S3 instead of tombstoning. */
 const MASS_MISSING_MIN = 10;
-const MASS_MISSING_FRACTION = 0.5;
+/** Raised 0.5 → 0.8 (2026-08-20). This is the LESS cautious direction: a disappearance of 50–80% of
+ * the vault is now trusted as genuine offline deletes and tombstoned, where it used to be caught and
+ * restored. The trade is deliberate — a real bulk deletion in that band was being reverted, and the
+ * `MASS_MISSING_MIN` floor plus the adopted-state guard above still cover the cases this exists for
+ * (a copied/restored/half-mounted vault, which loses effectively everything, not two thirds). */
+const MASS_MISSING_FRACTION = 0.8;
 /** Per-cycle log detail cap: how many file paths we list PER DIRECTION before collapsing the rest to
  * "…and N more". A resync/first-sync moves thousands of files; without a cap one cycle would flood
  * the 512 KB rotating log and the S3 tail. The counts in the summary Notice are always exact. */
