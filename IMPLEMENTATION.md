@@ -528,10 +528,15 @@ guard.
 
 > [!important] Mass-missing guard (offline-delete safety)
 > If ≥ `MASS_MISSING_MIN` (10) tracked files are missing **and** they exceed
-> `MASS_MISSING_FRACTION` (50%) of tracked files, that is almost certainly a stale/copied/moved
+> `MASS_MISSING_FRACTION` (80%) of tracked files, that is almost certainly a stale/copied/moved
 > state, not real deletions. Rather than tombstone (which would wipe the vault everywhere), the
 > engine resets `lastSyncedRev = 0` and **restores from S3**. Below the floor, missing files
 > propagate as normal tombstones.
+>
+> The fraction was 50% until 2026-08-20. Raising it is the *less* cautious direction — a vault that
+> loses 50–80% of its files now tombstones them rather than restoring — chosen because a genuine bulk
+> deletion in that band was being reverted. The scenarios the guard exists for (a copied, restored or
+> half-mounted vault) lose effectively everything, not two thirds, so they still trip it.
 
 > [!important] Case-insensitive, NFC path identity (§1.2a)
 > Obsidian treats a note's name as **case-insensitive** on every platform — `Foo.md`, `foo.md`,
@@ -1213,7 +1218,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Transfer concurrency | 8 mobile / 50 desktop / 50 CI | settings / `CONCURRENCY` |
 | Download cap | 10 MB (0 = off) | plugin `maxDownloadMB` |
 | Union-merge cutoff | 5 MB / binary → LWW | `LWW_SIZE_LIMIT` (engine.ts) |
-| Mass-missing guard | ≥10 files **and** >50% | `MASS_MISSING_MIN` / `MASS_MISSING_FRACTION` |
+| Mass-missing guard | ≥10 files **and** >80% | `MASS_MISSING_MIN` / `MASS_MISSING_FRACTION` |
 | Oversized git file | 25 MB | `GIT_MAX_FILE_BYTES` / `DEFAULT_MAX_GIT_FILE_BYTES` |
 | Delta retention | 30 days | `RETENTION_DAYS` |
 | Snapshot max age (compaction gate) | 24 h | `SNAPSHOT_MAX_AGE_HOURS` / `DEFAULT_SNAPSHOT_MAX_AGE_HOURS` (compaction.ts) |
