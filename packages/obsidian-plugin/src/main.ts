@@ -6,7 +6,7 @@ import { VersionHistoryModal } from "./history-modal";
 import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
-import { pollDelayMs } from "./poll-schedule";
+import { pollDelayMs, pushDelayMs } from "./poll-schedule";
 import { ChangeNotifier, revTopic } from "./notify";
 import { decodeJsonGz, encodeJsonGz, readFileHistory } from "@vault-sync/core";
 
@@ -101,7 +101,6 @@ function deserializeState(c: CompactState): SyncState {
   return { lastSyncedRev: c.r ?? 0, files };
 }
 
-const PUSH_DEBOUNCE_MS = 5_000; // §2.2
 /** Desktop-only: how long after launch the offline scan is armed. Keeps the first moments of a
  * session for the fast pull + quick-edit push; the scan (off the reconcile lock) then catches any
  * edits made outside the app while it was closed (§4.4). */
@@ -140,6 +139,9 @@ export default class S3SyncPlugin extends Plugin {
   private syncState: SyncState = { lastSyncedRev: 0, files: {} };
   private engine: SyncEngine | null = null;
   private pushTimer: number | null = null;
+  /** When the current burst of unpushed edits began; 0 when nothing is pending. Anchors the
+   * max-wait that keeps a long typing session from starving the debounce (§4.4). */
+  private pushFirstEditAt = 0;
   private pollTimer: number | null = null;
   /** Wall clock of the last poll tick, and the interval it was armed with — together they tell a
    * normal tick from one that fired after the device was frozen (§resume handling in startPolling). */
@@ -810,6 +812,7 @@ export default class S3SyncPlugin extends Plugin {
       window.clearTimeout(this.pushTimer);
       this.pushTimer = null;
     }
+    this.pushFirstEditAt = 0; // this flush covers the burst; the next edit starts a new one
     void this.runSync("background-flush");
   }
 
@@ -932,9 +935,17 @@ export default class S3SyncPlugin extends Plugin {
   }
 
   private schedulePush(): void {
-    this.lastActivityAt = Date.now(); // a local edit puts this device in the ACTIVE tier (§4.9a)
+    const now = Date.now();
+    this.lastActivityAt = now; // a local edit puts this device in the ACTIVE tier (§4.9a)
+    // Anchor the max-wait on the first edit of this burst, so continuous typing can't keep
+    // restarting the debounce forever and strand the whole session unsynced (§4.4).
+    if (this.pushFirstEditAt === 0) this.pushFirstEditAt = now;
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
-    this.pushTimer = window.setTimeout(() => void this.runSync("debounced-edit"), PUSH_DEBOUNCE_MS);
+    this.pushTimer = window.setTimeout(() => {
+      this.pushTimer = null;
+      this.pushFirstEditAt = 0;
+      void this.runSync("debounced-edit");
+    }, pushDelayMs(now - this.pushFirstEditAt));
   }
 
   private syncFailures = 0;
