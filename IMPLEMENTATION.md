@@ -492,8 +492,15 @@ engine has already logged what stalled and the next cycle picks the work up.
 
 ## 4.4 Change tracking & offline scan (`scanForOfflineChanges`)
 
-Vault events (`create/modify/delete/rename`) feed the dirty set while running (5 s debounce before a
-push). A `rename` also calls `recordRename(old → new)`, so the next push tags the old path's tombstone
+Vault events (`create/modify/delete/rename`) feed the dirty set while running, debounced before a
+push: every save restarts a **10 s** wait, so a burst of edits becomes one delta instead of one per
+save. The debounce is bounded by `PUSH_MAX_WAIT_MS` (45 s) measured from the **first** unpushed edit
+— a pure debounce restarts forever under continuous typing, which would strand a whole writing
+session unsynced exactly when the work is most valuable. `pushDelayMs` (poll-schedule.ts, pure and
+tested) returns `min(debounce, cap − elapsed)`, so the wait shortens as the cap approaches.
+`PUSH_DEBOUNCE_MS` was raised from 5 s once instant sync landed (§4.14): delivery after a push is now
+~1 s, which makes the debounce the dominant term in cross-device latency and therefore the knob that
+trades deltas against how soon a peer sees the change. A `rename` also calls `recordRename(old → new)`, so the next push tags the old path's tombstone
 with `renamedTo` (rename propagation, §2.8). Events don't fire while the app is closed, so the offline
 scan diffs the vault against stored state: an mtime pre-filter picks candidates, the hash decides. New
 files join the dirty set; missing files are treated as offline deletes — **except** the mass-missing
@@ -746,10 +753,16 @@ directions: too slow in the moment you switch devices, and pure waste on a vault
 | **baseline** | foreground, nothing moving | `pollIntervalSec` |
 | **BACKGROUND** | `document.visibilityState === "hidden"` | `max(baseline × 4, 60 s)` |
 
-- **"Movement"** is a local edit (`schedulePush`) or a cycle that persisted state (`onStateChanged`,
-  which the engine calls only when something transferred or the cursor advanced, §4.3). Changes
-  cluster, so a device that just saw one is likely to see another — and that is exactly when a stale
-  view gets noticed.
+- **"Movement" means a REMOTE change landed** — a cycle that pulled or merged (`onRemoteActivity`,
+  raised by the engine when `pulled + merged > 0`), or a change notification (§4.14). Changes
+  cluster, so a device that just saw one is likely to see another — exactly when a stale view gets
+  noticed.
+- **Local edits deliberately do not arm it.** Every cycle pulls *and* pushes, so arming the fast
+  tier from our own writes turned each poll into another push of the file being typed: one delta and
+  one S3 version per ACTIVE interval, for as long as the session lasted (observed 2026-08-23 on
+  linux-5791 — 14 pushes of one note across 70 s of typing, against 3 debounce cycles that found
+  nothing left to send). Flushing local edits is the debounce's job (§4.4); the poll only backstops
+  it.
 - The ACTIVE tier is a **floor, never an override**: `min` against the baseline means a user who
   already polls faster keeps their cadence.
 - **Return to device** (`onReturnToDevice`) syncs *immediately* rather than waiting out the pending
@@ -1212,7 +1225,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | MQTT keepalive / ping / silence cutoff | 60 s / 30 s / 90 s | `KEEPALIVE_SEC`, `PING_INTERVAL_MS`, `SILENCE_TIMEOUT_MS` (notify.ts) |
 | Notifier reconnect backoff | 1→60 s | `RECONNECT_BACKOFF_MS` (notify.ts) |
 | Notifier presign lifetime / handshake timeout | 300 s / 15 s | `PRESIGN_EXPIRES_SEC`, `HANDSHAKE_TIMEOUT_MS` |
-| Push debounce | 5 s | `PUSH_DEBOUNCE_MS` (main.ts) |
+| Push debounce | **10 s** | `PUSH_DEBOUNCE_MS` (poll-schedule.ts) |
+| Push max-wait (anti-starvation) | 45 s | `PUSH_MAX_WAIT_MS` (poll-schedule.ts) |
 | Offline-scan delay (desktop) | 30 s after launch | `OFFLINE_SCAN_DELAY_MS` (main.ts) |
 | Offline-scan yield batch | 250 files | `SCAN_CHUNK` (engine.ts) |
 | Transfer concurrency | 8 mobile / 50 desktop / 50 CI | settings / `CONCURRENCY` |

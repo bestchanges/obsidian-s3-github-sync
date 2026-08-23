@@ -217,6 +217,10 @@ export interface EngineOptions {
    * failures must not abort the write, so implementations swallow their own errors. */
   onBeforeOverwrite?: (path: string) => Promise<void>;
   onStateChanged: (state: SyncState) => Promise<void>;
+  /** Called after a cycle that applied REMOTE changes (pulled or merged > 0). Distinct from
+   * `onStateChanged`, which also fires for our own pushes — see §4.9a for why that difference
+   * matters to the poll cadence. Best-effort: implementations must not throw. */
+  onRemoteActivity?: () => void;
   /** Called with the revision this device just appended, so a notifier can announce it (§4.14).
    * Best-effort and synchronous by contract: implementations must swallow their own failures —
    * the delta is already durable by the time this runs, and nothing about announcing it may
@@ -1007,6 +1011,10 @@ export class SyncEngine {
     this.pendingResume = partialPull ? this.resumeReqFrom(req) : null;
 
     const activity = this.pulled + this.pushed + this.merged;
+    // REMOTE movement only (§4.9a). The ACTIVE poll tier exists to catch follow-up changes from
+    // other devices, so it must not be armed by our own pushes — during local typing that turns
+    // every poll into an extra push of the file being typed.
+    if (this.pulled + this.merged > 0) this.opts.onRemoteActivity?.();
     // Persist when state changed — and always after a resync, so the reset sticks even if S3 was
     // empty (activity 0, rev unchanged at 0). No-op polls (the common case) still skip the write.
     if (req.resetCursor || activity > 0 || this.state.lastSyncedRev !== rev0) {
