@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
+import { App, Modal, Notice, Platform, Setting, TFile, normalizePath } from "obsidian";
 import {
   DiffLine,
   StoredVersion,
@@ -43,11 +43,19 @@ export interface HistoryModalOptions {
 export class VersionHistoryModal extends Modal {
   private versions: StoredVersion[] = [];
   private selected = -1;
-  private showDiff = false;
+  /** Diff-by-default: a version list is only useful for finding WHAT changed, and making the user
+   * toggle that on for every row (and compare two walls of text by eye) is busywork. */
+  private showDiff = true;
   /** cache: versionId → decoded text (or null when binary/oversized) */
   private textCache = new Map<string, string | null>();
 
   private loadingEl: HTMLElement | null = null;
+  /** Mobile shows ONE pane at a time (list → tap → detail → back); desktop shows both. Obsidian's
+   * `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for — the list
+   * collapsed to a single visible row, which is why only one version could ever be reached (§4.12). */
+  private readonly isMobile = Platform.isMobile;
+  private sidebarEl!: HTMLElement;
+  private detailEl!: HTMLElement;
   private listEl!: HTMLElement;
   private headerEl!: HTMLElement;
   private bodyEl!: HTMLElement;
@@ -58,14 +66,22 @@ export class VersionHistoryModal extends Modal {
   }
 
   onOpen(): void {
-    this.modalEl.addClass("mod-sidebar-layout");
+    if (!this.isMobile) this.modalEl.addClass("mod-sidebar-layout");
     this.titleEl.setText(`Version history — ${this.opts.path}`);
 
-    const sidebar = this.contentEl.createDiv("modal-sidebar mod-history");
-    this.listEl = sidebar.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
+    this.sidebarEl = this.contentEl.createDiv("modal-sidebar mod-history");
+    this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
 
     const container = this.contentEl.createDiv("sync-history-content-container");
+    this.detailEl = container;
     const content = container.createDiv("sync-history-content");
+    if (this.isMobile) {
+      // Full width, own scroll, and only one pane visible at a time.
+      this.sidebarEl.style.width = "100%";
+      this.sidebarEl.style.maxHeight = "unset";
+      this.listEl.style.overflowY = "auto";
+      container.style.display = "none";
+    }
     this.headerEl = content.createDiv("u-small u-muted");
     this.headerEl.style.padding = "var(--size-4-3) var(--size-4-4)";
     this.bodyEl = content.createDiv("sync-history-preview diff-view");
@@ -102,7 +118,9 @@ export class VersionHistoryModal extends Modal {
     this.loadingEl = null;
     this.versions = versions;
     this.renderList();
-    if (this.versions.length > 0) await this.select(0);
+    // Desktop opens the newest version straight away; mobile stays on the list, so every version is
+    // reachable rather than the modal landing inside one of them.
+    if (!this.isMobile && this.versions.length > 0) await this.select(0);
   }
 
   private renderList(): void {
@@ -133,8 +151,15 @@ export class VersionHistoryModal extends Modal {
   private async select(index: number): Promise<void> {
     this.selected = index;
     this.renderList();
+    if (this.isMobile) this.showPane("detail");
     await this.renderContent();
     this.renderButtons();
+  }
+
+  /** Mobile only: swap between the version list and one version's content. */
+  private showPane(which: "list" | "detail"): void {
+    this.sidebarEl.style.display = which === "list" ? "" : "none";
+    this.detailEl.style.display = which === "detail" ? "" : "none";
   }
 
   /** Decoded text for a version, or null when it's binary / over the preview cap. */
@@ -206,6 +231,15 @@ export class VersionHistoryModal extends Modal {
     const v = this.versions[this.selected];
     if (!v) return;
 
+    if (this.isMobile) {
+      new Setting(this.buttonsEl).addButton((b) =>
+        b.setButtonText("← All versions").onClick(() => {
+          this.selected = -1;
+          this.renderList();
+          this.showPane("list");
+        }));
+    }
+
     new Setting(this.buttonsEl)
       .addToggle((t) =>
         t.setTooltip("Show changes").setValue(this.showDiff).onChange((val) => {
@@ -217,6 +251,16 @@ export class VersionHistoryModal extends Modal {
 
     new Setting(this.buttonsEl).addButton((b) =>
       b.setButtonText("Restore this version").setCta().onClick(() => void this.restore(v)));
+  }
+
+  private async matchesLocal(path: string, body: Uint8Array): Promise<boolean> {
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return false;
+      const current = new Uint8Array(await this.app.vault.adapter.readBinary(path));
+      return bytesEqual(current, body);
+    } catch {
+      return false; // can't tell → let the restore proceed
+    }
   }
 
   /**
@@ -231,6 +275,14 @@ export class VersionHistoryModal extends Modal {
       const body = await readStoredVersionContent(this.opts.storage, path, v.versionId);
       if (!body) {
         new Notice("S3 Vault Sync: that version is no longer in the bucket.");
+        return;
+      }
+      // Restoring the version that is already on disk is a no-op, and silently "succeeding" reads
+      // as a broken button — which is exactly how it looked when only the current version was
+      // reachable on mobile. Say plainly that nothing changed.
+      if (await this.matchesLocal(path, body)) {
+        new Notice("That version is identical to the current file — nothing changed.");
+        this.opts.log("info", `restore of ${path} skipped: ${when} is identical to the local file`);
         return;
       }
       if (this.opts.backupBeforeWrite) {
@@ -263,6 +315,13 @@ export class VersionHistoryModal extends Modal {
       new Notice(`Restore failed: ${String(err)}`);
     }
   }
+}
+
+/** True when the local file already holds exactly these bytes. */
+async function bytesEqual(a: Uint8Array, b: Uint8Array): Promise<boolean> {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function renderPlain(parent: HTMLElement, text: string): void {
