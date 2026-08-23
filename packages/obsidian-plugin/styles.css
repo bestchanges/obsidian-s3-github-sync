@@ -2,40 +2,42 @@
  *
  * Obsidian loads this automatically from the plugin folder, alongside main.js and manifest.json.
  *
- * Deliberately tiny. The version-history modal is built from Obsidian's OWN classes
- * (`mod-sidebar-layout`, `modal-sidebar mod-history`, `modal-sidebar-inner`, `modal-sidebar-list`,
- * `modal-sidebar-list-item`, `modal-button-container`, `diff-line`/`mod-left`/`mod-right`), so it
- * inherits the app's look on both desktop and phone — including Obsidian's own phone rules, which
- * already turn the modal body into a full-width scrolling column and strip the sidebar's side-panel
- * border and background. An earlier version restyled all of that here and looked alien for it.
+ * Deliberately tiny. The version-history modal is built from Obsidian's OWN classes —
+ * `mod-sidebar-layout`, `modal-sidebar mod-history`, `modal-sidebar-inner`, `modal-sidebar-list`,
+ * `modal-sidebar-list-item`, `modal-button-container`, `diff-line`/`mod-left`/`mod-right`, and on
+ * desktop `sync-history-content-container` + `sync-history-preview` (the classes Obsidian's own Sync
+ * history modal uses). So it inherits the app's look and, more importantly, its sizing.
  *
- * What remains is only what Obsidian has no opinion about: how our detail pane sizes itself beside
- * the sidebar, and one visibility class.
+ * Everything below exists only for the PHONE layout, where those desktop classes can't be used:
+ * `.sync-history-content-container` is `width: 0; flex: 1 1 auto`, which fills a flex ROW but
+ * collapses to min-content inside `.is-phone .modal-content`'s column.
  */
 
-/* The right-hand pane on desktop, the second screen on a phone. `min-width: 0` is load-bearing: a
- * flex item will not shrink below its content without it, so a long unbroken line (a URL, a base64
- * blob) would otherwise push the pane wider than the modal instead of scrolling inside it. */
+/* Phone: the detail pane, full width, its own column. */
 .s3sync-history-detail {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
+  width: 100%;
+  /* A flex item will not shrink below its content without this, so a long unbroken line (a URL, a
+   * base64 blob) would push the pane wider than the screen instead of scrolling inside it. */
   min-width: 0;
   min-height: 0;
 }
 
-.s3sync-history-header {
-  padding: var(--size-4-3) var(--size-4-4);
-}
-
-/* Takes the leftover height and scrolls internally, rather than stretching the modal. */
+/* Phone: takes the leftover height and scrolls internally rather than stretching the modal.
+ * `sync-history-preview` does the same job on desktop, via `flex: 1 0 0`. */
 .s3sync-history-body {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
 }
 
-/* Phone only: which pane is on screen. The single thing the modal changes at runtime. */
+.s3sync-history-header {
+  padding: var(--size-4-3) var(--size-4-4);
+}
+
+/* Phone: which pane is on screen. The single thing the modal changes at runtime. */
 .s3sync-hidden {
   display: none;
 }
