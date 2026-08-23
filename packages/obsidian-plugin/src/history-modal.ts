@@ -10,8 +10,6 @@ import type { StorageAdapter } from "@vault-sync/core";
 
 /** Bytes above this are shown as a metadata-only row — no preview, no diff (binaries, big attachments). */
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
-/** Below this modal width there is no room for a sidebar beside the content. */
-const NARROW_PX = 700;
 
 export interface HistoryModalOptions {
   storage: StorageAdapter;
@@ -52,9 +50,13 @@ export class VersionHistoryModal extends Modal {
   private textCache = new Map<string, string | null>();
 
   private loadingEl: HTMLElement | null = null;
-  /** Narrow layouts show ONE pane at a time (list → tap → detail → back); wide ones show both.
-   * Width, not platform: a narrow desktop window has exactly the same problem (§4.12). */
-  private narrow = false;
+  /** Phones show ONE pane at a time (list → tap → detail → back); everything else shows both.
+   *
+   * `Platform.isPhone`, matching the `.is-phone` body class Obsidian keys its OWN modal CSS off, so
+   * the two agree by construction. A width heuristic was tried and dropped: `modalEl.clientWidth`
+   * is read before the modal is laid out, so it can under-report and take the sidebar away on a
+   * desktop that has room for it (§4.12). */
+  private readonly phone = Platform.isPhone;
   private sidebarEl!: HTMLElement;
   private detailEl!: HTMLElement;
   private listEl!: HTMLElement;
@@ -67,50 +69,27 @@ export class VersionHistoryModal extends Modal {
   }
 
   onOpen(): void {
-    this.narrow = Platform.isMobile || (this.modalEl.clientWidth || window.innerWidth) < NARROW_PX;
     this.titleEl.setText(`Version history — ${this.opts.path}`);
-    if (this.narrow) this.buildNarrow();
-    else this.buildWide();
+    // ONE markup for both, using Obsidian's own classes throughout. The only structural difference
+    // is this class: `.modal.mod-sidebar-layout .modal-content` (3 classes) out-specifies
+    // `.is-phone .modal-content` (2), so adding it on a phone would override Obsidian's own mobile
+    // rule — a full-width scrolling column — and force the sidebar row onto a screen with no room
+    // for it. Leaving it off lets Obsidian lay the phone out the way it lays out its own modals.
+    if (!this.phone) this.modalEl.addClass("mod-sidebar-layout");
+
+    this.sidebarEl = this.contentEl.createDiv("modal-sidebar mod-history");
+    // `.is-phone .modal-sidebar-inner` drops the border and side-panel background itself, which is
+    // why the same markup can serve both without us restyling anything.
+    this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
+
+    this.detailEl = this.contentEl.createDiv("s3sync-history-detail");
+    this.headerEl = this.detailEl.createDiv("s3sync-history-header u-small u-muted");
+    this.bodyEl = this.detailEl.createDiv("s3sync-history-body diff-view");
+    this.buttonsEl = this.detailEl.createDiv("modal-button-container");
+    if (this.phone) this.showPane("list");
 
     this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
     void this.load();
-  }
-
-  /**
-   * One pane at a time, inside a wrapper this modal owns completely.
-   *
-   * `.modal-content` is `display: flex` (Obsidian, all platforms). A block child of a flex row is a
-   * flex item, and ours had no `flex` and no `min-width`, so it collapsed to its intrinsic content
-   * width — ~180 px of an ~840 px modal. That is the whole bug behind "the content pane is empty and
-   * everything is squeezed to the left": the panes were correct, their *sizing* was not, and it was
-   * never mobile-specific. So rather than react to whatever the parent's layout mode is, everything
-   * goes in one wrapper that declares its own — in `styles.css`, since none of it is dynamic (§4.12).
-   */
-  private buildNarrow(): void {
-    const root = this.contentEl.createDiv("s3sync-history-root");
-
-    this.sidebarEl = root.createDiv("s3sync-history-list-pane");
-    this.listEl = this.sidebarEl;
-
-    this.detailEl = root.createDiv("s3sync-history-detail-pane s3sync-hidden");
-
-    this.headerEl = this.detailEl.createDiv("s3sync-history-header u-small u-muted");
-    this.bodyEl = this.detailEl.createDiv("s3sync-history-body diff-view");
-    this.buttonsEl = this.detailEl.createDiv();
-  }
-
-  /** Two panes side by side — Obsidian's own sidebar layout, unchanged. */
-  private buildWide(): void {
-    this.modalEl.addClass("mod-sidebar-layout");
-    this.sidebarEl = this.contentEl.createDiv("modal-sidebar mod-history");
-    this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
-
-    const container = this.contentEl.createDiv("s3sync-history-content-container");
-    this.detailEl = container;
-    const content = container.createDiv("s3sync-history-content");
-    this.headerEl = content.createDiv("s3sync-history-header u-small u-muted");
-    this.bodyEl = content.createDiv("diff-view");
-    this.buttonsEl = container.createDiv("modal-button-container");
   }
 
   onClose(): void {
@@ -142,7 +121,9 @@ export class VersionHistoryModal extends Modal {
     this.renderList();
     // Desktop opens the newest version straight away; mobile stays on the list, so every version is
     // reachable rather than the modal landing inside one of them.
-    if (!this.narrow && this.versions.length > 0) await this.select(0);
+    // Desktop opens the newest version immediately; a phone stays on the list, so every version is
+    // reachable rather than the modal landing inside one of them.
+    if (!this.phone && this.versions.length > 0) await this.select(0);
   }
 
   private renderList(): void {
@@ -178,17 +159,22 @@ export class VersionHistoryModal extends Modal {
   private async select(index: number): Promise<void> {
     this.selected = index;
     this.renderList();
-    if (this.narrow) this.showPane("detail");
+    if (this.phone) this.showPane("detail");
     await this.renderContent();
     this.renderButtons();
   }
 
-  /** Narrow layout only: swap between the version list and one version's content. */
+  /** Phone only: swap between the version list and one version's content. */
   private showPane(which: "list" | "detail"): void {
     // A class toggle, not an inline style: each pane's own `display` stays in styles.css, so the
     // layout can't be half-defined in two places.
     this.sidebarEl.classList.toggle("s3sync-hidden", which !== "list");
     this.detailEl.classList.toggle("s3sync-hidden", which !== "detail");
+  }
+
+  /** The version currently live at this key — the diff baseline, and what a restore replaces. */
+  private currentVersion(): StoredVersion | undefined {
+    return this.versions.find((v) => v.isLatest) ?? this.versions[0];
   }
 
   /** Decoded text for a version, or null when it's binary / over the preview cap. */
@@ -233,26 +219,28 @@ export class VersionHistoryModal extends Modal {
       return;
     }
 
-    // Diff against the next older version — what this one actually changed.
-    const older = this.versions[this.selected + 1];
-    if (!older) {
-      this.bodyEl.createDiv({
-        cls: "u-muted u-small",
-        text: "Oldest stored version — nothing to compare against.",
-      });
+    // Diff against the CURRENT version, not the neighbouring one. The question this list answers is
+    // "how does this old version differ from what I have now" — which is also what a restore would
+    // do to the file. Diffing against rev-1 answered a different question (what that single revision
+    // changed), which is rarely the one being asked and is useless for deciding whether to restore.
+    const current = this.currentVersion();
+    if (!current || current.versionId === v.versionId) {
+      this.headerEl.setText(`${this.headerEl.getText()} · current version`);
       renderPlain(this.bodyEl, text);
       return;
     }
-    const olderText = await this.textFor(older);
-    if (olderText === null) {
+    const currentText = await this.textFor(current);
+    if (currentText === null) {
       this.bodyEl.createDiv({
         cls: "u-muted u-small",
-        text: "No preview for the previous version — can't diff.",
+        text: "No preview for the current version — can't diff.",
       });
       return;
     }
-    this.headerEl.setText(`${this.headerEl.getText()} · changes vs ${formatWhen(older.at)}`);
-    renderDiff(this.bodyEl, lineDiff(olderText, text));
+    this.headerEl.setText(`${this.headerEl.getText()} · changes vs current`);
+    // base = current, target = selected: removals are what the current file has and this version
+    // does not, additions are what restoring would bring back.
+    renderDiff(this.bodyEl, lineDiff(currentText, text));
   }
 
   private renderButtons(): void {
@@ -260,32 +248,16 @@ export class VersionHistoryModal extends Modal {
     const v = this.versions[this.selected];
     if (!v) return;
 
-    if (this.narrow) {
-      // Plain stacked buttons rather than `Setting` rows. A Setting is built for a full-width
-      // settings pane — label and description on the left, control floated right — which in a narrow
-      // column renders as a two-word-per-line paragraph with a toggle stranded beside it (screenshot,
-      // 2026-08-23). The diff state goes on the button label instead, so there is nothing to float.
-      const bar = this.buttonsEl.createDiv("s3sync-history-buttons");
-
-      const toggle = bar.createEl("button", {
-        text: this.showDiff ? "Showing changes — tap for full text" : "Showing full text — tap for changes",
-      });
-      toggle.onclick = () => {
-        this.showDiff = !this.showDiff;
-        void this.renderContent();
-        this.renderButtons();
-      };
-
-      const restore = bar.createEl("button", { text: "Restore this version", cls: "mod-cta" });
-      restore.onclick = () => void this.restore(v);
-
-      const back = bar.createEl("button", { text: "← All versions" });
-      back.onclick = () => {
-        this.selected = -1;
-        this.renderList();
-        this.showPane("list");
-      };
-      return;
+    // Obsidian's own controls on both platforms — `.is-phone .modal-button-container` already makes
+    // this row full-width with safe-area padding, and `.is-phone .modal .setting-item` adjusts the
+    // Setting rows, so nothing here needs a phone-specific variant.
+    if (this.phone) {
+      new Setting(this.buttonsEl).addButton((b) =>
+        b.setButtonText("← All versions").onClick(() => {
+          this.selected = -1;
+          this.renderList();
+          this.showPane("list");
+        }));
     }
 
     new Setting(this.buttonsEl)
@@ -295,7 +267,7 @@ export class VersionHistoryModal extends Modal {
           void this.renderContent();
         }))
       .setName("Show changes")
-      .setDesc("Compare with the previous version instead of showing the full text.");
+      .setDesc("Compare this version with the current one instead of showing its full text.");
 
     new Setting(this.buttonsEl).addButton((b) =>
       b.setButtonText("Restore this version").setCta().onClick(() => void this.restore(v)));
