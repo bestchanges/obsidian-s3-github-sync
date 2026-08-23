@@ -82,9 +82,24 @@ export class VersionHistoryModal extends Modal {
     // why the same markup can serve both without us restyling anything.
     this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
 
-    this.detailEl = this.contentEl.createDiv("s3sync-history-detail");
+    // Detail pane: Obsidian's OWN history classes on desktop, ours on the phone.
+    //
+    // `.sync-history-content-container` (an Obsidian class — its Sync history modal uses it) is
+    // `width: 0; flex: 1 1 auto`, the idiom for a flex item that fills its row and never exceeds
+    // it. That bound is what lets the preview scroll and keeps the buttons on screen; replacing it
+    // with a hand-rolled `min-width: 0` lost the scrollbars and pushed the actions out of reach.
+    //
+    // But `width: 0` only means "fill the row" inside a ROW. In `.is-phone .modal-content`'s column
+    // it overrides `align-items: stretch` and collapses the pane to min-content — the ~180 px
+    // squeeze reported on mobile. Same split as `mod-sidebar-layout` above, and for the same
+    // reason: these classes are built for the sidebar layout, which a phone does not have.
+    this.detailEl = this.contentEl.createDiv(
+      this.phone ? "s3sync-history-detail" : "sync-history-content-container",
+    );
     this.headerEl = this.detailEl.createDiv("s3sync-history-header u-small u-muted");
-    this.bodyEl = this.detailEl.createDiv("s3sync-history-body diff-view");
+    this.bodyEl = this.detailEl.createDiv(
+      this.phone ? "s3sync-history-body diff-view" : "sync-history-preview diff-view",
+    );
     this.buttonsEl = this.detailEl.createDiv("modal-button-container");
     if (this.phone) this.showPane("list");
 

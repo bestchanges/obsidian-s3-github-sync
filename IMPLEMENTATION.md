@@ -967,10 +967,20 @@ renders its own, off a source that is strictly richer than Sync's — see §2.9.
 > is read before the modal is laid out, so it can under-report and take the sidebar away from a
 > desktop that has room for it.
 >
-> `styles.css` is therefore ~4 rules: how the detail pane sizes itself beside the sidebar
-> (`min-width: 0` so a long unbroken line scrolls instead of widening the modal), the body's scroll,
-> the header padding, and `.s3sync-hidden`. An earlier revision restyled the whole layout here and
-> looked alien for it.
+> The detail pane splits the same way, and for the same reason: on desktop it uses Obsidian's
+> **`sync-history-content-container`** + **`sync-history-preview`** — the classes Obsidian's own Sync
+> history modal uses — and on a phone it uses ours. `.sync-history-content-container` is
+> `width: 0; flex: 1 1 auto`, the idiom for a flex item that **fills its row and never exceeds it**.
+> That bound is what lets the preview scroll and keeps the button row on screen; a hand-rolled
+> `min-width: 0` is not equivalent, and replacing it cost the desktop its scrollbars and put the
+> actions out of reach. But `width: 0` only means "fill" inside a **row** — in the phone's column it
+> overrides `align-items: stretch` and collapses the pane to min-content, which was the ~180 px
+> squeeze. One property, both bugs.
+>
+> `styles.css` is therefore ~4 rules, **all of them for the phone path**: the detail pane's column,
+> the body's scroll (`sync-history-preview` does that job on desktop), the header padding, and
+> `.s3sync-hidden`. An earlier revision restyled the whole layout here — including re-deriving what
+> these Obsidian classes already do — and looked alien for it.
 
 > [!note] The diff compares against the **current** version, not the neighbouring one
 > The question a version list answers is "how does this differ from what I have now" — which is also
