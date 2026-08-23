@@ -155,6 +155,28 @@ function withProgress(inner: StorageAdapter, tick: () => void): StorageAdapter {
   };
 }
 
+/** How many cycles' stats to retain. Only the live cycle's entry is read; the rest are orphans
+ * still unwinding, kept just long enough that their late writes land somewhere harmless. */
+const STATS_KEEP = 4;
+
+/** One cycle's activity: counters for the verbose summary, plus WHICH files moved for the
+ * persistent log (never the transient Notice). `mergedPaths` doubles as the guard that keeps a
+ * merged file — which is also re-pushed — from being listed twice. */
+interface CycleStats {
+  pulled: number;
+  pushed: number;
+  merged: number;
+  skipped: number;
+  detail: {
+    pulled: string[];
+    pushed: string[];
+    deletedLocal: string[];
+    deletedRemote: string[];
+    mergedPaths: string[];
+  };
+  mergedSet: Set<string>;
+}
+
 /** Outcome of a "force download" request (the linked-files command). Counts + the candidates that
  * had no live remote content, so the caller can give the user a precise summary. */
 export interface ForceDownloadResult {
@@ -332,22 +354,13 @@ export class SyncEngine {
   /** Set when a cycle handed the lock back mid-catch-up (§4.3): runLoop keeps draining until the
    * journal is caught up rather than leaving the rest to whenever the next poll happens to fire. */
   private pendingResume: CycleReq | null = null;
-  // per-cycle activity counters (for the verbose summary)
-  private pulled = 0;
-  private pushed = 0;
-  private merged = 0;
-  private skipped = 0; // remote files left in the cloud this cycle (over the download cap)
-  // per-cycle WHICH-files detail, for the persistent log only (never the transient Notice). Reset at
-  // the start of every cycle; emitted (capped) by logCycleDetail() at the end. `mergedPaths` doubles
-  // as the guard that keeps a merged file — which is also re-pushed — from being listed twice.
-  private detail = {
-    pulled: [] as string[], // remote content written locally
-    pushed: [] as string[], // local content uploaded to S3
-    deletedLocal: [] as string[], // removed here because a remote tombstone said so
-    deletedRemote: [] as string[], // deleted here → tombstoned in the cloud
-    mergedPaths: [] as string[], // conflict-resolved (union-merge or freshest-wins)
-  };
-  private mergedSet = new Set<string>(); // paths already recorded as merged this cycle
+  /** Per-cycle activity, keyed by the cycle's `seq` (§4.3).
+   *
+   * Keyed rather than held in plain fields because an ABANDONED cycle can still be unwinding while
+   * its replacement runs: shared fields let the orphan's late completions land in the successor's
+   * counters, which is how one poll reported `↓13` for three files (2026-08-23). Each cycle records
+   * into the object its own `seq` maps to; the orphan's is discarded when its entry is dropped. */
+  private stats = new Map<number, CycleStats>();
   // Result of the most recent forced-download cycle, read back by forceDownloadPaths() after the
   // cycle it queued has run. Only forced cycles set it; ordinary cycles leave it untouched.
   private forceResult: ForceDownloadResult | null = null;
@@ -359,23 +372,51 @@ export class SyncEngine {
     this.opts.log("info", msg);
   }
 
+  /** This cycle's stats, created on first use. Never falls back to a shared object: a caller with a
+   * stale `seq` gets its own dead entry rather than corrupting the live cycle's numbers. */
+  private statsFor(seq: number): CycleStats {
+    let s = this.stats.get(seq);
+    if (!s) {
+      // Bound the map: an abandoned cycle's entry is never deleted by the cycle itself (it is gone),
+      // and one leak per stall would grow forever. Map preserves insertion order, so the oldest
+      // entries — always the dead ones — go first.
+      while (this.stats.size >= STATS_KEEP) {
+        const oldest = this.stats.keys().next().value;
+        if (oldest === undefined) break;
+        this.stats.delete(oldest);
+      }
+      s = {
+        pulled: 0,
+        pushed: 0,
+        merged: 0,
+        skipped: 0,
+        detail: { pulled: [], pushed: [], deletedLocal: [], deletedRemote: [], mergedPaths: [] },
+        mergedSet: new Set<string>(),
+      };
+      this.stats.set(seq, s);
+    }
+    return s;
+  }
+
   /** Record a conflict-resolved path once (union-merge or freshest-wins). Idempotent per cycle, and
    * the mergedSet lets push() list the file as "merged" rather than re-listing it as "pushed". */
-  private recordMerged(path: string): void {
-    if (this.mergedSet.has(path)) return;
-    this.mergedSet.add(path);
-    this.detail.mergedPaths.push(path);
+  private recordMerged(seq: number, path: string): void {
+    const st = this.statsFor(seq);
+    if (st.mergedSet.has(path)) return;
+    st.mergedSet.add(path);
+    st.detail.mergedPaths.push(path);
   }
 
   /** Emit the per-cycle file lists to the persistent log (disk + S3), one greppable line per file,
    * capped at LOG_LIST_CAP per direction. Log-only — never a Notice; the arrow prefixes mirror the
    * summary Notice (↓ pulled / ↑ pushed / ⇅ merged) so both read alike. */
-  private logCycleDetail(): void {
-    this.logGroup("↓ pulled", this.detail.pulled);
-    this.logGroup("↓ deleted", this.detail.deletedLocal);
-    this.logGroup("↑ pushed", this.detail.pushed);
-    this.logGroup("↑ deleted", this.detail.deletedRemote);
-    this.logGroup("⇅ merged", this.detail.mergedPaths);
+  private logCycleDetail(seq: number): void {
+    const detail = this.statsFor(seq).detail;
+    this.logGroup("↓ pulled", detail.pulled);
+    this.logGroup("↓ deleted", detail.deletedLocal);
+    this.logGroup("↑ pushed", detail.pushed);
+    this.logGroup("↑ deleted", detail.deletedRemote);
+    this.logGroup("⇅ merged", detail.mergedPaths);
   }
 
   private logGroup(verb: string, paths: string[]): void {
@@ -662,7 +703,7 @@ export class SyncEngine {
         // Same node under a different case/NFC on disk → re-case to the tracked name so on-disk and
         // state agree. Pure rename (never a delete); no-ops on failure. Its own state mutation is
         // guarded by the applying-set and no-ops when `from` is already gone, so it's safe off-lock.
-        await this.renameLocalToCanonical(p, tracked);
+        await this.renameLocalToCanonical(this.cycleSeq, p, tracked);
         p = tracked;
       }
       known.add(p);
@@ -956,12 +997,11 @@ export class SyncEngine {
   }
 
   private async reconcile(req: CycleReq, seq: number): Promise<void> {
-    this.pulled = this.pushed = this.merged = this.skipped = 0;
+    this.stats.delete(seq); // fresh counters for this cycle; the orphan's entry (if any) stays put
     // Cleared up front so a cycle that throws (abandoned, network) can't leave a stale resume armed;
     // it is re-set below only if THIS cycle actually yields mid-catch-up.
     this.pendingResume = null;
-    this.detail = { pulled: [], pushed: [], deletedLocal: [], deletedRemote: [], mergedPaths: [] };
-    this.mergedSet.clear();
+    const st = this.statsFor(seq);
     const rev0 = this.state.lastSyncedRev;
     if (req.announce) this.notify(`Sync: started (${req.label})`, req.force);
 
@@ -985,7 +1025,7 @@ export class SyncEngine {
     this.prunePendingPulls();
     // A pull that stopped at a chunk boundary to let a queued request through leaves catch-up work
     // behind; the cycle records that so it can requeue a follow-up once the queue has drained.
-    const partialPull = await this.pull(req.fullPull);
+    const partialPull = await this.pull(seq, req.fullPull);
     this.bootstrap = false; // first pull is done — later collisions are real edits again
     // Deferral is a one-cycle guard too: whatever this pull collected is handed to the prompt now,
     // and ordinary cycles (polls, edits) must resolve their conflicts normally rather than pile up
@@ -993,7 +1033,7 @@ export class SyncEngine {
     this.deferConflicts = false;
     // Force-download runs before push so any files it fetches are recorded (never re-uploaded as
     // dirty) and so a delete-vs-edit re-push it triggers is flushed in the same cycle.
-    if (req.forcePaths.length) this.forceResult = await this.forceDownload(req.forcePaths);
+    if (req.forcePaths.length) this.forceResult = await this.forceDownload(seq, req.forcePaths);
     // Revalidate the write baseline (§2.3). The pull above established what remote looked like when
     // it ran; everything push() decides — is this file changed? what is its merge base? which rev do
     // we claim? — is measured against that. A cycle that took a while (large changeset, slow link,
@@ -1011,7 +1051,7 @@ export class SyncEngine {
     if (!partialPull) {
       if (this.dirty.size > 0) {
         this.assertOwner(seq, req.label);
-        await this.pull();
+        await this.pull(seq);
       }
       this.assertOwner(seq, req.label);
       await this.push(seq, req.label);
@@ -1019,30 +1059,30 @@ export class SyncEngine {
     // Unfinished catch-up must not wait for the next poll — resuming it is this cycle's business.
     this.pendingResume = partialPull ? this.resumeReqFrom(req) : null;
 
-    const activity = this.pulled + this.pushed + this.merged;
+    const activity = st.pulled + st.pushed + st.merged;
     // REMOTE movement only (§4.9a). The ACTIVE poll tier exists to catch follow-up changes from
     // other devices, so it must not be armed by our own pushes — during local typing that turns
     // every poll into an extra push of the file being typed.
-    if (this.pulled + this.merged > 0) this.opts.onRemoteActivity?.();
+    if (st.pulled + st.merged > 0) this.opts.onRemoteActivity?.();
     // Persist when state changed — and always after a resync, so the reset sticks even if S3 was
     // empty (activity 0, rev unchanged at 0). No-op polls (the common case) still skip the write.
     if (req.resetCursor || activity > 0 || this.state.lastSyncedRev !== rev0) {
       await this.opts.onStateChanged(this.state);
     }
-    if (req.announce || activity > 0 || this.skipped > 0) {
+    if (req.announce || activity > 0 || st.skipped > 0) {
       this.notify(
-        `Sync: ${req.announce ? `done (${req.label}) ` : ""}↓${this.pulled} ↑${this.pushed}` +
-          (this.merged ? ` (${this.merged} merged)` : "") +
-          (this.skipped ? ` · ${this.skipped} kept in cloud (over size limit)` : ""),
+        `Sync: ${req.announce ? `done (${req.label}) ` : ""}↓${st.pulled} ↑${st.pushed}` +
+          (st.merged ? ` (${st.merged} merged)` : "") +
+          (st.skipped ? ` · ${st.skipped} kept in cloud (over size limit)` : ""),
         req.force,
       );
     }
     // The summary Notice above is a transient count; the persistent log gets the actual file list.
-    this.logCycleDetail();
+    this.logCycleDetail(seq);
   }
 
   /** Returns true when it stopped early with entries still to apply (see applyChunked). */
-  private async pull(fullPull = false): Promise<boolean> {
+  private async pull(seq: number, fullPull = false): Promise<boolean> {
     let deltas: Delta[];
     let changed: Map<string, SnapshotEntry>;
     let targetRev: number;
@@ -1079,7 +1119,7 @@ export class SyncEngine {
     this.nodeIndex = new Map();
     for (const k of Object.keys(this.state.files)) this.nodeIndex.set(canonicalKey(k), k);
     try {
-      return await this.applyChunked(applicable, targetRev);
+      return await this.applyChunked(applicable, targetRev, seq);
     } finally {
       this.nodeIndex = undefined;
     }
@@ -1103,6 +1143,7 @@ export class SyncEngine {
   private async applyChunked(
     applicable: [string, SnapshotEntry][],
     targetRev: number,
+    seq: number,
   ): Promise<boolean> {
     // Group by authoring rev so a chunk can never split one revision across two commits.
     const byRev = new Map<number, [string, SnapshotEntry][]>();
@@ -1131,8 +1172,8 @@ export class SyncEngine {
       // ONE delta, so both always land in the same chunk and the ordering survives chunking intact.
       const lives = chunk.filter(([, e]) => !isTombstone(e));
       const tombstones = chunk.filter(([, e]) => isTombstone(e));
-      await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
-      await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry));
+      await mapPool(lives, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry, seq));
+      await mapPool(tombstones, this.opts.concurrency, ([path, entry]) => this.applyRemote(path, entry, seq));
 
       const done = i >= revs.length;
       // On the last chunk take `targetRev` — it can exceed the highest rev that carried an applicable
@@ -1172,7 +1213,17 @@ export class SyncEngine {
    * path MUST set it: by then this device has already uploaded its own bytes to that key (files are
    * PUT before the delta, §2.3), so "latest" is our own stale content and merging against it would
    * compare local with local and quietly conclude there was no conflict. */
-  private async applyRemote(path: string, entry: SnapshotEntry, pin = false): Promise<void> {
+  private async applyRemote(
+    path: string,
+    entry: SnapshotEntry,
+    seq: number,
+    pin = false,
+  ): Promise<void> {
+    // Stop on the next file when this cycle has been fenced (§4.3). Checked here, at the top of each
+    // file's work, so an abandoned catch-up abandons the REST of its queue instead of draining it —
+    // the 2026-08-23 poll that kept downloading after being abandoned, re-fetching main.js seven
+    // times while its replacement did the same work.
+    this.assertOwner(seq, "apply");
     const st = this.state.files[path];
 
     if (isTombstone(entry)) {
@@ -1185,14 +1236,14 @@ export class SyncEngine {
           // (which the live-first pull pass has already materialized) instead of resurrecting `old`,
           // then remove `old` below. Losslessly carries a concurrent edit across the rename — the case
           // the freshest-wins delete-vs-edit tiebreak can't preserve.
-          await this.foldRenamedEdit(path, renamedTo, localBuf, st!);
+          await this.foldRenamedEdit(seq, path, renamedTo, localBuf, st!);
         } else if (divergent && (await this.editWinsOverDelete(path, entry))) {
           this.dirty.add(path); // delete-vs-edit: our FRESHER edit wins (§1.5) → re-push
           return;
         }
         await this.withApplying(path, () => this.vault.adapter.remove(path));
-        this.pulled++;
-        this.detail.deletedLocal.push(path);
+        this.statsFor(seq).pulled++;
+        this.statsFor(seq).detail.deletedLocal.push(path);
       }
       delete this.state.files[path];
       this.dirty.delete(path);
@@ -1205,7 +1256,7 @@ export class SyncEngine {
     // to the winning name so the new name shows here too. A pure rename (never a delete), so it can't
     // lose the shared inode; on any failure we skip and fall through to normal content handling.
     const variant = this.nodeIndex?.get(canonicalKey(path));
-    if (variant && variant !== path) await this.renameLocalToCanonical(variant, path);
+    if (variant && variant !== path) await this.renameLocalToCanonical(seq, variant, path);
     const localBuf = await this.readLocal(path);
     const localHash = localBuf ? contentHash(localBuf) : null;
     if (localHash === remote.hash) {
@@ -1248,7 +1299,7 @@ export class SyncEngine {
         // it's over the cap so we won't download either — drop it from the dirty set so push()
         // can't upload the default (it's untracked, so push wouldn't otherwise skip it).
         if (this.bootstrap) this.dirty.delete(path);
-        this.skipped++;
+        this.statsFor(seq).skipped++;
         return;
       }
       // clean local (or absent) → take remote as-is
@@ -1273,8 +1324,8 @@ export class SyncEngine {
         });
       }
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
-      this.pulled++;
-      this.detail.pulled.push(path);
+      this.statsFor(seq).pulled++;
+      this.statsFor(seq).detail.pulled.push(path);
       return;
     }
 
@@ -1292,11 +1343,11 @@ export class SyncEngine {
       // notes never reach here; their union merge collapses base==theirs to ours on its own.
       if (st && remote.hash === st.hash) {
         this.dirty.add(path); // keep local, re-push it
-        this.merged++;
-        this.recordMerged(path);
+        this.statsFor(seq).merged++;
+        this.recordMerged(seq, path);
         return;
       }
-      await this.resolveFreshestWins(path, remote, pin);
+      await this.resolveFreshestWins(seq, path, remote, pin);
       return;
     }
     const baseObj = st?.s3VersionId
@@ -1318,8 +1369,8 @@ export class SyncEngine {
     // conflict on this device forever. Leave the file dirty with its prior state so push() sees the
     // change, uploads it, and records the true state (with the real s3VersionId from the PUT).
     this.dirty.add(path); // merged result must go back to S3
-    this.merged++;
-    this.recordMerged(path); // listed in the cycle's log summary; push() won't re-list it as pushed
+    this.statsFor(seq).merged++;
+    this.recordMerged(seq, path); // listed in the cycle's log summary; push() won't re-list it as pushed
     if (merged.hadConflicts) {
       // A real conflict is worth surfacing on its own (distinct severity + a Notice), beyond the
       // per-cycle merged list — so keep this immediate warning too.
@@ -1354,6 +1405,7 @@ export class SyncEngine {
    * concurrent edit across a rename — the case editWinsOverDelete's freshest-wins tiebreak cannot
    * preserve. */
   private async foldRenamedEdit(
+    seq: number,
     oldPath: string,
     newPath: string,
     localOld: Uint8Array,
@@ -1391,8 +1443,8 @@ export class SyncEngine {
       await this.write(newPath, localOld, new Date().toISOString()); // `old` edit is newer → move it onto `new`
     }
     this.dirty.add(newPath); // re-publish the folded result so all devices converge
-    this.merged++;
-    this.recordMerged(newPath);
+    this.statsFor(seq).merged++;
+    this.recordMerged(seq, newPath);
   }
 
   /** Which conflict strategy a path uses: config-dir files and binary/oversized content resolve by
@@ -1405,6 +1457,7 @@ export class SyncEngine {
    * both sync legs stay convergent even if clock skew makes them pick different sides on one pass.
    * Remote newer → download and record it; local newer (or a tie) → keep local and re-push. */
   private async resolveFreshestWins(
+    seq: number,
     path: string,
     remote: FileEntry & SnapshotEntry,
     pin = false,
@@ -1421,13 +1474,13 @@ export class SyncEngine {
       }
       await this.write(path, obj.body, remote.mtime);
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
-      this.pulled++;
-      this.merged++;
-      this.recordMerged(path);
+      this.statsFor(seq).pulled++;
+      this.statsFor(seq).merged++;
+      this.recordMerged(seq, path);
     } else {
       this.dirty.add(path); // local is newer (or tie) → keep it and push it up
-      this.merged++;
-      this.recordMerged(path);
+      this.statsFor(seq).merged++;
+      this.recordMerged(seq, path);
     }
   }
 
@@ -1435,7 +1488,7 @@ export class SyncEngine {
    * linkpath against the full live remote state (snapshot ⊕ newer deltas) so files not present
    * locally — the whole point on a capped device — still resolve. Writes clean/absent targets and
    * records them; never clobbers a locally-dirty file (that's for normal reconcile to resolve). */
-  private async forceDownload(candidates: string[]): Promise<ForceDownloadResult> {
+  private async forceDownload(seq: number, candidates: string[]): Promise<ForceDownloadResult> {
     const result: ForceDownloadResult = {
       requested: candidates.length,
       downloaded: 0,
@@ -1473,8 +1526,8 @@ export class SyncEngine {
       }
       await this.write(path, obj.body, remote.mtime);
       this.record(path, { ...remote, s3VersionId: obj.versionId ?? remote.s3VersionId });
-      this.pulled++;
-      this.detail.pulled.push(path);
+      this.statsFor(seq).pulled++;
+      this.statsFor(seq).detail.pulled.push(path);
       result.downloaded++;
     });
     return result;
@@ -1553,7 +1606,7 @@ export class SyncEngine {
           if (this.state.files[path]) {
             files[path] = { deleted: true, renamedTo: renamedAway };
             newStates.set(path, null);
-            this.detail.deletedRemote.push(path);
+            this.statsFor(seq).detail.deletedRemote.push(path);
           }
           return;
         }
@@ -1565,7 +1618,7 @@ export class SyncEngine {
           if (this.state.files[path]) {
             files[path] = { deleted: true }; // deleted locally → tombstone
             newStates.set(path, null);
-            this.detail.deletedRemote.push(path);
+            this.statsFor(seq).detail.deletedRemote.push(path);
           }
           return;
         }
@@ -1591,8 +1644,8 @@ export class SyncEngine {
               mtime: clobber.mtime,
             });
             this.pendingPull.delete(path);
-            this.pulled++; // healed back to the pulled content (took remote), not a push
-            this.detail.pulled.push(path);
+            this.statsFor(seq).pulled++; // healed back to the pulled content (took remote), not a push
+            this.statsFor(seq).detail.pulled.push(path);
             this.opts.log(
               "warn",
               `healed phantom revert in ${path} — write clobbered after pull, not republishing stale content`,
@@ -1618,8 +1671,8 @@ export class SyncEngine {
         newStates.set(path, { hash, s3VersionId: versionId, mtime });
         // A conflict-resolved file is re-pushed here too — it's already in the merged list, so don't
         // list it a second time as a plain push.
-        if (!this.mergedSet.has(path) && !this.detail.pushed.includes(path)) {
-          this.detail.pushed.push(path);
+        if (!this.statsFor(seq).mergedSet.has(path) && !this.statsFor(seq).detail.pushed.includes(path)) {
+          this.statsFor(seq).detail.pushed.push(path);
         }
       };
 
@@ -1641,7 +1694,7 @@ export class SyncEngine {
             this.assertOwner(seq, label);
             const remote: SnapshotEntry = { ...entry, rev: winner.rev, by: winner.by, at: winner.at };
             if (!(path in files)) {
-              await this.applyRemote(path, remote);
+              await this.applyRemote(path, remote, seq);
               continue;
             }
             // COLLISION: the winner touched a path this push is carrying. Skipping it — the old
@@ -1652,10 +1705,10 @@ export class SyncEngine {
             // our payload entry from whatever the resolution left on disk.
             delete files[path];
             newStates.delete(path);
-            const listed = this.detail.pushed.indexOf(path);
-            if (listed >= 0) this.detail.pushed.splice(listed, 1);
+            const listed = this.statsFor(seq).detail.pushed.indexOf(path);
+            if (listed >= 0) this.statsFor(seq).detail.pushed.splice(listed, 1);
             this.dirty.delete(path);
-            await this.applyRemote(path, remote, true);
+            await this.applyRemote(path, remote, seq, true);
             // applyRemote re-dirties a path whose local side survived resolution (a union merge, a
             // freshest-wins local win, an edit that beat a delete) and leaves it clean when remote won
             // outright. Only the former still has anything of ours left to publish.
@@ -1669,7 +1722,7 @@ export class SyncEngine {
         else this.state.files[path] = st;
       }
       this.state.lastSyncedRev = result.rev;
-      this.pushed += Object.keys(files).length;
+      this.statsFor(seq).pushed += Object.keys(files).length;
       // Announce the revision we just published so peers pull it now instead of at their next poll
       // (§4.14). Strictly after the append succeeded — a notification must never point at a
       // revision the journal doesn't have — and best-effort by contract: the hook swallows its own
@@ -1718,7 +1771,7 @@ export class SyncEngine {
    * on a case-insensitive FS it just re-cases the name (same inode); on a case-sensitive FS it moves
    * the file. Echo-suppressed (both paths in `applying`) so the resulting vault rename event isn't
    * re-pushed. On any failure it no-ops — the note is untouched, only its displayed name lags. */
-  private async renameLocalToCanonical(from: string, to: string): Promise<void> {
+  private async renameLocalToCanonical(seq: number, from: string, to: string): Promise<void> {
     const st = await this.vault.adapter.stat(from);
     if (!st || st.type !== "file") return; // nothing on disk under the old name
     // A case/NFC-only rename is a "target already exists" fold-collision on a case-INSENSITIVE
@@ -1768,7 +1821,7 @@ export class SyncEngine {
       this.state.files[to] = prior; // migrate the tracked entry to the winning name
       delete this.state.files[from];
     }
-    this.detail.pulled.push(to);
+    this.statsFor(seq).detail.pulled.push(to);
     this.opts.log("info", `re-cased ${from} → ${to} (${via})`);
     // vault events fire async — release on the next tick, matching write()'s echo window
     setTimeout(release, 500);

@@ -549,6 +549,27 @@ one device, the second one publishing an ancient baseline, which is strictly wor
 The plugin treats `CycleAbandonedError` on a background cycle as self-healing (WARN, no Notice); the
 engine has already logged what stalled and the next cycle picks the work up.
 
+> [!important] The fence is checked **per file**, and the counters are **per cycle**
+> Fencing is a per-cycle flag (`seq` vs `cycleSeq`), but a flag nobody reads stops nothing. It was
+> asserted only around `push`, so an abandoned **pull** never noticed: it kept downloading and
+> writing its entire remaining queue while its replacement did the same work. Observed 2026-08-23 —
+> one poll reported `↓13` for three files, having re-fetched a 525 KB `main.js` **seven times** on a
+> phone. Both cycles also shared the counters, so the numbers belonged to neither.
+>
+> `applyRemote` now asserts ownership **at the top of each file**, so a fenced catch-up abandons the
+> rest of its queue and only work already in flight (≤ `concurrency`) completes. This is what makes
+> the guarantee above — "unwinds without writing" — actually true for pulls, not just pushes.
+>
+> Per-cycle activity (`pulled`/`pushed`/`merged`/`skipped` and the per-file detail lists) lives in a
+> map keyed by `seq`, not in engine fields: an orphan's late completions land in its own entry and
+> are discarded, instead of inflating the live cycle's summary. The map is bounded (`STATS_KEEP`),
+> since an abandoned cycle never deletes its own entry.
+>
+> Deliberately *not* done: aborting the in-flight requests. That needs an `AbortSignal` threaded into
+> the adapter, and cancellation was rejected for this design in the first place — a hung promise is
+> exactly what cannot be cancelled. Stopping at the next file caps the waste without touching the
+> path every S3 request takes.
+
 ## 4.4 Change tracking & offline scan (`scanForOfflineChanges`)
 
 Vault events (`create/modify/delete/rename`) feed the dirty set while running, debounced before a
