@@ -211,6 +211,15 @@ export interface EngineOptions {
    * path isn't a note in the vault index (e.g. a config file) so the engine falls back to the adapter.
    * Optional: absent in tests / where only adapter renames are available. */
   renameFile?: (from: string, to: string, viaTmp: string) => Promise<boolean>;
+  /** Write a pulled NOTE through Obsidian's own API (`Vault.modifyBinary`) rather than the raw
+   * storage adapter, for the same reason `renameFile` exists: the adapter writes the bytes but tells
+   * Obsidian nothing, so an **open editor keeps its stale buffer** — it shows old text, and worse,
+   * saves that text back over what we just pulled. The engine then sees a legitimate-looking local
+   * edit and publishes it, reverting the note on every device (the 2026-08-23 `linux-stkv`
+   * rollback). Going through the Vault makes Obsidian refresh open views instead.
+   * Returns false when the path isn't a note in the vault index (config files live outside it), so
+   * the engine falls back to the adapter. Optional: absent in tests. */
+  writeFile?: (path: string, data: Uint8Array, mtimeMs: number) => Promise<boolean>;
   /** Called with the path just before sync overwrites an EXISTING local file with remote bytes.
    * The plugin routes this to Obsidian's File recovery store so the pre-sync local content is always
    * recoverable in-app, even when this device never pushed it (§4.12). Best-effort by contract:
@@ -1816,10 +1825,22 @@ export class SyncEngine {
           /* best-effort safety net; a failed snapshot must not stop the sync */
         }
       }
+      const mtimeMs = Date.parse(mtimeIso);
+      // Prefer Obsidian's own Vault write for notes: it refreshes open editors, so a view of this
+      // file can't keep — and later save back — a stale buffer. Falls through to the raw adapter for
+      // anything outside the vault index (config dir), and if the Vault write fails for any reason:
+      // getting the bytes on disk matters more than getting the UI to notice.
+      if (this.opts.writeFile) {
+        try {
+          if (await this.opts.writeFile(path, data, mtimeMs)) return;
+        } catch {
+          /* fall through to the adapter below */
+        }
+      }
       await this.vault.adapter.writeBinary(
         path,
         data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer,
-        { mtime: Date.parse(mtimeIso) },
+        { mtime: mtimeMs },
       );
     });
   }

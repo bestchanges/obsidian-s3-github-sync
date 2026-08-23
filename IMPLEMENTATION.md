@@ -61,7 +61,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/engine.ts` | `SyncEngine`: pull/push, merge, exclusions, offline scan, download cap, resync. |
 | `packages/obsidian-plugin/src/main.ts` | Plugin lifecycle, persistence, device identity, settings UI, commands. |
 | `packages/obsidian-plugin/src/s3-fetch-adapter.ts` | `StorageAdapter` over `aws4fetch` (small, mobile-safe). |
-| `packages/obsidian-plugin/src/poll-schedule.ts` | Pure adaptive-poll tier selection (§4.9a) — no DOM, unit-tested. |
+| `packages/obsidian-plugin/src/poll-schedule.ts` | Pure poll-tier + push-debounce cadence (§4.9a, §4.4) — no DOM, unit-tested. |
 | `packages/obsidian-plugin/src/notify.ts` | `ChangeNotifier`: MQTT-over-WSS subscribe/publish, presign, backoff (§4.14). |
 | `packages/obsidian-plugin/src/mqtt.ts` | Hand-rolled QoS-0 MQTT 3.1.1 codec — pure, unit-tested (§4.14). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
@@ -710,6 +710,23 @@ to the download cap); local also changed → **conflict**. Conflict strategy dep
 > event, §4.4): the next `push` tags the old path's tombstone with `renamedTo`. Because a rename's
 > `new` must exist before the fold, `pull` applies **live entries before tombstones** in each cycle.
 
+> [!important] Pulled notes are written through the **Vault**, not the adapter (`EngineOptions.writeFile`)
+> The raw adapter puts bytes on disk but tells Obsidian nothing, so a note **open in an editor keeps
+> its stale buffer**: it displays the old text, and when Obsidian later saves that buffer it lands
+> back on disk looking like a legitimate local edit — which the next cycle publishes, reverting the
+> note on every device. That is the **2026-08-23 `linux-stkv` rollback**: rev 6255 republished
+> two-hour-old content over rev 6254 and cost two paragraphs everywhere. `writeFile` routes the
+> write through `Vault.modifyBinary` when the path is a `TFile` in the index, so open views follow
+> the file; it returns false for config-dir paths (outside the index) and the engine falls back to
+> the adapter, as it does if the Vault write throws — bytes on disk matter more than a refreshed UI.
+> Same reasoning as `renameFile` (§4.4), which exists because the adapter bypasses the metadata cache.
+>
+> Note this is *upstream* of the phantom-revert guard below, which only recognises a **one-step**
+> revert (back to `priorHash`). A buffer that is several revisions stale writes back a state that
+> matches neither the pulled hash nor its immediate predecessor, so the guard reads it as a genuine
+> third state and lets it through — by design. Keeping the editor in sync is what actually prevents
+> the class; the guard covers the narrower autosave race.
+
 Remote writes
 land with the **manifest's mtime** (`DataWriteOptions`), so sort-by-modified is consistent across
 devices and the offline pre-filter stays trustworthy. Writes made by sync are wrapped in an
@@ -1190,6 +1207,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Notification socket down / message lost | polling continues and re-tightens automatically (§4.9a, §4.14) — latency, never loss |
 | Corrupt S3 object | manifest hash mismatch on apply → skip/re-fetch |
 | "Resync pulled 0 files" | resync uses `fullPull` (no echo suppression) → restores own lost files |
+| Open editor shows stale text after a pull, then reverts it | pulled notes go through `Vault.modifyBinary` so open views refresh (§4.8) — the raw adapter silently left stale buffers alive |
 | Wrong content in one note (bad merge, unwanted edit, remote clobber) | **Version history** (§4.12): pick a revision, diff it, restore — attributed by device and rev |
 | Note deleted / renamed unexpectedly | Version history follows renames and shows the tombstone with its writing device; restore the revision before it |
 | Local bytes lost that were never pushed | Obsidian **File recovery** snapshot taken before every sync overwrite (§4.12) — device-local, `.md`/`.canvas` |
