@@ -942,41 +942,43 @@ mention of version history, snapshots or revisions, and the app exposes no provi
 (`registerVersionHistory` / `versionHistoryProvider` and friends simply do not exist). So the plugin
 renders its own, off a source that is strictly richer than Sync's — see §2.9.
 
-> [!important] Narrow layouts own their sizing — `.modal-content` is a **flex row**
-> Obsidian sets `.modal-content { display: flex }` on every platform, so a block child of ours is a
-> flex item. Ours declared no `flex` and no `min-width`, so it collapsed to its intrinsic content
-> width — about **180 px of an 840 px modal** — which is what produced the reported "content pane is
-> empty, everything squeezed to the left, split in two" (screenshot, 2026-08-23): the panes and the
-> navigation were fine, the *sizing* was not.
+> [!important] One markup, Obsidian's classes, `mod-sidebar-layout` only off-phone
+> The modal is built from Obsidian's own classes on **both** platforms — `modal-sidebar mod-history`,
+> `modal-sidebar-inner`, `modal-sidebar-list`, `modal-sidebar-list-item`, `modal-button-container`,
+> `diff-line`/`mod-left`/`mod-right` — so it inherits the app's look instead of imitating it. The
+> only structural difference is a single class on the modal:
 >
-> Two earlier diagnoses were wrong and are recorded so they aren't re-proposed: it is **not**
-> `Platform.isMobile` reading false (it reads correctly, and the mobile pane did render and
-> navigate), and it is **not** `.diff-view` imposing columns (that rule is only `user-select: text`).
-> It is also **not mobile-specific** — a narrow desktop window does the same thing, which is what
-> makes it testable without a phone.
+> | | Desktop | Phone |
+> |---|---|---|
+> | `mod-sidebar-layout` | **yes** → the two-pane sidebar | **no** |
+> | Panes | both visible | one at a time, `.s3sync-hidden` |
+> | Landing | newest version auto-selected | the list |
 >
-> The narrow layout therefore builds everything inside **one wrapper this modal owns**
-> (`display:flex; flex-direction:column; flex:1 1 auto; width:100%; min-width:0; min-height:0`)
-> rather than reacting to whatever the parent's layout mode is. `min-*: 0` is the specific cure for
-> the collapse: without it a flex item won't shrink below its content, and with no `flex-grow` it
-> won't expand. `bodyEl` gets `flex:1 1 auto; min-height:0; overflow:auto` so the diff scrolls inside
-> the pane instead of being sized to nothing.
+> Leaving the class off on a phone is the whole trick: `.modal.mod-sidebar-layout .modal-content`
+> (three classes) out-specifies `.is-phone .modal-content` (two), so adding it would override
+> Obsidian's own mobile rule — a full-width scrolling column — and force a sidebar row onto a screen
+> with no room for it. Without it, Obsidian lays the phone out the way it lays out its own modals,
+> and `.is-phone .modal-sidebar-inner` even drops the sidebar's border and side-panel background for
+> us. `.is-phone .modal-button-container` and `.is-phone .modal .setting-item` do the same for the
+> controls, which is why `Setting` rows are used on both rather than hand-built buttons.
 >
-> It also uses **no `Setting` rows** for its buttons: a `Setting` is built for a full-width settings
-> pane (label and description left, control floated right), which in a narrow column renders as a
-> two-word-per-line paragraph with a toggle stranded beside it. Plain stacked buttons instead, with
-> the diff state on the button label. Layout is chosen by
-> `Platform.isMobile || modal width < NARROW_PX` (700) — width is the property the layout actually
-> depends on. Wide layouts keep Obsidian's sidebar classes, unchanged.
+> **Detection is `Platform.isPhone`**, matching the `.is-phone` body class Obsidian keys its own CSS
+> off, so the two agree by construction. A width heuristic was tried and **dropped**: `clientWidth`
+> is read before the modal is laid out, so it can under-report and take the sidebar away from a
+> desktop that has room for it.
 >
-> The layout itself lives in **`packages/obsidian-plugin/styles.css`**, not in JS: none of it is
-> dynamic, and Obsidian loads a plugin's stylesheet automatically. The modal sets **no** inline
-> styles at all — the one thing it changes at runtime, which pane is on screen, is a
-> `.s3sync-hidden` class toggle. Classes are namespaced `s3sync-` so they cannot collide with
-> Obsidian's; Obsidian's own classes are still used where they carry the look we want
-> (`diff-line`, `mod-left`/`mod-right`, `modal-sidebar*`).
->
-> Rejected: a `<select>` of versions (loses the per-row size/delta labelling below).
+> `styles.css` is therefore ~4 rules: how the detail pane sizes itself beside the sidebar
+> (`min-width: 0` so a long unbroken line scrolls instead of widening the modal), the body's scroll,
+> the header padding, and `.s3sync-hidden`. An earlier revision restyled the whole layout here and
+> looked alien for it.
+
+> [!note] The diff compares against the **current** version, not the neighbouring one
+> The question a version list answers is "how does this differ from what I have now" — which is also
+> exactly what a restore would do to the file. Diffing against rev−1 answered a different question
+> (what that one revision changed), rarely the one being asked and useless for deciding whether to
+> restore. Base is the current version, target the selected one: removals are what the live file has
+> and this version doesn't, additions are what restoring would bring back. Selecting the current
+> version shows plain text — there is nothing to compare it with.
 
 > [!note] Rows carry a **size delta**, because timestamps alone aren't identifiable
 > The 2026-08-23 rollback (1076 B) and the good copy it overwrote (1327 B) were **4 seconds apart**,
