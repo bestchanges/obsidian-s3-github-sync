@@ -41,6 +41,11 @@ export class VersionHistoryModal extends Modal {
   /** cache: rev → decoded text (or null when binary/oversized/deleted) */
   private textCache = new Map<number, string | null>();
 
+  private loadingEl: HTMLElement | null = null;
+  /** How much of the journal the bounded walk actually read (§2.9) — the empty state must say so
+   * rather than claiming the file has no history. */
+  private scanned = 0;
+  private available = 0;
   private listEl!: HTMLElement;
   private headerEl!: HTMLElement;
   private bodyEl!: HTMLElement;
@@ -64,7 +69,7 @@ export class VersionHistoryModal extends Modal {
     this.bodyEl = content.createDiv("sync-history-preview diff-view");
     this.buttonsEl = container.createDiv("modal-button-container");
 
-    this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
+    this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
     void this.load();
   }
 
@@ -75,15 +80,33 @@ export class VersionHistoryModal extends Modal {
   private async load(): Promise<void> {
     let result: HistoryResult;
     try {
-      result = await readFileHistory(this.opts.storage, this.opts.path, this.opts.concurrency);
+      result = await readFileHistory(this.opts.storage, this.opts.path, {
+        concurrency: this.opts.concurrency,
+        // Progress matters here: the walk reads the journal newest-first in batches, and without a
+        // count a slow scan is indistinguishable from "this file has no history" — which is exactly
+        // how the feature read as broken before.
+        onProgress: (scanned, available) => {
+          if (this.loadingEl) {
+            this.loadingEl.setText(`Searching journal… ${scanned} of ${available} revisions`);
+          }
+        },
+      });
     } catch (err) {
       this.opts.log("error", `version history failed for ${this.opts.path}: ${String(err)}`);
+      this.loadingEl = null;
       this.listEl.empty();
       this.listEl.createDiv({ cls: "u-muted u-small", text: `Couldn't read history: ${String(err)}` });
       return;
     }
+    this.loadingEl?.remove();
+    this.loadingEl = null;
     this.versions = result.versions;
+    this.scanned = result.scanned;
+    this.available = result.available;
     this.truncated = result.truncated;
+    if (result.unreadable > 0) {
+      this.opts.log("warn", `version history: ${result.unreadable} unreadable deltas skipped for ${this.opts.path}`);
+    }
     this.oldestRev = result.oldestRevAvailable;
     this.renderList();
     if (this.versions.length > 0) await this.select(0);
@@ -92,9 +115,15 @@ export class VersionHistoryModal extends Modal {
   private renderList(): void {
     this.listEl.empty();
     if (this.versions.length === 0) {
+      // Distinguish "searched everything, genuinely nothing" from "searched the recent part and
+      // found nothing" — the second is not evidence that the file has no history.
+      const partial = this.scanned < this.available;
       this.listEl.createDiv({
         cls: "u-muted u-small",
-        text: "No revisions for this file in the journal.",
+        text: partial
+          ? `No revisions in the ${this.scanned} most recent of ${this.available} journal entries. ` +
+            `Older history may exist — this file hasn't changed recently.`
+          : "No revisions for this file in the journal.",
       });
       return;
     }
@@ -118,9 +147,15 @@ export class VersionHistoryModal extends Modal {
     });
 
     if (this.truncated) {
+      // Two different reasons, and conflating them misleads: the journal may have been pruned
+      // (older revisions are gone for good), or the bounded walk simply stopped before the end
+      // (they exist, we just didn't read that far). Say which.
+      const stoppedEarly = this.scanned < this.available;
       this.listEl.createDiv({
         cls: "u-muted u-small",
-        text: `Journal pruned below rev ${this.oldestRev} — older revisions are no longer available.`,
+        text: stoppedEarly
+          ? `Searched the ${this.scanned} most recent of ${this.available} journal entries — older revisions of this file may exist.`
+          : `Journal pruned below rev ${this.oldestRev} — older revisions are no longer available.`,
       });
     }
   }

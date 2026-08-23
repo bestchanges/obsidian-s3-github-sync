@@ -250,8 +250,28 @@ The journal is already a complete, attributed history — every write to a path 
 **query over `deltas/`, not a second store**. Nothing new is written to S3 for this feature.
 
 - `fileHistory(deltas, path)` → `FileVersion[]`, **newest first**. Pure.
-- `readFileHistory(storage, path)` → the above plus `oldestRevAvailable` / `truncated`, so a caller
-  can say "older revisions were pruned" instead of silently showing a short list.
+- `readFileHistory(storage, path, opts?)` → the above plus `oldestRevAvailable` / `truncated` /
+  `scanned` / `available` / `unreadable`. **Bounded and newest-first**: it LISTs the delta keys
+  (cheap — one object per rev, so keys sort by rev) and walks backwards in batches of `chunk` (200),
+  stopping at `limit` versions (100), after `quietChunks` (2) consecutive batches that add nothing,
+  or at `maxScan` (1500) deltas. Individual unreadable deltas are counted and skipped, never fatal.
+
+> [!warning] Why it is bounded — the feature was effectively broken without it
+> The original implementation fetched **every surviving delta** and filtered afterwards. On a vault
+> with 3 588 deltas that is 3 588 GETs per open: ~57 s on a desktop at concurrency 16, minutes on a
+> phone at 8 — and because `listDeltasSince` throws when any single object fails, one transient
+> error among thousands discarded the whole result. Across that many mobile requests a failure is
+> near-certain, so history reliably rendered as an empty list with no error anywhere (diagnosed
+> 2026-08-23). The bounded walk brings the same query to ~12 s / 600 deltas for a recently-edited
+> note, and a hole in the journal now costs one revision rather than the feature.
+>
+> `truncated` therefore has two causes, and callers must not conflate them: the journal was **pruned**
+> (older revisions are gone), or the walk **stopped early** (they exist but weren't read).
+> `scanned < available` distinguishes them; the modal words each case differently.
+>
+> This is still O(journal), just with a ceiling. The real fix is an **index** — e.g. git-sync writing
+> `index/history.json.gz` (path → revs) at compaction, turning a query into one GET plus only the
+> deltas that actually touch the path. Not implemented; see §12.
 - `readVersionContent(storage, version)` → the exact bytes, `GET files/<path>?versionId=<s3VersionId>`.
   Entries predating `s3VersionId` fall back to the object's current version (verify against `hash`).
 - `lineDiff(before, after)` → `DiffLine[]` for display, built on the same `diffComm` primitive the
@@ -1261,6 +1281,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Log flush debounce | 1 s | `FLUSH_DEBOUNCE_MS` (logger.ts) |
 | Log S3 namespace | `_logs/<deviceId>.log` | `LOG_PREFIX` (logger.ts) |
 | History preview cap | 2 MB (larger → metadata only) | `PREVIEW_MAX_BYTES` (history-modal.ts) |
+| History scan: batch / versions / quiet / ceiling | 200 / 100 / 2 batches / 1500 deltas | `DEFAULT_CHUNK`, `DEFAULT_LIMIT`, `DEFAULT_QUIET_CHUNKS`, `DEFAULT_MAX_SCAN` (history.ts) |
 | History binary sniff | NUL byte in first 8 KB | history-modal.ts |
 
 ---
@@ -1286,6 +1307,12 @@ implementation added or diverged as follows:
 | Tombstone GC | prune > 90 days | **not implemented** — tombstones persist in the snapshot; only deltas are pruned (30 days) |
 | Branch protection | bot bypass / auto-PR option | direct push by `s3-sync-bot` with `[skip ci]` |
 | Sync cadence | `*/15` cron, compaction every run | **4-hourly** cron; snapshot rebuild **age-gated** to ~daily (`SNAPSHOT_MAX_AGE_HOURS`) |
+
+> [!note] Known gap — per-path history index
+> `readFileHistory` scans the journal (bounded, §2.9) because nothing maps a path to the revisions
+> that touched it. An `index/history.json.gz` written by git-sync at compaction would make history a
+> single GET plus the handful of deltas that matter, and would remove the `maxScan` ceiling (and its
+> "older revisions may exist" caveat) entirely.
 
 > [!note] Known gap
 > The 90-day tombstone garbage-collection from the design is **not** implemented: `foldDeltas`
