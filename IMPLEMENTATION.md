@@ -920,7 +920,31 @@ mention of version history, snapshots or revisions, and the app exposes no provi
 (`registerVersionHistory` / `versionHistoryProvider` and friends simply do not exist). So the plugin
 renders its own, off a source that is strictly richer than Sync's — see §2.9.
 
-**`VersionHistoryModal`** — a two-pane modal built with Obsidian's own shipped classes
+> [!important] Mobile is a **single pane at a time**, not a sidebar
+> Obsidian's `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for:
+> the version list collapsed to roughly one visible row, so on mobile only the newest version could
+> ever be reached (reported 2026-08-23). Worse, the modal auto-selected that newest version on open,
+> which *hid the list behind it* — and restoring the version already on disk does nothing, so the
+> Restore button looked broken too. All three symptoms were one layout bug.
+>
+> On `Platform.isMobile` the modal therefore drops the sidebar class and shows **one pane at a
+> time** — the full-width scrollable list, then a version's content with an **← All versions**
+> button — and does *not* auto-select on open, so the list is what you land on. Desktop keeps the
+> two-pane layout.
+>
+> Rejected alternatives: shipping a `styles.css` with media queries (the build emits `main.js` +
+> `manifest.json` only, and a stylesheet is another artefact to distribute per §8), and a `<select>`
+> dropdown of versions (works, but loses the timestamp/size/current labelling that makes a row
+> identifiable). If the layout ever misbehaves on a specific device, the desktop app renders the same
+> data — the panel is a view over S3, not device state.
+
+> [!note] Restoring the current version is reported, not silently ignored
+> `matchesLocal` compares the chosen bytes with the file on disk; identical means the restore is a
+> no-op, and the modal says so instead of appearing to succeed and changing nothing. **Show changes**
+> also defaults **on**: the list exists to answer "what changed", and making the user toggle that per
+> row, then eyeball two walls of text, is work the tool should do.
+
+**`VersionHistoryModal`** — a two-pane modal (desktop) built with Obsidian's own shipped classes
 (`mod-sidebar-layout`, `modal-sidebar-list-item`, `diff-line mod-left/mod-right`), so it matches the
 native look with no bundled CSS:
 
