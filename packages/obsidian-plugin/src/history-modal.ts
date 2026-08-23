@@ -1,11 +1,10 @@
 import { App, Modal, Notice, Setting, TFile, normalizePath } from "obsidian";
 import {
   DiffLine,
-  FileVersion,
-  HistoryResult,
+  StoredVersion,
   lineDiff,
-  readFileHistory,
-  readVersionContent,
+  readStoredVersionContent,
+  readStoredVersions,
 } from "@vault-sync/core";
 import type { StorageAdapter } from "@vault-sync/core";
 
@@ -15,9 +14,6 @@ const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 export interface HistoryModalOptions {
   storage: StorageAdapter;
   path: string;
-  /** this device's id, so its own revisions are labelled "this device" */
-  deviceId: string;
-  concurrency: number;
   log: (level: "info" | "warn" | "error", msg: string) => void;
   /** Snapshot the current local bytes into Obsidian's File recovery store before a restore (§4.12). */
   backupBeforeWrite?: (path: string) => Promise<void>;
@@ -26,21 +22,32 @@ export interface HistoryModalOptions {
 }
 
 /**
- * Per-note version history, read off the delta journal (§4.12).
+ * Per-note version history, read straight from **S3 object versions** (§2.9, §4.12).
  *
  * Obsidian's own "Open version history" belongs to Obsidian Sync and has no plugin-facing API, so
- * this renders our own — using Obsidian's shipped modal/diff classes so it looks native. The journal
- * is a richer source than Sync's: every row carries the revision AND the device that wrote it.
+ * this renders our own, using Obsidian's shipped modal/diff classes so it looks native.
+ *
+ * The source is the bucket's own version list rather than the delta journal. The journal *can*
+ * answer this — it records every write — but only by scanning: thousands of GETs per open, ~57 s on
+ * a real vault, and all-or-nothing, so in practice history rendered empty. S3 already stores one
+ * version per write (versioning is required for merge bases, §8), so one `ListObjectVersions`
+ * returns the same list in ~1 s, with the content hash free in the ETag, reaching further back than
+ * the journal's retention window.
+ *
+ * Known limitations, both accepted (§2.9):
+ *  - **A rename resets the trail.** S3 has no rename — the new path is a new object — so history
+ *    starts fresh there. The pre-rename versions still exist under the old key.
+ *  - **Deletes aren't shown.** The protocol tombstones in the journal and never issues DeleteObject,
+ *    so there is no delete marker; recovering a deleted file is a separate feature.
  */
 export class VersionHistoryModal extends Modal {
-  private versions: FileVersion[] = [];
-  private truncated = false;
-  private oldestRev = 0;
+  private versions: StoredVersion[] = [];
   private selected = -1;
   private showDiff = false;
-  /** cache: rev → decoded text (or null when binary/oversized/deleted) */
-  private textCache = new Map<number, string | null>();
+  /** cache: versionId → decoded text (or null when binary/oversized) */
+  private textCache = new Map<string, string | null>();
 
+  private loadingEl: HTMLElement | null = null;
   private listEl!: HTMLElement;
   private headerEl!: HTMLElement;
   private bodyEl!: HTMLElement;
@@ -64,7 +71,7 @@ export class VersionHistoryModal extends Modal {
     this.bodyEl = content.createDiv("sync-history-preview diff-view");
     this.buttonsEl = container.createDiv("modal-button-container");
 
-    this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
+    this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
     void this.load();
   }
 
@@ -73,18 +80,27 @@ export class VersionHistoryModal extends Modal {
   }
 
   private async load(): Promise<void> {
-    let result: HistoryResult;
+    let versions: StoredVersion[];
     try {
-      result = await readFileHistory(this.opts.storage, this.opts.path, this.opts.concurrency);
+      versions = await readStoredVersions(this.opts.storage, this.opts.path);
     } catch (err) {
       this.opts.log("error", `version history failed for ${this.opts.path}: ${String(err)}`);
+      this.loadingEl = null;
       this.listEl.empty();
-      this.listEl.createDiv({ cls: "u-muted u-small", text: `Couldn't read history: ${String(err)}` });
+      // AccessDenied here almost always means the IAM user predates this feature:
+      // ListObjectVersions is a separate action from ListBucket (§8).
+      const hint = /denied/i.test(String(err))
+        ? " — the S3 user may be missing s3:ListBucketVersions (re-run scripts/install/02-create-user.sh)"
+        : "";
+      this.listEl.createDiv({
+        cls: "u-muted u-small",
+        text: `Couldn't read history: ${String(err)}${hint}`,
+      });
       return;
     }
-    this.versions = result.versions;
-    this.truncated = result.truncated;
-    this.oldestRev = result.oldestRevAvailable;
+    this.loadingEl?.remove();
+    this.loadingEl = null;
+    this.versions = versions;
     this.renderList();
     if (this.versions.length > 0) await this.select(0);
   }
@@ -94,7 +110,7 @@ export class VersionHistoryModal extends Modal {
     if (this.versions.length === 0) {
       this.listEl.createDiv({
         cls: "u-muted u-small",
-        text: "No revisions for this file in the journal.",
+        text: "No stored versions for this file. A renamed file keeps no history from before the rename.",
       });
       return;
     }
@@ -103,26 +119,15 @@ export class VersionHistoryModal extends Modal {
       const item = this.listEl.createDiv("modal-sidebar-list-item tappable");
       item.setAttr("tabIndex", -1);
       const details = item.createDiv("modal-sidebar-list-item-details");
-      details.createDiv({ text: v.at ? formatWhen(v.at) : `rev ${v.rev}` });
-
-      const who = v.by === this.opts.deviceId ? `${v.by} (this device)` : v.by;
-      const what = v.deleted
-        ? v.renamedTo
-          ? `renamed → ${v.renamedTo}`
-          : "deleted"
-        : formatBytes(v.size ?? 0);
-      details.createDiv({ cls: "u-small u-muted", text: `rev ${v.rev} · ${who} · ${what}` });
+      details.createDiv({ text: formatWhen(v.at) });
+      details.createDiv({
+        cls: "u-small u-muted",
+        text: v.isLatest ? `${formatBytes(v.size)} · current` : formatBytes(v.size),
+      });
 
       item.addEventListener("click", () => void this.select(i));
       if (i === this.selected) item.addClass("is-active");
     });
-
-    if (this.truncated) {
-      this.listEl.createDiv({
-        cls: "u-muted u-small",
-        text: `Journal pruned below rev ${this.oldestRev} — older revisions are no longer available.`,
-      });
-    }
   }
 
   private async select(index: number): Promise<void> {
@@ -132,19 +137,19 @@ export class VersionHistoryModal extends Modal {
     this.renderButtons();
   }
 
-  /** Decoded text for a version, or null when it's a tombstone / binary / over the preview cap. */
-  private async textFor(v: FileVersion): Promise<string | null> {
-    if (this.textCache.has(v.rev)) return this.textCache.get(v.rev) ?? null;
+  /** Decoded text for a version, or null when it's binary / over the preview cap. */
+  private async textFor(v: StoredVersion): Promise<string | null> {
+    if (this.textCache.has(v.versionId)) return this.textCache.get(v.versionId) ?? null;
     let text: string | null = null;
-    if (!v.deleted && (v.size ?? 0) <= PREVIEW_MAX_BYTES) {
-      const obj = await readVersionContent(this.opts.storage, v);
-      if (obj) {
+    if (v.size <= PREVIEW_MAX_BYTES) {
+      const body = await readStoredVersionContent(this.opts.storage, this.opts.path, v.versionId);
+      if (body) {
         // A NUL byte in the first block means this isn't text — show metadata, not mojibake.
-        const isBinary = obj.body.subarray(0, 8192).includes(0);
-        text = isBinary ? null : new TextDecoder("utf-8", { fatal: false }).decode(obj.body);
+        const isBinary = body.subarray(0, 8192).includes(0);
+        text = isBinary ? null : new TextDecoder("utf-8", { fatal: false }).decode(body);
       }
     }
-    this.textCache.set(v.rev, text);
+    this.textCache.set(v.versionId, text);
     return text;
   }
 
@@ -153,21 +158,9 @@ export class VersionHistoryModal extends Modal {
     this.bodyEl.empty();
     if (!v) return;
 
-    const who = v.by === this.opts.deviceId ? `${v.by} (this device)` : v.by;
-    const parts = [`rev ${v.rev}`, who, v.at ? formatWhen(v.at) : ""];
-    if (v.path !== this.opts.path) parts.push(`stored as ${v.path}`);
-    if (v.mtime) parts.push(`edited ${formatWhen(v.mtime)}`);
-    this.headerEl.setText(parts.filter(Boolean).join(" · "));
-
-    if (v.deleted) {
-      this.bodyEl.createDiv({
-        cls: "u-muted",
-        text: v.renamedTo
-          ? `Renamed to ${v.renamedTo} at this revision.`
-          : "Deleted at this revision.",
-      });
-      return;
-    }
+    const parts = [formatWhen(v.at), formatBytes(v.size)];
+    if (v.isLatest) parts.push("current");
+    this.headerEl.setText(parts.join(" · "));
 
     this.bodyEl.createDiv({ cls: "u-muted u-small", text: "Loading…" });
     const text = await this.textFor(v);
@@ -176,7 +169,7 @@ export class VersionHistoryModal extends Modal {
     if (text === null) {
       this.bodyEl.createDiv({
         cls: "u-muted",
-        text: `No preview (${formatBytes(v.size ?? 0)} — binary or over the ${formatBytes(PREVIEW_MAX_BYTES)} preview limit). Restore still works.`,
+        text: `No preview (${formatBytes(v.size)} — binary or over the ${formatBytes(PREVIEW_MAX_BYTES)} preview limit). Restore still works.`,
       });
       return;
     }
@@ -186,19 +179,25 @@ export class VersionHistoryModal extends Modal {
       return;
     }
 
-    // Diff against the next OLDER live revision — what this revision actually changed.
-    const older = this.versions.slice(this.selected + 1).find((x) => !x.deleted);
+    // Diff against the next older version — what this one actually changed.
+    const older = this.versions[this.selected + 1];
     if (!older) {
-      this.bodyEl.createDiv({ cls: "u-muted u-small", text: "First revision — nothing to compare against." });
+      this.bodyEl.createDiv({
+        cls: "u-muted u-small",
+        text: "Oldest stored version — nothing to compare against.",
+      });
       renderPlain(this.bodyEl, text);
       return;
     }
     const olderText = await this.textFor(older);
     if (olderText === null) {
-      this.bodyEl.createDiv({ cls: "u-muted u-small", text: `No preview for rev ${older.rev} — can't diff.` });
+      this.bodyEl.createDiv({
+        cls: "u-muted u-small",
+        text: "No preview for the previous version — can't diff.",
+      });
       return;
     }
-    this.headerEl.setText(`${this.headerEl.getText()} · changes vs rev ${older.rev}`);
+    this.headerEl.setText(`${this.headerEl.getText()} · changes vs ${formatWhen(older.at)}`);
     renderDiff(this.bodyEl, lineDiff(olderText, text));
   }
 
@@ -214,40 +213,24 @@ export class VersionHistoryModal extends Modal {
           void this.renderContent();
         }))
       .setName("Show changes")
-      .setDesc("Compare with the previous revision instead of showing the full text.");
-
-    if (v.deleted) {
-      new Setting(this.buttonsEl).addButton((b) =>
-        b
-          .setButtonText("Restore the previous revision")
-          .setCta()
-          .onClick(() => {
-            const prior = this.versions.slice(this.selected + 1).find((x) => !x.deleted);
-            if (!prior) {
-              new Notice("Nothing to restore — no live revision before this delete.");
-              return;
-            }
-            void this.restore(prior);
-          }));
-      return;
-    }
+      .setDesc("Compare with the previous version instead of showing the full text.");
 
     new Setting(this.buttonsEl).addButton((b) =>
       b.setButtonText("Restore this version").setCta().onClick(() => void this.restore(v)));
   }
 
   /**
-   * Write the chosen revision back into the vault at the CURRENT path and let the normal push
-   * publish it as a new revision — history stays append-only, nothing is rewritten in S3. The
-   * pre-restore bytes go into Obsidian's File recovery store first, so an unwanted restore is itself
-   * undoable in-app.
+   * Write the chosen version back into the vault at the CURRENT path and let the normal push
+   * publish it — history stays append-only, nothing in S3 is rewritten. The pre-restore bytes go
+   * into Obsidian's File recovery store first, so an unwanted restore is itself undoable in-app.
    */
-  private async restore(v: FileVersion): Promise<void> {
+  private async restore(v: StoredVersion): Promise<void> {
     const path = normalizePath(this.opts.path);
+    const when = formatWhen(v.at);
     try {
-      const obj = await readVersionContent(this.opts.storage, v);
-      if (!obj) {
-        new Notice(`S3 Vault Sync: revision ${v.rev} is no longer in the bucket.`);
+      const body = await readStoredVersionContent(this.opts.storage, path, v.versionId);
+      if (!body) {
+        new Notice("S3 Vault Sync: that version is no longer in the bucket.");
         return;
       }
       if (this.opts.backupBeforeWrite) {
@@ -257,24 +240,26 @@ export class VersionHistoryModal extends Modal {
           /* best-effort */
         }
       }
-      const body = obj.body.buffer.slice(
-        obj.body.byteOffset,
-        obj.body.byteOffset + obj.body.byteLength,
+      const buf = body.buffer.slice(
+        body.byteOffset,
+        body.byteOffset + body.byteLength,
       ) as ArrayBuffer;
+      // Through the Vault when the note is in the index, so an open editor follows the restore
+      // instead of keeping — and later saving back — the pre-restore buffer (§4.8).
       const existing = this.app.vault.getAbstractFileByPath(path);
-      if (existing instanceof TFile || (await this.app.vault.adapter.exists(path))) {
-        await this.app.vault.adapter.writeBinary(path, body);
+      if (existing instanceof TFile) {
+        await this.app.vault.modifyBinary(existing, buf);
       } else {
         const dir = path.split("/").slice(0, -1).join("/");
         if (dir && !(await this.app.vault.adapter.exists(dir))) await this.app.vault.adapter.mkdir(dir);
-        await this.app.vault.adapter.writeBinary(path, body);
+        await this.app.vault.adapter.writeBinary(path, buf);
       }
-      this.opts.log("info", `restored ${path} from rev ${v.rev} (by ${v.by})`);
-      new Notice(`Restored ${path} from rev ${v.rev}.`);
+      this.opts.log("info", `restored ${path} from the version stored ${when}`);
+      new Notice(`Restored ${path} from ${when}.`);
       this.opts.afterRestore?.();
       this.close();
     } catch (err) {
-      this.opts.log("error", `restore of ${path} from rev ${v.rev} failed: ${String(err)}`);
+      this.opts.log("error", `restore of ${path} from ${when} failed: ${String(err)}`);
       new Notice(`Restore failed: ${String(err)}`);
     }
   }
@@ -282,7 +267,7 @@ export class VersionHistoryModal extends Modal {
 
 function renderPlain(parent: HTMLElement, text: string): void {
   for (const line of text.split("\n")) {
-    parent.createDiv({ cls: "diff-line", text: line === "" ? " " : line });
+    parent.createDiv({ cls: "diff-line", text: line === "" ? " " : line });
   }
 }
 
@@ -290,23 +275,22 @@ function renderDiff(parent: HTMLElement, lines: DiffLine[]): void {
   let changes = 0;
   for (const l of lines) {
     if (l.type === "common") {
-      parent.createDiv({ cls: "diff-line", text: l.text === "" ? " " : l.text });
+      parent.createDiv({ cls: "diff-line", text: l.text === "" ? " " : l.text });
     } else {
       changes += 1;
       const cls = l.type === "removed" ? "diff-line mod-left" : "diff-line mod-right";
-      parent.createDiv({ cls, text: l.text === "" ? " " : l.text });
+      parent.createDiv({ cls, text: l.text === "" ? " " : l.text });
     }
   }
   if (changes === 0) {
-    parent.createDiv({ cls: "u-muted u-small", text: "No textual changes in this revision." });
+    parent.createDiv({ cls: "u-muted u-small", text: "No textual changes in this version." });
   }
 }
 
-/** Local-time, locale-aware stamp for a journal timestamp. Obsidian's bundled moment is exported as
- * a namespace (not callable under our tsconfig), and Date does the job without the dependency. */
-function formatWhen(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+/** Local-time, locale-aware stamp. Obsidian's bundled moment is exported as a namespace (not
+ * callable under our tsconfig), and Date does the job without the dependency. */
+function formatWhen(at: Date): string {
+  return Number.isNaN(at.getTime()) ? "unknown" : at.toLocaleString();
 }
 
 function formatBytes(n: number): string {

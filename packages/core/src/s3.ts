@@ -42,6 +42,19 @@ export interface ObjectInfo {
   lastModified?: Date;
 }
 
+/** One stored version of a single object — S3 ListObjectVersions, which the bucket already keeps
+ * because versioning is required for merge bases (§8). This is the backing store for version
+ * history (§2.9): the object's own version list IS the file's history, so no journal scan is
+ * needed. `etag` is the content MD5 for plain PUTs, i.e. exactly our `hash` minus the prefix. */
+export interface ObjectVersion {
+  versionId: string;
+  lastModified: Date;
+  size: number;
+  /** unquoted MD5 hex for plain (non-multipart) PUTs */
+  etag: string;
+  isLatest: boolean;
+}
+
 export interface StorageAdapter {
   get(key: string, opts?: GetOptions): Promise<GetResult | null>;
   head(key: string): Promise<HeadResult | null>;
@@ -54,4 +67,8 @@ export interface StorageAdapter {
    * pins the exact source version. Returns the NEW object's identifiers. OPTIONAL: callers must fall
    * back to get()+put() when an adapter (or a test fake) doesn't implement it. */
   copy?(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult>;
+  /** Every stored version of ONE key, newest first (S3 ListObjectVersions). Powers version history
+   * (§2.9) in a single request, where scanning the delta journal took thousands. OPTIONAL so test
+   * fakes and older adapters keep working: callers must handle its absence. */
+  listVersions?(key: string): Promise<ObjectVersion[]>;
 }

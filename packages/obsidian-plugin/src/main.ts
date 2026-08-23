@@ -8,7 +8,7 @@ import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
 import { pollDelayMs, pushDelayMs } from "./poll-schedule";
 import { ChangeNotifier, revTopic } from "./notify";
-import { decodeJsonGz, encodeJsonGz, readFileHistory } from "@vault-sync/core";
+import { decodeJsonGz, encodeJsonGz, readStoredVersions } from "@vault-sync/core";
 
 interface Settings {
   bucket: string;
@@ -543,13 +543,12 @@ export default class S3SyncPlugin extends Plugin {
   }
 
   // -------------------------------------------------- version history (§4.12)
-  /** Open the journal-backed history panel for a vault path. */
+  /** Open the history panel for a vault path — one S3 ListObjectVersions, no journal scan (§2.9). */
   openVersionHistory(path: string): void {
     if (!this.configured()) {
       new Notice("S3 Vault Sync: set the bucket and access keys first.");
       return;
     }
-    const isMobile = (this.app as unknown as { isMobile?: boolean }).isMobile === true;
     new VersionHistoryModal(this.app, {
       storage: new S3FetchAdapter({
         bucket: this.settings.bucket,
@@ -559,8 +558,6 @@ export default class S3SyncPlugin extends Plugin {
         prefix: this.settings.prefix,
       }),
       path,
-      deviceId: this.settings.deviceId,
-      concurrency: isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
       log: (level, msg) => this.logger.log(level, msg),
       backupBeforeWrite: (p) => this.recoverySnapshot(p),
       // A restore is an ordinary local edit: mark it dirty and let the debounced push publish it as
@@ -608,7 +605,6 @@ export default class S3SyncPlugin extends Plugin {
     if (!this.configured()) return "S3 Vault Sync is not configured.";
     const path = params.path || this.app.workspace.getActiveFile()?.path;
     if (!path) return "Pass --path <path>, or open the file first.";
-    const isMobile = (this.app as unknown as { isMobile?: boolean }).isMobile === true;
     const storage = new S3FetchAdapter({
       bucket: this.settings.bucket,
       region: this.settings.region,
@@ -616,20 +612,14 @@ export default class S3SyncPlugin extends Plugin {
       secretAccessKey: this.settings.secretAccessKey,
       prefix: this.settings.prefix,
     });
-    const { versions, truncated, oldestRevAvailable } = await readFileHistory(
-      storage,
-      path,
-      isMobile ? this.settings.mobileConcurrency : this.settings.desktopConcurrency,
-    );
+    const versions = await readStoredVersions(storage, path);
     if (params.total === "true") return String(versions.length);
-    if (versions.length === 0) return `No revisions found for ${path}`;
+    if (versions.length === 0) return `No stored versions for ${path}`;
     const lines = versions.map((v) => {
-      const when = (v.at ? new Date(v.at).toISOString().replace("T", " ").slice(0, 19) : "").padEnd(19);
-      const what = v.deleted ? (v.renamedTo ? `renamed → ${v.renamedTo}` : "deleted") : `${v.size ?? 0} B`;
-      const where = v.path === path ? "" : `  (as ${v.path})`;
-      return `${String(v.rev).padStart(6)}  ${when}  ${v.by.padEnd(24)}  ${what}${where}`;
+      const when = v.at.toISOString().replace("T", " ").slice(0, 19);
+      const size = `${v.size} B`.padStart(10);
+      return `${when}  ${size}  ${v.versionId}${v.isLatest ? "  (current)" : ""}`;
     });
-    if (truncated) lines.push(`(journal pruned below rev ${oldestRevAvailable} — older revisions unavailable)`);
     return [path, ...lines].join("\n");
   }
 

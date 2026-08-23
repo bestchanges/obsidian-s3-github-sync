@@ -43,7 +43,9 @@ else
   log "created"
 fi
 
-log "inline policy 's3' → objects under $USER_NS/* + scoped ListBucket"
+# ListBucketVersions is a SEPARATE action from ListBucket, and version history reads it directly
+# (§2.9) — without it the history panel fails with AccessDenied.
+log "inline policy 's3' → objects under $USER_NS/* + scoped ListBucket/ListBucketVersions"
 POL="$(mktemp)"; trap 'rm -f "$POL"' EXIT
 cat >"$POL" <<JSON
 {
@@ -53,7 +55,7 @@ cat >"$POL" <<JSON
       "Action": ["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:DeleteObject"],
       "Resource": "arn:aws:s3:::$BUCKET/$USER_NS/*" },
     { "Sid": "ListScoped", "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
       "Resource": "arn:aws:s3:::$BUCKET",
       "Condition": { "StringLike": { "s3:prefix": ["$USER_NS/*"] } } }
   ]

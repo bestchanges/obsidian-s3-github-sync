@@ -11,10 +11,12 @@
  */
 
 import { diffComm } from "node-diff3";
-import { Delta, FileEntry, SnapshotEntry, Tombstone, isTombstone } from "./schemas";
-import { GetResult, StorageAdapter } from "./s3";
+import { Delta, FileEntry, SnapshotEntry, Tombstone, isTombstone, parseDelta } from "./schemas";
+import { GetResult, ObjectVersion, StorageAdapter } from "./s3";
 import { canonicalKey } from "./casing";
-import { listDeltasSince } from "./journal";
+import { DELTA_PREFIX, revFromKey } from "./journal";
+import { decodeJsonGz } from "./codec";
+import { mapPool } from "./util";
 
 export const FILES_PREFIX = "files/";
 
@@ -107,27 +109,179 @@ export interface HistoryResult {
   versions: FileVersion[];
   /** Lowest revision still in the journal. History below it was pruned (§2.5) and is unavailable. */
   oldestRevAvailable: number;
-  /** True when the journal has been pruned, so `versions` may be missing older entries. */
+  /** True when older entries may exist but aren't in `versions` — pruned journal, or the scan cap
+   * below stopped the walk early. Either way the list shown is not the whole trail. */
   truncated: boolean;
+  /** How many deltas were actually fetched, and how many exist. Surfaced so a caller can say
+   * "searched the last N revisions" instead of implying it read everything. */
+  scanned: number;
+  available: number;
+  /** Deltas that could not be read (transient GET failures). The walk skips them rather than
+   * failing the whole query — see the note on `readFileHistory`. */
+  unreadable: number;
 }
 
+export interface ReadHistoryOptions {
+  concurrency?: number;
+  /** Stop once this many versions of the path have been found. */
+  limit?: number;
+  /** Never fetch more than this many deltas, however few versions were found. */
+  maxScan?: number;
+  /** Deltas per round-trip batch; also the granularity of `onProgress`. */
+  chunk?: number;
+  /** Stop after this many consecutive batches yield no further versions (once at least one has
+   * been found). A file's revisions cluster in time, so once the trail goes quiet it has almost
+   * always ended; the alternative is scanning to `maxScan` for every ordinary note. */
+  quietChunks?: number;
+  onProgress?: (scanned: number, available: number) => void;
+}
+
+/** Plenty for a UI list, and reached within one or two chunks for any recently-touched note. */
+const DEFAULT_LIMIT = 100;
+/** Hard ceiling on work per query. At ~350 B per delta this is a few hundred KB, seconds on mobile. */
+const DEFAULT_MAX_SCAN = 1_500;
+const DEFAULT_CHUNK = 200;
+const DEFAULT_QUIET_CHUNKS = 2;
+
 /**
- * Read the journal and extract one path's history. Fetches every surviving delta — the journal is
- * pruned to a retention window (§2.5), so this is bounded by that window, not by vault age.
+ * Read the journal and extract one path's history, **newest first, in bounded batches**.
+ *
+ * The naive version of this — fetch every surviving delta, then filter — is what made the feature
+ * unusable in the field: a vault with 3 588 deltas meant 3 588 GETs on every open (~57 s even on a
+ * desktop at concurrency 16, minutes on a phone), and because the fetch was all-or-nothing a single
+ * transient failure among those thousands threw the whole query away. Across that many requests on
+ * mobile, at least one failure is close to certain — so history reliably showed nothing.
+ *
+ * Instead: LIST the keys (cheap — the journal is one object per revision, so keys sort by rev), then
+ * walk backwards from the newest in chunks, stopping as soon as `limit` versions are found or
+ * `maxScan` deltas have been read. A note edited this week resolves in the first chunk. Individual
+ * unreadable deltas are counted and skipped, never fatal: a hole in the middle of the journal costs
+ * one revision of history, not the feature.
+ *
+ * Walking strictly newest→oldest also keeps rename-following correct (§2.9): the trail switches to
+ * the old path only after the rename's own revision has been seen.
  */
 export async function readFileHistory(
   storage: StorageAdapter,
   path: string,
-  concurrency = 8,
+  opts: number | ReadHistoryOptions = {},
 ): Promise<HistoryResult> {
-  const deltas = await listDeltasSince(storage, 0, concurrency);
-  const oldestRevAvailable = deltas.length ? deltas[0].rev : 0;
+  // Historic signature took a bare concurrency number.
+  const o: ReadHistoryOptions = typeof opts === "number" ? { concurrency: opts } : opts;
+  const concurrency = o.concurrency ?? 8;
+  const limit = o.limit ?? DEFAULT_LIMIT;
+  const maxScan = o.maxScan ?? DEFAULT_MAX_SCAN;
+  const chunk = o.chunk ?? DEFAULT_CHUNK;
+  const quietChunks = o.quietChunks ?? DEFAULT_QUIET_CHUNKS;
+
+  const infos = await storage.list(DELTA_PREFIX);
+  // S3 lists lexicographically and keys are zero-padded, so this is already revision order.
+  const keys = infos.map((i) => i.key).sort();
+  const available = keys.length;
+  const oldestRevAvailable = available ? revFromKey(keys[0]) : 0;
+
+  const deltas: Delta[] = [];
+  let scanned = 0;
+  let unreadable = 0;
+  let versions: FileVersion[] = [];
+  let quiet = 0;
+
+  for (let end = available; end > 0 && scanned < maxScan && versions.length < limit; end -= chunk) {
+    const batch = keys.slice(Math.max(0, end - chunk), end);
+    const fetched = await mapPool(batch, concurrency, async (key) => {
+      try {
+        const obj = await storage.get(key);
+        return obj ? parseDelta(decodeJsonGz(obj.body)) : null;
+      } catch {
+        return null; // counted below; one bad delta must not sink the query
+      }
+    });
+    for (const d of fetched) {
+      if (d) deltas.push(d);
+      else unreadable++;
+    }
+    scanned += batch.length;
+    // fileHistory is pure and sorts internally, so re-running it over the growing set is correct
+    // (and cheap) — and it keeps rename-following consistent as older chunks arrive.
+    const before = versions.length;
+    versions = fileHistory(deltas, path);
+    o.onProgress?.(scanned, available);
+    // Trail went quiet: found something earlier, but this batch added nothing.
+    quiet = versions.length > before ? 0 : versions.length > 0 ? quiet + 1 : 0;
+    if (quiet >= quietChunks) break;
+  }
+
   return {
-    versions: fileHistory(deltas, path),
+    versions: versions.slice(0, limit),
     oldestRevAvailable,
-    // rev 1 present → nothing was ever pruned and the trail is complete back to the vault's first write
-    truncated: oldestRevAvailable > 1,
+    // Either the journal was pruned below rev 1, or we stopped before reading all of it.
+    truncated: oldestRevAvailable > 1 || scanned < available || versions.length > limit,
+    scanned,
+    available,
+    unreadable,
   };
+}
+
+// ─────────────────────────── S3-backed history (§2.9, the UI path) ───────────────────────────
+
+/** One revision of a file, as S3 itself records it. Deliberately leaner than `FileVersion`: no
+ * `rev` and no `by`. Both come from the journal, and neither means anything in a single-user vault
+ * — a revision number is an implementation detail and the writer is always the same person. */
+export interface StoredVersion {
+  versionId: string;
+  /** when S3 stored these bytes */
+  at: Date;
+  size: number;
+  /** `"md5:<hex>"` — S3's ETag is the content MD5 for plain PUTs, so this is free */
+  hash: string;
+  /** the version currently served for the key */
+  isLatest: boolean;
+}
+
+/**
+ * A file's version history, read **straight from S3** in one request.
+ *
+ * The bucket already versions every object (required for merge bases, §8), so the object's own
+ * version list *is* the file's history — timestamps, sizes, and via ETag the content hash. There is
+ * nothing to reconstruct and nothing to scan: what took thousands of journal GETs (~57 s on this
+ * vault, and unreliable enough that history rendered empty) is one `ListObjectVersions` at ~1 s.
+ *
+ * It is also *deeper* than the journal, which prunes at `RETENTION_DAYS`, whereas S3 keeps every
+ * noncurrent version until a lifecycle rule says otherwise.
+ *
+ * Two limits, both accepted deliberately (§2.9):
+ *  - **Renames reset history.** S3 has no rename: the new path is a new object with no versions, so
+ *    the trail starts over. The old object still holds the pre-rename versions under the old key.
+ *  - **Deletes don't appear.** The protocol tombstones in the journal and never issues DeleteObject,
+ *    so there is no delete marker to show. Recovering a deleted file is a separate concern.
+ */
+export async function readStoredVersions(
+  storage: StorageAdapter,
+  path: string,
+): Promise<StoredVersion[]> {
+  if (!storage.listVersions) throw new Error("storage adapter cannot list object versions");
+  const versions = await storage.listVersions(fileKey(path));
+  return versions
+    .map(
+      (v: ObjectVersion): StoredVersion => ({
+        versionId: v.versionId,
+        at: v.lastModified,
+        size: v.size,
+        hash: `md5:${v.etag.replace(/"/g, "")}`,
+        isLatest: v.isLatest,
+      }),
+    )
+    .sort((a, b) => b.at.getTime() - a.at.getTime());
+}
+
+/** Bytes of one stored version. Pinned by `versionId`, so it is exact regardless of later writes. */
+export async function readStoredVersionContent(
+  storage: StorageAdapter,
+  path: string,
+  versionId: string,
+): Promise<Uint8Array | null> {
+  const obj = await storage.get(fileKey(path), { versionId });
+  return obj ? obj.body : null;
 }
 
 /**
