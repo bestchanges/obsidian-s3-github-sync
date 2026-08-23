@@ -1,0 +1,85 @@
+/* vault-s3-sync — plugin styles.
+ *
+ * Obsidian loads this file automatically from the plugin folder, alongside main.js and
+ * manifest.json. Everything here is static, so it belongs in CSS rather than being assembled
+ * element-by-element in TypeScript.
+ *
+ * Class names are namespaced `s3sync-` so they can never collide with Obsidian's own. Obsidian's
+ * classes are still used where they carry the look we want (`diff-line`, `mod-left`/`mod-right`,
+ * `modal-sidebar*`, `u-muted`); only layout the plugin owns is defined here.
+ */
+
+/* ── Version history: narrow layout (§4.12) ──────────────────────────────────
+ *
+ * `.modal-content` is `display: flex` on every platform, so a child of ours is a flex item. Without
+ * an explicit `flex` and `min-width: 0` it collapses to its intrinsic content width — ~180 px of an
+ * ~840 px modal, which is what left the content pane empty and everything squeezed against the left
+ * edge. So this layout declares its own sizing instead of depending on whatever the parent does.
+ *
+ * `min-width`/`min-height: 0` are load-bearing, not decoration: a flex item refuses to shrink below
+ * its content without them, so an overflowing child blows the pane out instead of scrolling.
+ */
+.s3sync-history-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The version list, when it is the only visible pane. */
+.s3sync-history-list-pane {
+  width: 100%;
+  min-width: 0;
+  overflow-y: auto;
+}
+
+/* One version's content. Visibility is switched by adding/removing `.s3sync-hidden`, so even the
+ * pane swap is a class toggle rather than an inline style. */
+.s3sync-history-detail-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.s3sync-history-detail-pane .s3sync-history-header {
+  padding: var(--size-4-2) 0;
+}
+
+/* The scroll container for the diff/preview: it takes the leftover height and scrolls internally
+ * rather than stretching the modal. */
+.s3sync-history-detail-pane .s3sync-history-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Stacked, full-width buttons. Obsidian's `Setting` row is built for a full-width settings pane —
+ * label and description left, control floated right — which in a narrow column renders as a
+ * two-word-per-line paragraph with a control stranded beside it. */
+.s3sync-history-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+  padding: var(--size-4-2) 0;
+}
+
+.s3sync-history-buttons button {
+  width: 100%;
+}
+
+/* The one thing the modal changes at runtime: which pane is on screen. */
+.s3sync-hidden {
+  display: none;
+}
+
+/* ── Version history: wide layout ───────────────────────────────────────────
+ * Obsidian's own sidebar layout does the work; only the content padding is ours.
+ */
+.s3sync-history-content .s3sync-history-header {
+  padding: var(--size-4-3) var(--size-4-4);
+}

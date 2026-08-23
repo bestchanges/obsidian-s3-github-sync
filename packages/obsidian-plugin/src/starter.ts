@@ -15,6 +15,8 @@ export interface StarterInput {
   pluginId: string;
   mainJs: Uint8Array;
   manifestJson: string;
+  /** Plugin stylesheet, when this install has one — omitted for builds that predate it (§4.10). */
+  stylesCss?: string;
   /** already-serialized { settings } — defaults + connection fields, identity/state cleared */
   dataJson: string;
 }
@@ -35,6 +37,8 @@ export function buildStarterZip(input: StarterInput): Uint8Array {
       [`${root}/.obsidian/community-plugins.json`]: strToU8(JSON.stringify([input.pluginId]) + "\n"),
       [`${pluginDir}/main.js`]: input.mainJs,
       [`${pluginDir}/manifest.json`]: strToU8(input.manifestJson),
+      // Ships with main.js or the new device's version-history modal renders unstyled.
+      ...(input.stylesCss ? { [`${pluginDir}/styles.css`]: strToU8(input.stylesCss) } : {}),
       [`${pluginDir}/data.json`]: strToU8(input.dataJson),
     },
     { level: 6 },

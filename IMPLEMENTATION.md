@@ -66,6 +66,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/mqtt.ts` | Hand-rolled QoS-0 MQTT 3.1.1 codec — pure, unit-tested (§4.14). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/history-modal.ts` | `VersionHistoryModal`: per-note revision list, diff, restore (§4.12). |
+| `packages/obsidian-plugin/styles.css` | Plugin stylesheet (version-history layout, §4.12). Auto-loaded by Obsidian; shipped through every channel. |
 | `packages/obsidian-plugin/src/starter.ts` | In-memory zip (`fflate`) + cross-platform delivery for the starter-vault export. |
 | `packages/mcp-server/` | Optional third client: remote MCP server on Lambda (stateless, bearer-auth POC). Module map + behavior: its `README.md`; rationale: [[MCP Server Design.md\|MCP Server Design.md]]. |
 | `templates/s3-sync.yml` | The Actions workflow the content repo installs. |
@@ -947,9 +948,14 @@ renders its own, off a source that is strictly richer than Sync's — see §2.9.
 > `Platform.isMobile || modal width < NARROW_PX` (700) — width is the property the layout actually
 > depends on. Wide layouts keep Obsidian's sidebar classes, unchanged.
 >
-> Rejected: shipping a `styles.css` with media queries (the build emits `main.js` + `manifest.json`
-> only, and a stylesheet is another artefact to distribute per §8) and a `<select>` of versions (loses
-> the per-row size/delta labelling below).
+> The layout itself lives in **`packages/obsidian-plugin/styles.css`**, not in JS: none of it is
+> dynamic, and Obsidian loads a plugin's stylesheet automatically. The modal sets **no** inline
+> styles at all — the one thing it changes at runtime, which pane is on screen, is a
+> `.s3sync-hidden` class toggle. Classes are namespaced `s3sync-` so they cannot collide with
+> Obsidian's; Obsidian's own classes are still used where they carry the look we want
+> (`diff-line`, `mod-left`/`mod-right`, `modal-sidebar*`).
+>
+> Rejected: a `<select>` of versions (loses the per-row size/delta labelling below).
 
 > [!note] Rows carry a **size delta**, because timestamps alone aren't identifiable
 > The 2026-08-23 rollback (1076 B) and the good copy it overwrote (1327 B) were **4 seconds apart**,
@@ -1292,8 +1298,8 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 - **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
   role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`
   per request, writes CAS-append `by: "mcp"`. See `packages/mcp-server/README.md`.
-- **Plugin distribution** — because `.obsidian` now syncs, a new `main.js` committed/synced into one
-  vault propagates to all devices as ordinary vault content; the starter-vault export bootstraps a
+- **Plugin distribution** — because `.obsidian` now syncs, a new `main.js` **and `styles.css`**
+  committed/synced into one vault propagate to all devices as ordinary vault content; the starter-vault export bootstraps a
   brand-new device.
 
 ---

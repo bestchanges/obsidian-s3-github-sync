@@ -434,6 +434,9 @@ export default class S3SyncPlugin extends Plugin {
       const adapter = this.app.vault.adapter;
       const mainJs = new Uint8Array(await adapter.readBinary(normalizePath(`${dir}/main.js`)));
       const manifestJson = await adapter.read(normalizePath(`${dir}/manifest.json`));
+      // Optional: an install from before styles.css existed simply has none to copy.
+      const stylesPath = normalizePath(`${dir}/styles.css`);
+      const stylesCss = (await adapter.exists(stylesPath)) ? await adapter.read(stylesPath) : undefined;
 
       // Export = plugin DEFAULTS + this device's connection fields. Identity is cleared so the new
       // device mints its own, and no state file is included → clean full pull on first run. Sync is
@@ -452,7 +455,14 @@ export default class S3SyncPlugin extends Plugin {
 
       const vaultName = safeVaultName(this.app.vault.getName());
       new Notice("Building vault zip…");
-      const zip = buildStarterZip({ vaultName, pluginId: this.manifest.id, mainJs, manifestJson, dataJson });
+      const zip = buildStarterZip({
+        vaultName,
+        pluginId: this.manifest.id,
+        mainJs,
+        manifestJson,
+        stylesCss,
+        dataJson,
+      });
       const how = await deliverFile(zip, `${vaultName}.zip`);
       if (how === "shared") new Notice(`${vaultName}.zip ready — choose where to send it.`);
       else if (how === "downloaded") new Notice(`Saved ${vaultName}.zip to your downloads.`);

@@ -31,6 +31,15 @@ const pkgFiles = {
   "manifest.json": readFileSync(path.join(dist, "manifest.json")),
   "main.js": readFileSync(path.join(dist, "main.js")),
 };
+// styles.css carries the version-history layout (§4.12). Obsidian loads it automatically from the
+// plugin folder, so it must travel with main.js through EVERY channel — dist/, the zip, the release
+// assets, and the starter vault — or the modal renders unstyled.
+const stylesSrc = path.join(dir, "styles.css");
+if (existsSync(stylesSrc)) {
+  copyFileSync(stylesSrc, path.join(dist, "styles.css"));
+  pkgFiles["styles.css"] = readFileSync(stylesSrc);
+}
+
 const versionsSrc = path.join(dir, "versions.json");
 if (existsSync(versionsSrc)) {
   copyFileSync(versionsSrc, path.join(dist, "versions.json"));
@@ -40,7 +49,7 @@ if (existsSync(versionsSrc)) {
 const zipName = `${manifest.id}-${manifest.version}.zip`;
 writeFileSync(path.join(dist, zipName), zipSync(pkgFiles, { level: 9 }));
 
-console.log(`Plugin built → dist/main.js`);
+console.log(`Plugin built → dist/main.js${existsSync(stylesSrc) ? " + styles.css" : ""}`);
 console.log(
   `Deployment package → dist/${zipName}  (v${manifest.version}, minAppVersion ${manifest.minAppVersion})`,
 );

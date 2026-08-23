@@ -149,6 +149,7 @@ jobs:
           gh release create "${{ steps.v.outputs.version }}" \
             packages/obsidian-plugin/dist/main.js \
             packages/obsidian-plugin/dist/manifest.json \
+            packages/obsidian-plugin/dist/styles.css \
             packages/obsidian-plugin/dist/versions.json \
             --title "${{ steps.v.outputs.version }}" \
             --generate-notes \
