@@ -920,29 +920,44 @@ mention of version history, snapshots or revisions, and the app exposes no provi
 (`registerVersionHistory` / `versionHistoryProvider` and friends simply do not exist). So the plugin
 renders its own, off a source that is strictly richer than Sync's — see §2.9.
 
-> [!important] Mobile is a **single pane at a time**, not a sidebar
+> [!important] Narrow screens get **one pane at a time**, chosen by measured width
 > Obsidian's `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for:
-> the version list collapsed to roughly one visible row, so on mobile only the newest version could
-> ever be reached (reported 2026-08-23). Worse, the modal auto-selected that newest version on open,
-> which *hid the list behind it* — and restoring the version already on disk does nothing, so the
-> Restore button looked broken too. All three symptoms were one layout bug.
+> the version list collapsed to roughly one visible row, so only the newest version could ever be
+> reached, the modal auto-selected it (hiding the list behind it), and restoring the version already
+> on disk does nothing — so Restore looked broken too. One layout bug, three symptoms.
 >
-> On `Platform.isMobile` the modal therefore drops the sidebar class and shows **one pane at a
-> time** — the full-width scrollable list, then a version's content with an **← All versions**
-> button — and does *not* auto-select on open, so the list is what you land on. Desktop keeps the
-> two-pane layout.
+> The layout is selected on **`Platform.isMobile || modal width < NARROW_PX` (700)**. The flag alone
+> was not enough: it read false on the very device that reported the problem (`linux-5791`), so the
+> two-pane layout still rendered on a phone. Width is what the layout actually depends on, so width
+> is what we test — and it also fixes a narrow desktop window.
+>
+> The narrow layout uses **none of the `modal-sidebar*` classes** (they carry the side-by-side rules
+> that caused the split) and **no `Setting` rows** for its buttons (a `Setting` puts its label left
+> and control right, which reads as controls stranded in the left column). Plain full-width blocks
+> and stacked buttons instead: list → tap → content with **← All versions**, and no auto-select on
+> open. Wide layouts are unchanged.
 >
 > Rejected alternatives: shipping a `styles.css` with media queries (the build emits `main.js` +
 > `manifest.json` only, and a stylesheet is another artefact to distribute per §8), and a `<select>`
-> dropdown of versions (works, but loses the timestamp/size/current labelling that makes a row
-> identifiable). If the layout ever misbehaves on a specific device, the desktop app renders the same
-> data — the panel is a view over S3, not device state.
+> dropdown of versions (works, but loses the per-row labelling below). If a device still misbehaves,
+> the desktop app renders the same data — the panel is a view over S3, not device state.
+
+> [!note] Rows carry a **size delta**, because timestamps alone aren't identifiable
+> The 2026-08-23 rollback (1076 B) and the good copy it overwrote (1327 B) were **4 seconds apart**,
+> so their timestamps rendered nearly identically and picking the right one was guesswork. Each row
+> now shows size, the change against the next older version (`+251 B`), and `current` where it
+> applies.
 
 > [!note] Restoring the current version is reported, not silently ignored
 > `matchesLocal` compares the chosen bytes with the file on disk; identical means the restore is a
 > no-op, and the modal says so instead of appearing to succeed and changing nothing. **Show changes**
 > also defaults **on**: the list exists to answer "what changed", and making the user toggle that per
 > row, then eyeball two walls of text, is work the tool should do.
+>
+> A restore **does not force a sync cycle**. It marks the file dirty and lets the ordinary debounce
+> (§4.4) publish it, because a restore is usually the *start* of editing rather than the end: forcing
+> a cycle published the restored text before the user could touch it, and the debounce coalesces
+> restore-then-edit into a single revision.
 
 **`VersionHistoryModal`** — a two-pane modal (desktop) built with Obsidian's own shipped classes
 (`mod-sidebar-layout`, `modal-sidebar-list-item`, `diff-line mod-left/mod-right`), so it matches the

@@ -10,6 +10,8 @@ import type { StorageAdapter } from "@vault-sync/core";
 
 /** Bytes above this are shown as a metadata-only row — no preview, no diff (binaries, big attachments). */
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+/** Below this modal width there is no room for a sidebar beside the content. */
+const NARROW_PX = 700;
 
 export interface HistoryModalOptions {
   storage: StorageAdapter;
@@ -50,10 +52,13 @@ export class VersionHistoryModal extends Modal {
   private textCache = new Map<string, string | null>();
 
   private loadingEl: HTMLElement | null = null;
-  /** Mobile shows ONE pane at a time (list → tap → detail → back); desktop shows both. Obsidian's
-   * `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for — the list
-   * collapsed to a single visible row, which is why only one version could ever be reached (§4.12). */
-  private readonly isMobile = Platform.isMobile;
+  /** Narrow layouts show ONE pane at a time (list → tap → detail → back); wide ones show both.
+   *
+   * Decided by **measured width**, not `Platform.isMobile` alone: the flag was false on the device
+   * that reported this (deviceId `linux-5791`), so the two-pane sidebar layout rendered on a phone
+   * screen — a vertical split with the content pane too narrow to show anything (§4.12). Width is
+   * the property the layout actually depends on, so it is what we test. */
+  private narrow = false;
   private sidebarEl!: HTMLElement;
   private detailEl!: HTMLElement;
   private listEl!: HTMLElement;
@@ -66,22 +71,37 @@ export class VersionHistoryModal extends Modal {
   }
 
   onOpen(): void {
-    if (!this.isMobile) this.modalEl.addClass("mod-sidebar-layout");
+    this.narrow = Platform.isMobile || (this.modalEl.clientWidth || window.innerWidth) < NARROW_PX;
     this.titleEl.setText(`Version history — ${this.opts.path}`);
 
+    if (this.narrow) {
+      // Deliberately NONE of Obsidian's `modal-sidebar*` classes: they carry the fixed-width,
+      // side-by-side rules that produced the unusable split. Plain blocks instead.
+      this.sidebarEl = this.contentEl.createDiv();
+      this.sidebarEl.style.width = "100%";
+      this.sidebarEl.style.overflowY = "auto";
+      this.listEl = this.sidebarEl;
+
+      this.detailEl = this.contentEl.createDiv();
+      this.detailEl.style.width = "100%";
+      this.detailEl.style.display = "none";
+      this.headerEl = this.detailEl.createDiv("u-small u-muted");
+      this.headerEl.style.padding = "var(--size-4-2) 0";
+      this.bodyEl = this.detailEl.createDiv("diff-view");
+      this.bodyEl.style.overflowX = "auto";
+      this.buttonsEl = this.detailEl.createDiv();
+      this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
+      void this.load();
+      return;
+    }
+
+    this.modalEl.addClass("mod-sidebar-layout");
     this.sidebarEl = this.contentEl.createDiv("modal-sidebar mod-history");
     this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
 
     const container = this.contentEl.createDiv("sync-history-content-container");
     this.detailEl = container;
     const content = container.createDiv("sync-history-content");
-    if (this.isMobile) {
-      // Full width, own scroll, and only one pane visible at a time.
-      this.sidebarEl.style.width = "100%";
-      this.sidebarEl.style.maxHeight = "unset";
-      this.listEl.style.overflowY = "auto";
-      container.style.display = "none";
-    }
     this.headerEl = content.createDiv("u-small u-muted");
     this.headerEl.style.padding = "var(--size-4-3) var(--size-4-4)";
     this.bodyEl = content.createDiv("sync-history-preview diff-view");
@@ -120,7 +140,7 @@ export class VersionHistoryModal extends Modal {
     this.renderList();
     // Desktop opens the newest version straight away; mobile stays on the list, so every version is
     // reachable rather than the modal landing inside one of them.
-    if (!this.isMobile && this.versions.length > 0) await this.select(0);
+    if (!this.narrow && this.versions.length > 0) await this.select(0);
   }
 
   private renderList(): void {
@@ -138,10 +158,16 @@ export class VersionHistoryModal extends Modal {
       item.setAttr("tabIndex", -1);
       const details = item.createDiv("modal-sidebar-list-item-details");
       details.createDiv({ text: formatWhen(v.at) });
-      details.createDiv({
-        cls: "u-small u-muted",
-        text: v.isLatest ? `${formatBytes(v.size)} · current` : formatBytes(v.size),
-      });
+      // Size AND the delta against the next older version. Two versions seconds apart otherwise
+      // render as near-identical timestamps — which is how the rollback (1076 B) and the good copy
+      // (1327 B), 4 s apart, were indistinguishable in the list.
+      const older = this.versions[i + 1];
+      const delta = older ? v.size - older.size : 0;
+      const sign = delta > 0 ? `+${delta}` : `${delta}`;
+      const parts = [formatBytes(v.size)];
+      if (older && delta !== 0) parts.push(`${sign} B`);
+      if (v.isLatest) parts.push("current");
+      details.createDiv({ cls: "u-small u-muted", text: parts.join(" · ") });
 
       item.addEventListener("click", () => void this.select(i));
       if (i === this.selected) item.addClass("is-active");
@@ -151,12 +177,12 @@ export class VersionHistoryModal extends Modal {
   private async select(index: number): Promise<void> {
     this.selected = index;
     this.renderList();
-    if (this.isMobile) this.showPane("detail");
+    if (this.narrow) this.showPane("detail");
     await this.renderContent();
     this.renderButtons();
   }
 
-  /** Mobile only: swap between the version list and one version's content. */
+  /** Narrow layout only: swap between the version list and one version's content. */
   private showPane(which: "list" | "detail"): void {
     this.sidebarEl.style.display = which === "list" ? "" : "none";
     this.detailEl.style.display = which === "detail" ? "" : "none";
@@ -231,13 +257,34 @@ export class VersionHistoryModal extends Modal {
     const v = this.versions[this.selected];
     if (!v) return;
 
-    if (this.isMobile) {
-      new Setting(this.buttonsEl).addButton((b) =>
-        b.setButtonText("← All versions").onClick(() => {
-          this.selected = -1;
-          this.renderList();
-          this.showPane("list");
-        }));
+    if (this.narrow) {
+      // Plain stacked buttons: a `Setting` row puts its label left and control right, which on a
+      // phone reads as controls floating in the left column with nothing beside them.
+      const bar = this.buttonsEl.createDiv();
+      bar.style.display = "flex";
+      bar.style.flexDirection = "column";
+      bar.style.gap = "var(--size-4-2)";
+      bar.style.padding = "var(--size-4-2) 0";
+
+      const back = bar.createEl("button", { text: "← All versions" });
+      back.onclick = () => {
+        this.selected = -1;
+        this.renderList();
+        this.showPane("list");
+      };
+
+      const toggle = bar.createEl("button", {
+        text: this.showDiff ? "Showing changes — tap for full text" : "Showing full text — tap for changes",
+      });
+      toggle.onclick = () => {
+        this.showDiff = !this.showDiff;
+        void this.renderContent();
+        this.renderButtons();
+      };
+
+      const restore = bar.createEl("button", { text: "Restore this version", cls: "mod-cta" });
+      restore.onclick = () => void this.restore(v);
+      return;
     }
 
     new Setting(this.buttonsEl)

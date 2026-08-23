@@ -560,11 +560,12 @@ export default class S3SyncPlugin extends Plugin {
       path,
       log: (level, msg) => this.logger.log(level, msg),
       backupBeforeWrite: (p) => this.recoverySnapshot(p),
-      // A restore is an ordinary local edit: mark it dirty and let the debounced push publish it as
-      // a new revision, so history stays append-only.
+      // A restore is an ordinary local edit: mark it dirty and let the DEBOUNCED push publish it,
+      // so history stays append-only. Deliberately no immediate sync — a restore is often the start
+      // of editing, not the end of it, and forcing a cycle published the restored text before the
+      // user could touch it. The debounce (§4.4) coalesces a restore-then-edit into one revision.
       afterRestore: () => {
         this.engine?.markDirty(path);
-        void this.runSync("manual");
       },
     }).open();
   }
