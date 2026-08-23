@@ -4,6 +4,7 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
   ListObjectsV2Command,
+  ListObjectVersionsCommand,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -12,6 +13,7 @@ import type {
   GetResult,
   HeadResult,
   ObjectInfo,
+  ObjectVersion,
   PutOptions,
   PutResult,
   StorageAdapter,
@@ -107,6 +109,38 @@ export class S3SdkAdapter implements StorageAdapter {
       }
       token = res.NextContinuationToken;
     } while (token);
+    return out;
+  }
+
+  /** Every stored version of ONE key, newest first (§2.9) — the same listing the plugin uses for
+   * version history, so both legs read history identically. Requires `s3:ListBucketVersions`. */
+  async listVersions(key: string): Promise<ObjectVersion[]> {
+    const full = this.prefix + key;
+    const out: ObjectVersion[] = [];
+    let keyMarker: string | undefined;
+    let versionIdMarker: string | undefined;
+    do {
+      const res = await this.client.send(
+        new ListObjectVersionsCommand({
+          Bucket: this.bucket,
+          Prefix: full,
+          KeyMarker: keyMarker,
+          VersionIdMarker: versionIdMarker,
+        }),
+      );
+      for (const v of res.Versions ?? []) {
+        if (v.Key !== full) continue; // prefix listing — keep only this exact object
+        out.push({
+          versionId: v.VersionId ?? "",
+          lastModified: v.LastModified ?? new Date(0),
+          size: v.Size ?? 0,
+          etag: (v.ETag ?? "").replace(/"/g, ""),
+          isLatest: v.IsLatest === true,
+        });
+      }
+      keyMarker = res.IsTruncated ? res.NextKeyMarker : undefined;
+      versionIdMarker = res.IsTruncated ? res.NextVersionIdMarker : undefined;
+    } while (keyMarker);
     return out;
   }
 

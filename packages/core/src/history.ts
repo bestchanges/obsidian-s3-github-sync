@@ -12,7 +12,7 @@
 
 import { diffComm } from "node-diff3";
 import { Delta, FileEntry, SnapshotEntry, Tombstone, isTombstone, parseDelta } from "./schemas";
-import { GetResult, StorageAdapter } from "./s3";
+import { GetResult, ObjectVersion, StorageAdapter } from "./s3";
 import { canonicalKey } from "./casing";
 import { DELTA_PREFIX, revFromKey } from "./journal";
 import { decodeJsonGz } from "./codec";
@@ -220,6 +220,68 @@ export async function readFileHistory(
     available,
     unreadable,
   };
+}
+
+// ─────────────────────────── S3-backed history (§2.9, the UI path) ───────────────────────────
+
+/** One revision of a file, as S3 itself records it. Deliberately leaner than `FileVersion`: no
+ * `rev` and no `by`. Both come from the journal, and neither means anything in a single-user vault
+ * — a revision number is an implementation detail and the writer is always the same person. */
+export interface StoredVersion {
+  versionId: string;
+  /** when S3 stored these bytes */
+  at: Date;
+  size: number;
+  /** `"md5:<hex>"` — S3's ETag is the content MD5 for plain PUTs, so this is free */
+  hash: string;
+  /** the version currently served for the key */
+  isLatest: boolean;
+}
+
+/**
+ * A file's version history, read **straight from S3** in one request.
+ *
+ * The bucket already versions every object (required for merge bases, §8), so the object's own
+ * version list *is* the file's history — timestamps, sizes, and via ETag the content hash. There is
+ * nothing to reconstruct and nothing to scan: what took thousands of journal GETs (~57 s on this
+ * vault, and unreliable enough that history rendered empty) is one `ListObjectVersions` at ~1 s.
+ *
+ * It is also *deeper* than the journal, which prunes at `RETENTION_DAYS`, whereas S3 keeps every
+ * noncurrent version until a lifecycle rule says otherwise.
+ *
+ * Two limits, both accepted deliberately (§2.9):
+ *  - **Renames reset history.** S3 has no rename: the new path is a new object with no versions, so
+ *    the trail starts over. The old object still holds the pre-rename versions under the old key.
+ *  - **Deletes don't appear.** The protocol tombstones in the journal and never issues DeleteObject,
+ *    so there is no delete marker to show. Recovering a deleted file is a separate concern.
+ */
+export async function readStoredVersions(
+  storage: StorageAdapter,
+  path: string,
+): Promise<StoredVersion[]> {
+  if (!storage.listVersions) throw new Error("storage adapter cannot list object versions");
+  const versions = await storage.listVersions(fileKey(path));
+  return versions
+    .map(
+      (v: ObjectVersion): StoredVersion => ({
+        versionId: v.versionId,
+        at: v.lastModified,
+        size: v.size,
+        hash: `md5:${v.etag.replace(/"/g, "")}`,
+        isLatest: v.isLatest,
+      }),
+    )
+    .sort((a, b) => b.at.getTime() - a.at.getTime());
+}
+
+/** Bytes of one stored version. Pinned by `versionId`, so it is exact regardless of later writes. */
+export async function readStoredVersionContent(
+  storage: StorageAdapter,
+  path: string,
+  versionId: string,
+): Promise<Uint8Array | null> {
+  const obj = await storage.get(fileKey(path), { versionId });
+  return obj ? obj.body : null;
 }
 
 /**

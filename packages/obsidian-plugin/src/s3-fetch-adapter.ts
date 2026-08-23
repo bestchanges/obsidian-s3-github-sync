@@ -4,6 +4,7 @@ import type {
   GetResult,
   HeadResult,
   ObjectInfo,
+  ObjectVersion,
   PutOptions,
   PutResult,
   StorageAdapter,
@@ -208,6 +209,49 @@ export class S3FetchAdapter implements StorageAdapter {
         ? (xml.getElementsByTagName("NextContinuationToken")[0]?.textContent ?? undefined)
         : undefined;
     } while (token);
+    return out;
+  }
+
+  /** Every stored version of ONE key, newest first (§2.9). `?versions` is a bucket-level listing, so
+   * it is scoped with `prefix` to this exact key and filtered again below — a prefix match could
+   * otherwise pull in `note.md.bak`. Needs `s3:ListBucketVersions`, which is a DIFFERENT IAM action
+   * from `s3:ListBucket`. */
+  async listVersions(key: string): Promise<ObjectVersion[]> {
+    const full = this.prefix + key;
+    const out: ObjectVersion[] = [];
+    let keyMarker: string | undefined;
+    let versionMarker: string | undefined;
+    do {
+      const query: Record<string, string> = { versions: "", prefix: full };
+      if (keyMarker) query["key-marker"] = keyMarker;
+      if (versionMarker) query["version-id-marker"] = versionMarker;
+      const { res, body } = await this.send<string>(
+        `${this.base}/?${new URLSearchParams(query)}`,
+        {},
+        true,
+        (r) => r.text(),
+      );
+      if (!res.ok) throw new Error(`S3 LIST versions: ${res.status}`);
+      const xml = new DOMParser().parseFromString(body!, "text/xml");
+      for (const node of Array.from(xml.getElementsByTagName("Version"))) {
+        const k = node.getElementsByTagName("Key")[0]?.textContent ?? "";
+        if (k !== full) continue; // prefix listing — keep only this exact object
+        out.push({
+          versionId: node.getElementsByTagName("VersionId")[0]?.textContent ?? "",
+          lastModified: new Date(node.getElementsByTagName("LastModified")[0]?.textContent ?? 0),
+          size: Number(node.getElementsByTagName("Size")[0]?.textContent ?? 0),
+          etag: (node.getElementsByTagName("ETag")[0]?.textContent ?? "").replace(/"/g, ""),
+          isLatest: node.getElementsByTagName("IsLatest")[0]?.textContent === "true",
+        });
+      }
+      const truncated = xml.getElementsByTagName("IsTruncated")[0]?.textContent === "true";
+      keyMarker = truncated
+        ? (xml.getElementsByTagName("NextKeyMarker")[0]?.textContent ?? undefined)
+        : undefined;
+      versionMarker = truncated
+        ? (xml.getElementsByTagName("NextVersionIdMarker")[0]?.textContent ?? undefined)
+        : undefined;
+    } while (keyMarker);
     return out;
   }
 

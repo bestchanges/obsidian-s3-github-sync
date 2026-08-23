@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryStorage } from "../src/memory";
 import { appendDelta } from "../src/journal";
-import { readFileHistory } from "../src/history";
+import { readFileHistory, readStoredVersionContent, readStoredVersions } from "../src/history";
 import type { Delta } from "../src/schemas";
 
 /** Build a journal of `n` revisions; `touch` decides which revs touch the tracked path. */
@@ -84,5 +84,46 @@ describe("readFileHistory — bounded newest-first walk (§2.9)", () => {
     expect(r.scanned).toBe(5);
     expect(r.available).toBe(5);
     expect(r.truncated).toBe(false);
+  });
+});
+
+describe("readStoredVersions — S3 object versions as history (§2.9)", () => {
+  it("returns one entry per stored version, newest first, with the hash from the ETag", async () => {
+    const s = new InMemoryStorage();
+    for (const body of ["one\n", "two\n", "three\n"]) {
+      await s.put("files/note.md", new TextEncoder().encode(body));
+    }
+
+    const versions = await readStoredVersions(s, "note.md");
+
+    expect(versions).toHaveLength(3);
+    expect(versions[0].isLatest).toBe(true);
+    expect(versions.map((v) => v.size)).toEqual([6, 4, 4]); // three\n, two\n, one\n
+    expect(versions.every((v) => v.hash.startsWith("md5:"))).toBe(true);
+    // newest first
+    expect(versions[0].at.getTime()).toBeGreaterThanOrEqual(versions[1].at.getTime());
+  });
+
+  it("reads the exact bytes of an older version", async () => {
+    const s = new InMemoryStorage();
+    await s.put("files/note.md", new TextEncoder().encode("first\n"));
+    await s.put("files/note.md", new TextEncoder().encode("second\n"));
+
+    const versions = await readStoredVersions(s, "note.md");
+    const older = await readStoredVersionContent(s, "note.md", versions[1].versionId);
+
+    expect(new TextDecoder().decode(older!)).toBe("first\n");
+  });
+
+  it("is empty for a path that was never stored — e.g. just after a rename", async () => {
+    const s = new InMemoryStorage();
+    await s.put("files/old.md", new TextEncoder().encode("x\n"));
+
+    expect(await readStoredVersions(s, "new.md")).toEqual([]);
+  });
+
+  it("fails loudly when the adapter cannot list versions", async () => {
+    const noVersions = { get: async () => null } as never;
+    await expect(readStoredVersions(noVersions, "note.md")).rejects.toThrow(/cannot list object versions/);
   });
 });

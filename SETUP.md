@@ -124,6 +124,12 @@ It provisions role + function + URL + token idempotently and prints a ready-to-p
 details: [packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
 [scripts/install/README.md](scripts/install/README.md).
 
+> [!note] Upgrading an existing vault
+> **Version history** reads S3 object versions directly, which needs `s3:ListBucketVersions` — a
+> different IAM action from `s3:ListBucket`. Deployments created before that feature must re-run
+> `scripts/install/02-create-user.sh --user <ns>` once (it is idempotent and won't touch your access
+> key), or the history panel fails with AccessDenied.
+
 ## 8. Instant sync (optional)
 
 Cuts cross-device latency from "next poll" to well under a second, and *lowers* request cost. AWS

@@ -7,6 +7,7 @@ and the **MCP leg** (05) and **instant sync** (06) are optional.
 ```
 01-create-bucket.sh      shared S3 bucket (versioning, block-public, SSE-S3, CORS)   ── once per bucket
 02-create-user.sh        per-user IAM plugin user + access key (S3 leg)              ── once per user
+                         (re-run after upgrading: version history needs ListBucketVersions)
 03-create-vault-repo.sh  per-vault GitHub repo + OIDC Actions role (git leg)         ── per vault, OPTIONAL
 04-init-vault-zip.sh      per-vault <vault>.zip for a device                          ── per vault
 05-create-mcp-server.sh  per-vault remote MCP server (Lambda + Function URL)         ── per vault, OPTIONAL

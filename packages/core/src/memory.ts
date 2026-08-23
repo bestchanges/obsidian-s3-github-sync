@@ -3,6 +3,7 @@ import {
   GetResult,
   HeadResult,
   ObjectInfo,
+  ObjectVersion,
   PreconditionFailedError,
   PutOptions,
   PutResult,
@@ -16,6 +17,8 @@ export class InMemoryStorage implements StorageAdapter {
     { body: Uint8Array; etag: string; versionId: string; lastModified: Date; metadata?: Record<string, string> }
   >();
   private versions = new Map<string, Map<string, Uint8Array>>();
+  /** Per-version metadata, in write order — mirrors what S3 ListObjectVersions returns (§2.9). */
+  private versionMeta = new Map<string, { versionId: string; etag: string; size: number; lastModified: Date }[]>();
   private counter = 0;
 
   /** test hook */
@@ -54,6 +57,13 @@ export class InMemoryStorage implements StorageAdapter {
     });
     if (!this.versions.has(key)) this.versions.set(key, new Map());
     this.versions.get(key)!.set(versionId, body.slice());
+    if (!this.versionMeta.has(key)) this.versionMeta.set(key, []);
+    this.versionMeta.get(key)!.push({
+      versionId,
+      etag,
+      size: body.byteLength,
+      lastModified: this.objects.get(key)!.lastModified,
+    });
     return { etag, versionId };
   }
 
@@ -66,6 +76,22 @@ export class InMemoryStorage implements StorageAdapter {
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
+  }
+
+  /** Newest first, like S3. Versions survive `delete()` here for the same reason they do in S3:
+   * the protocol tombstones in the journal and never issues DeleteObject (§2.8). */
+  async listVersions(key: string): Promise<ObjectVersion[]> {
+    const metas = this.versionMeta.get(key) ?? [];
+    const latest = this.objects.get(key)?.versionId;
+    return metas
+      .map((m) => ({
+        versionId: m.versionId,
+        lastModified: m.lastModified,
+        size: m.size,
+        etag: m.etag.replace(/"/g, ""),
+        isLatest: m.versionId === latest,
+      }))
+      .reverse();
   }
 
   async copy(srcKey: string, destKey: string, srcVersionId?: string): Promise<PutResult> {

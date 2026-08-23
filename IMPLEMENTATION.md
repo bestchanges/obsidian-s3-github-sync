@@ -245,9 +245,47 @@ can't read it just applies the freshest-wins tiebreak (1).
 
 ## 2.9 Version history (`history.ts`)
 
-The journal is already a complete, attributed history — every write to a path records `rev`, `at`,
-`by` (**which device**), `hash`, `size` and the `s3VersionId` of the bytes — so per-file history is a
-**query over `deltas/`, not a second store**. Nothing new is written to S3 for this feature.
+**The UI reads S3 object versions, not the journal.** The bucket already keeps one version per write
+(versioning is required for merge bases, §8), so a file's own version list *is* its history:
+`readStoredVersions` is a single `ListObjectVersions` returning timestamp, size, `versionId` and —
+free, because S3's ETag is the content MD5 for plain PUTs — the same `hash` the journal records.
+
+> [!important] Why not the journal
+> The journal *can* answer this: it records every write with `rev`, `at`, `by` and `s3VersionId`. But
+> only by **scanning** it, and the journal is one object per revision — 3 588 of them on this vault.
+> That meant thousands of GETs per open (**~57 s** on desktop, minutes on mobile) and, because the
+> read was all-or-nothing, one transient failure among thousands discarded the result. In the field
+> the panel simply rendered empty (diagnosed 2026-08-23). Measured after the switch: **753 ms** for
+> the same 26 versions, one request. S3 history is also *deeper* — deltas prune at `RETENTION_DAYS`,
+> object versions persist until a lifecycle rule removes them (this bucket has none).
+
+> [!warning] Two accepted limitations
+> - **A rename resets the trail.** S3 has no rename primitive — the new path is a new object with no
+>   versions — so history starts fresh after a rename. The pre-rename versions still exist under the
+>   old key, and the journal still records the rename, but the panel does not follow it.
+> - **Deletes are not shown.** The protocol tombstones in the journal and never issues
+>   `DeleteObject` (§2.8), so there is no delete marker to list. Recovering a deleted file is a
+>   separate feature, not part of this panel.
+>
+> Neither costs attribution, because there is none to lose: `rev` and `by` are dropped from the UI
+> deliberately. In a single-user vault the writer is always the same person, and a revision number is
+> an implementation detail — timestamp and size are what identify a version to a human.
+
+**IAM:** reading versions needs **`s3:ListBucketVersions`**, a *different* action from `s3:ListBucket`.
+`02-create-user.sh` grants both; a deployment created before this feature must re-run it, or the
+panel fails with AccessDenied (the modal says so explicitly).
+
+### The journal-backed query (retained, not on the UI path)
+
+`fileHistory` / `readFileHistory` still exist and are still tested: they are the only source for
+deletes, renames and attribution, which a future undelete feature will need. `readFileHistory` is
+**bounded** — it walks the journal newest-first in batches, stopping at `limit` versions, after
+`quietChunks` empty batches, or at `maxScan` — so if anything does call it, it can no longer spend
+thousands of requests or fail wholesale on one bad object.
+
+Every write to a path records `rev`, `at`, `by` (**which device**), `hash`, `size` and the
+`s3VersionId` of the bytes — a complete, attributed history, and nothing extra is written to S3 for
+either query.
 
 - `fileHistory(deltas, path)` → `FileVersion[]`, **newest first**. Pure.
 - `readFileHistory(storage, path, opts?)` → the above plus `oldestRevAvailable` / `truncated` /
@@ -1190,6 +1228,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 - **S3 bucket** — versioning **required** (merge bases), SSE-S3 at rest, private, **CORS** for
   `app://obsidian.md` / `capacitor://localhost` / `http://localhost` exposing `ETag` +
   `x-amz-version-id`.
+- **Version history** — reads S3 object versions directly (§2.9), which requires
+  **`s3:ListBucketVersions`** on the bucket in addition to `s3:ListBucket`. Granted by
+  `02-create-user.sh`; pre-existing deployments must re-run it.
 - **Auth** — GitHub **OIDC provider** → **IAM role** with a bucket-scoped policy assumed by the
   workflow (`role-to-assume`); no long-lived keys in CI. The plugin uses a separate IAM **user**'s
   access key (the only long-lived credential, and it lives only in per-device `data.json`).
@@ -1228,6 +1269,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Corrupt S3 object | manifest hash mismatch on apply → skip/re-fetch |
 | "Resync pulled 0 files" | resync uses `fullPull` (no echo suppression) → restores own lost files |
 | Open editor shows stale text after a pull, then reverts it | pulled notes go through `Vault.modifyBinary` so open views refresh (§4.8) — the raw adapter silently left stale buffers alive |
+| Version history empty / AccessDenied | the S3 user needs `s3:ListBucketVersions` (§2.9) — re-run `02-create-user.sh` |
 | Wrong content in one note (bad merge, unwanted edit, remote clobber) | **Version history** (§4.12): pick a revision, diff it, restore — attributed by device and rev |
 | Note deleted / renamed unexpectedly | Version history follows renames and shows the tombstone with its writing device; restore the revision before it |
 | Local bytes lost that were never pushed | Obsidian **File recovery** snapshot taken before every sync overwrite (§4.12) — device-local, `.md`/`.canvas` |
@@ -1281,7 +1323,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | Log flush debounce | 1 s | `FLUSH_DEBOUNCE_MS` (logger.ts) |
 | Log S3 namespace | `_logs/<deviceId>.log` | `LOG_PREFIX` (logger.ts) |
 | History preview cap | 2 MB (larger → metadata only) | `PREVIEW_MAX_BYTES` (history-modal.ts) |
-| History scan: batch / versions / quiet / ceiling | 200 / 100 / 2 batches / 1500 deltas | `DEFAULT_CHUNK`, `DEFAULT_LIMIT`, `DEFAULT_QUIET_CHUNKS`, `DEFAULT_MAX_SCAN` (history.ts) |
+| Journal history scan (**not** the UI path, §2.9): batch / versions / quiet / ceiling | 200 / 100 / 2 batches / 1500 deltas | `DEFAULT_CHUNK`, `DEFAULT_LIMIT`, `DEFAULT_QUIET_CHUNKS`, `DEFAULT_MAX_SCAN` (history.ts) |
 | History binary sniff | NUL byte in first 8 KB | history-modal.ts |
 
 ---
@@ -1307,12 +1349,6 @@ implementation added or diverged as follows:
 | Tombstone GC | prune > 90 days | **not implemented** — tombstones persist in the snapshot; only deltas are pruned (30 days) |
 | Branch protection | bot bypass / auto-PR option | direct push by `s3-sync-bot` with `[skip ci]` |
 | Sync cadence | `*/15` cron, compaction every run | **4-hourly** cron; snapshot rebuild **age-gated** to ~daily (`SNAPSHOT_MAX_AGE_HOURS`) |
-
-> [!note] Known gap — per-path history index
-> `readFileHistory` scans the journal (bounded, §2.9) because nothing maps a path to the revisions
-> that touched it. An `index/history.json.gz` written by git-sync at compaction would make history a
-> single GET plus the handful of deltas that matter, and would remove the `maxScan` ceiling (and its
-> "older revisions may exist" caveat) entirely.
 
 > [!note] Known gap
 > The 90-day tombstone garbage-collection from the design is **not** implemented: `foldDeltas`
