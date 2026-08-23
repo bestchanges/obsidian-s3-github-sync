@@ -748,10 +748,16 @@ directions: too slow in the moment you switch devices, and pure waste on a vault
 | **baseline** | foreground, nothing moving | `pollIntervalSec` |
 | **BACKGROUND** | `document.visibilityState === "hidden"` | `max(baseline × 4, 60 s)` |
 
-- **"Movement"** is a local edit (`schedulePush`) or a cycle that persisted state (`onStateChanged`,
-  which the engine calls only when something transferred or the cursor advanced, §4.3). Changes
-  cluster, so a device that just saw one is likely to see another — and that is exactly when a stale
-  view gets noticed.
+- **"Movement" means a REMOTE change landed** — a cycle that pulled or merged (`onRemoteActivity`,
+  raised by the engine when `pulled + merged > 0`), or a change notification (§4.14). Changes
+  cluster, so a device that just saw one is likely to see another — exactly when a stale view gets
+  noticed.
+- **Local edits deliberately do not arm it.** Every cycle pulls *and* pushes, so arming the fast
+  tier from our own writes turned each poll into another push of the file being typed: one delta and
+  one S3 version per ACTIVE interval, for as long as the session lasted (observed 2026-08-23 on
+  linux-5791 — 14 pushes of one note across 70 s of typing, against 3 debounce cycles that found
+  nothing left to send). Flushing local edits is the debounce's job (§4.4); the poll only backstops
+  it.
 - The ACTIVE tier is a **floor, never an override**: `min` against the baseline means a user who
   already polls faster keeps their cadence.
 - **Return to device** (`onReturnToDevice`) syncs *immediately* rather than waiting out the pending

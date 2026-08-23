@@ -6,10 +6,14 @@
  * wasteful on a vault nobody is looking at. The configured `pollIntervalSec` is therefore a
  * BASELINE — an idle, foreground device — and two tiers move off it:
  *
- *  - **ACTIVE** — something moved recently (a local edit, or a cycle that transferred / advanced the
- *    cursor). Changes cluster: a device that just saw one is likely to see another, and that is
- *    exactly when a stale view is noticed. Tightens the poll for `ACTIVE_WINDOW_MS` after the last
- *    movement.
+ *  - **ACTIVE** — a **remote** change arrived recently (a cycle that pulled/merged, or a change
+ *    notification). Changes cluster: a device that just saw one is likely to see another, and that
+ *    is exactly when a stale view is noticed. Tightens the poll for `ACTIVE_WINDOW_MS`.
+ *
+ *    Deliberately **not** armed by local edits. Every cycle pulls *and* pushes, so arming the fast
+ *    tier from our own writes made each poll re-push the file being typed — one delta and one S3
+ *    version per ACTIVE interval for the whole session (observed 2026-08-23: 14 pushes of one note
+ *    in 70 s of typing). Flushing local edits is the debounce's job, not the poll's.
  *  - **BACKGROUND** — the window is hidden. Nothing here is being read, and mobile is about to be
  *    suspended anyway, so back off hard rather than spend requests (and radio wake-ups) on it.
  *
@@ -38,7 +42,8 @@ export interface PollTierInput {
   baseMs: number;
   /** `document.visibilityState === "hidden"`. */
   hidden: boolean;
-  /** Time since the last observed movement; `Infinity` when nothing has moved this session. */
+  /** Time since the last **remote** change landed; `Infinity` when none has this session. Local
+   * edits must not feed this — see the ACTIVE tier note above. */
   msSinceActivity: number;
   /** A change-notification socket is connected *at this moment* (§4.14). */
   pushConnected?: boolean;

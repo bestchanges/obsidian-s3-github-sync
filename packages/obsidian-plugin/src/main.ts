@@ -701,11 +701,13 @@ export default class S3SyncPlugin extends Plugin {
             this.logger.warn(`notify: announce rev ${rev} failed: ${String(err)}`);
           }
         },
-        onStateChanged: async (state) => {
-          // The engine persists only when a cycle actually moved something or the cursor advanced
-          // (§4.3), which makes this the cheapest honest "the vault is in motion" signal available —
-          // no engine API change, and it covers remote pulls as well as our own pushes (§4.9a).
+        // A cycle applied REMOTE changes — tighten the poll to catch follow-ups (§4.9a). Local
+        // edits deliberately do NOT arm this: every cycle pushes the dirty set, so arming it from
+        // our own writes made each poll re-push the file being typed, once per ACTIVE interval.
+        onRemoteActivity: () => {
           this.lastActivityAt = Date.now();
+        },
+        onStateChanged: async (state) => {
           this.syncState = state;
           await this.persistState();
         },
@@ -936,7 +938,10 @@ export default class S3SyncPlugin extends Plugin {
 
   private schedulePush(): void {
     const now = Date.now();
-    this.lastActivityAt = now; // a local edit puts this device in the ACTIVE tier (§4.9a)
+    // NB: deliberately does NOT arm the ACTIVE poll tier (§4.9a) — every cycle pushes the dirty
+    // set, so a local edit doing so made each poll re-push the file being typed. Remote arrivals
+    // arm it (`onRemoteActivity`); flushing local edits is this debounce's job.
+    //
     // Anchor the max-wait on the first edit of this burst, so continuous typing can't keep
     // restarting the debounce forever and strand the whole session unsynced (§4.4).
     if (this.pushFirstEditAt === 0) this.pushFirstEditAt = now;
