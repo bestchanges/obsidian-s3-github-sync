@@ -138,10 +138,15 @@ export class VersionHistoryModal extends Modal {
       item.setAttr("tabIndex", -1);
       const details = item.createDiv("modal-sidebar-list-item-details");
       details.createDiv({ text: formatWhen(v.at) });
-      details.createDiv({
-        cls: "u-small u-muted",
-        text: v.isLatest ? `${formatBytes(v.size)} · current` : formatBytes(v.size),
-      });
+      // Size AND the delta against the next older version. Two versions seconds apart otherwise
+      // render as near-identical timestamps — which is how the 2026-08-23 rollback (1076 B) and the
+      // good copy it overwrote (1327 B), 4 s apart, were indistinguishable in this list.
+      const older = this.versions[i + 1];
+      const delta = older ? v.size - older.size : 0;
+      const parts = [formatBytes(v.size)];
+      if (delta !== 0) parts.push(`${delta > 0 ? "+" : ""}${delta} B`);
+      if (v.isLatest) parts.push("current");
+      details.createDiv({ cls: "u-small u-muted", text: parts.join(" · ") });
 
       item.addEventListener("click", () => void this.select(i));
       if (i === this.selected) item.addClass("is-active");
