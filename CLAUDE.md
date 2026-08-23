@@ -76,6 +76,7 @@ npm run bump:plugin -- <x.y.z>   # version bump across manifest/package/versions
 |---|---|
 | `main.js` | the bundle |
 | `manifest.json` | copied from source; carries the **version** Obsidian shows and compares |
+| `styles.css` | plugin stylesheet — Obsidian auto-loads it; **must travel with `main.js`** on every channel or the version-history modal renders unstyled |
 | `versions.json` | plugin version → `minAppVersion` map (used by Obsidian/BRAT) |
 | `<id>-<version>.zip` | the three files above, flat — same layout as a GitHub Release's assets |
 
@@ -89,7 +90,8 @@ bundle without the inline sourcemap.
 tests/typechecks/builds, computes the next version (highest existing release tag / manifest version
 with the **minor** bumped, patch → 0, e.g. `0.5.2 → 0.6.0`), bumps `manifest.json` / `package.json` /
 `versions.json` and commits that back to `main`, publishes a GitHub Release tagged `<version>` (tag =
-`manifest.version`, no `v` prefix) with `main.js` / `manifest.json` / `versions.json` attached, then
+`manifest.version`, no `v` prefix) with `main.js` / `manifest.json` / `styles.css` / `versions.json`
+attached, then
 fires a `repository_dispatch` at the vault repo to install it. So: **just merge — no manual bump.**
 Only merges that touch what ships (`packages/obsidian-plugin/**`, `packages/core/**`, or the
 workflow itself) cut a release — docs/git-sync/infra-only merges don't. A red build (tests/typecheck)
@@ -105,11 +107,11 @@ GitHub Release + tag (`<version>`, no `v` prefix) with the built `main.js` / `ma
 that tag.
 
 Distribution channels the release feeds:
-   - **Self-sync (default):** copy `dist/main.js` + `dist/manifest.json` into **one** synced vault's
+   - **Self-sync (default):** copy `dist/main.js` + `dist/manifest.json` + `dist/styles.css` into **one** synced vault's
      `.obsidian/plugins/vault-s3-sync/`, let a sync cycle run; other devices pick it up. Reload
      Obsidian (or toggle the plugin off/on) on each device so the new `main.js` is loaded — a running
      plugin does not hot-swap its own code.
-   - **Manual (recovery / first install):** copy the same two files into that folder on each device
+   - **Manual (recovery / first install):** copy the same files into that folder on each device
      directly. This is the fallback when sync itself is broken.
    - **BRAT (public repo):** create a GitHub Release tagged `<version>` (tag = `manifest.version`, no
      `v` prefix) with `manifest.json`, `main.js`, `versions.json` attached — i.e. the zip contents.
