@@ -938,11 +938,21 @@ renders its own, off a source that is strictly richer than Sync's — see §2.9.
 > identifiable). If the layout ever misbehaves on a specific device, the desktop app renders the same
 > data — the panel is a view over S3, not device state.
 
+> [!note] Rows carry a **size delta**, because timestamps alone aren't identifiable
+> The 2026-08-23 rollback (1076 B) and the good copy it overwrote (1327 B) were **4 seconds apart**,
+> so their timestamps rendered nearly identically and picking the right one was guesswork. Each row
+> shows size, the change against the next older version (`+251 B`), and `current` where it applies.
+
 > [!note] Restoring the current version is reported, not silently ignored
 > `matchesLocal` compares the chosen bytes with the file on disk; identical means the restore is a
 > no-op, and the modal says so instead of appearing to succeed and changing nothing. **Show changes**
 > also defaults **on**: the list exists to answer "what changed", and making the user toggle that per
 > row, then eyeball two walls of text, is work the tool should do.
+>
+> A restore **does not force a sync cycle**. It marks the file dirty and lets the ordinary debounce
+> (§4.4) publish it, because a restore is usually the *start* of editing rather than the end: forcing
+> a cycle published the restored text before the user could touch it, and the debounce coalesces
+> restore-then-edit into a single revision.
 
 **`VersionHistoryModal`** — a two-pane modal (desktop) built with Obsidian's own shipped classes
 (`mod-sidebar-layout`, `modal-sidebar-list-item`, `diff-line mod-left/mod-right`), so it matches the
