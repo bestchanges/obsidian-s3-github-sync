@@ -674,6 +674,18 @@ export default class S3SyncPlugin extends Plugin {
         // (the raw adapter rejects a case-only rename there) and the new name shows without a reload.
         // Returns false for anything that isn't a note in the vault index (e.g. config files) so the
         // engine falls back to the storage adapter.
+        // Write pulled notes through the Vault, not the adapter (§4.8): the adapter puts the bytes
+        // on disk but tells Obsidian nothing, so a note open in an editor keeps showing its stale
+        // buffer — and Obsidian later saves that buffer back over the pulled content, which the
+        // engine then publishes as a "local edit" and every device rolls back. `modifyBinary` makes
+        // the open view follow the file. Config-dir paths aren't in the index → false → adapter.
+        writeFile: async (path, data, mtimeMs) => {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          if (!(file instanceof TFile)) return false;
+          const buf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+          await this.app.vault.modifyBinary(file, buf as ArrayBuffer, { mtime: mtimeMs });
+          return true;
+        },
         renameFile: async (from, to, viaTmp) => {
           const file = this.app.vault.getAbstractFileByPath(from);
           if (!(file instanceof TFile)) return false; // not a note in the index → engine uses the adapter
