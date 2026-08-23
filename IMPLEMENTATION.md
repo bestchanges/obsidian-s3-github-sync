@@ -920,23 +920,36 @@ mention of version history, snapshots or revisions, and the app exposes no provi
 (`registerVersionHistory` / `versionHistoryProvider` and friends simply do not exist). So the plugin
 renders its own, off a source that is strictly richer than Sync's — see §2.9.
 
-> [!important] Mobile is a **single pane at a time**, not a sidebar
-> Obsidian's `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for:
-> the version list collapsed to roughly one visible row, so on mobile only the newest version could
-> ever be reached (reported 2026-08-23). Worse, the modal auto-selected that newest version on open,
-> which *hid the list behind it* — and restoring the version already on disk does nothing, so the
-> Restore button looked broken too. All three symptoms were one layout bug.
+> [!important] Narrow layouts own their sizing — `.modal-content` is a **flex row**
+> Obsidian sets `.modal-content { display: flex }` on every platform, so a block child of ours is a
+> flex item. Ours declared no `flex` and no `min-width`, so it collapsed to its intrinsic content
+> width — about **180 px of an 840 px modal** — which is what produced the reported "content pane is
+> empty, everything squeezed to the left, split in two" (screenshot, 2026-08-23): the panes and the
+> navigation were fine, the *sizing* was not.
 >
-> On `Platform.isMobile` the modal therefore drops the sidebar class and shows **one pane at a
-> time** — the full-width scrollable list, then a version's content with an **← All versions**
-> button — and does *not* auto-select on open, so the list is what you land on. Desktop keeps the
-> two-pane layout.
+> Two earlier diagnoses were wrong and are recorded so they aren't re-proposed: it is **not**
+> `Platform.isMobile` reading false (it reads correctly, and the mobile pane did render and
+> navigate), and it is **not** `.diff-view` imposing columns (that rule is only `user-select: text`).
+> It is also **not mobile-specific** — a narrow desktop window does the same thing, which is what
+> makes it testable without a phone.
 >
-> Rejected alternatives: shipping a `styles.css` with media queries (the build emits `main.js` +
-> `manifest.json` only, and a stylesheet is another artefact to distribute per §8), and a `<select>`
-> dropdown of versions (works, but loses the timestamp/size/current labelling that makes a row
-> identifiable). If the layout ever misbehaves on a specific device, the desktop app renders the same
-> data — the panel is a view over S3, not device state.
+> The narrow layout therefore builds everything inside **one wrapper this modal owns**
+> (`display:flex; flex-direction:column; flex:1 1 auto; width:100%; min-width:0; min-height:0`)
+> rather than reacting to whatever the parent's layout mode is. `min-*: 0` is the specific cure for
+> the collapse: without it a flex item won't shrink below its content, and with no `flex-grow` it
+> won't expand. `bodyEl` gets `flex:1 1 auto; min-height:0; overflow:auto` so the diff scrolls inside
+> the pane instead of being sized to nothing.
+>
+> It also uses **no `Setting` rows** for its buttons: a `Setting` is built for a full-width settings
+> pane (label and description left, control floated right), which in a narrow column renders as a
+> two-word-per-line paragraph with a toggle stranded beside it. Plain stacked buttons instead, with
+> the diff state on the button label. Layout is chosen by
+> `Platform.isMobile || modal width < NARROW_PX` (700) — width is the property the layout actually
+> depends on. Wide layouts keep Obsidian's sidebar classes, unchanged.
+>
+> Rejected: shipping a `styles.css` with media queries (the build emits `main.js` + `manifest.json`
+> only, and a stylesheet is another artefact to distribute per §8) and a `<select>` of versions (loses
+> the per-row size/delta labelling below).
 
 > [!note] Rows carry a **size delta**, because timestamps alone aren't identifiable
 > The 2026-08-23 rollback (1076 B) and the good copy it overwrote (1327 B) were **4 seconds apart**,

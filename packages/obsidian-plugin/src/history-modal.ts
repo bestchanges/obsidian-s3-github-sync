@@ -10,6 +10,8 @@ import type { StorageAdapter } from "@vault-sync/core";
 
 /** Bytes above this are shown as a metadata-only row — no preview, no diff (binaries, big attachments). */
 const PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
+/** Below this modal width there is no room for a sidebar beside the content. */
+const NARROW_PX = 700;
 
 export interface HistoryModalOptions {
   storage: StorageAdapter;
@@ -50,10 +52,9 @@ export class VersionHistoryModal extends Modal {
   private textCache = new Map<string, string | null>();
 
   private loadingEl: HTMLElement | null = null;
-  /** Mobile shows ONE pane at a time (list → tap → detail → back); desktop shows both. Obsidian's
-   * `mod-sidebar-layout` gives a fixed-width sidebar that a phone screen has no room for — the list
-   * collapsed to a single visible row, which is why only one version could ever be reached (§4.12). */
-  private readonly isMobile = Platform.isMobile;
+  /** Narrow layouts show ONE pane at a time (list → tap → detail → back); wide ones show both.
+   * Width, not platform: a narrow desktop window has exactly the same problem (§4.12). */
+  private narrow = false;
   private sidebarEl!: HTMLElement;
   private detailEl!: HTMLElement;
   private listEl!: HTMLElement;
@@ -66,29 +67,71 @@ export class VersionHistoryModal extends Modal {
   }
 
   onOpen(): void {
-    if (!this.isMobile) this.modalEl.addClass("mod-sidebar-layout");
+    this.narrow = Platform.isMobile || (this.modalEl.clientWidth || window.innerWidth) < NARROW_PX;
     this.titleEl.setText(`Version history — ${this.opts.path}`);
+    if (this.narrow) this.buildNarrow();
+    else this.buildWide();
 
+    this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
+    void this.load();
+  }
+
+  /**
+   * One pane at a time, inside a wrapper this modal owns completely.
+   *
+   * `.modal-content` is `display: flex` (Obsidian, all platforms). A block child of a flex row is a
+   * flex item, and ours had no `flex` and no `min-width`, so it collapsed to its intrinsic content
+   * width — ~180 px of an ~840 px modal. That is the whole bug behind "the content pane is empty and
+   * everything is squeezed to the left": the panes were correct, their *sizing* was not, and it was
+   * never mobile-specific. So rather than react to whatever the parent's layout mode is, everything
+   * goes in one wrapper that declares its own (§4.12).
+   */
+  private buildNarrow(): void {
+    const root = this.contentEl.createDiv();
+    root.style.display = "flex";
+    root.style.flexDirection = "column";
+    root.style.flex = "1 1 auto";
+    root.style.width = "100%";
+    // Without min-*: 0 a flex item refuses to shrink below its content — the collapse above, and the
+    // reason an overflowing child would blow the pane out instead of scrolling.
+    root.style.minWidth = "0";
+    root.style.minHeight = "0";
+
+    this.sidebarEl = root.createDiv();
+    this.sidebarEl.style.width = "100%";
+    this.sidebarEl.style.overflowY = "auto";
+    this.listEl = this.sidebarEl;
+
+    this.detailEl = root.createDiv();
+    this.detailEl.style.display = "none";
+    this.detailEl.style.flexDirection = "column";
+    this.detailEl.style.flex = "1 1 auto";
+    this.detailEl.style.width = "100%";
+    this.detailEl.style.minWidth = "0";
+    this.detailEl.style.minHeight = "0";
+
+    this.headerEl = this.detailEl.createDiv("u-small u-muted");
+    this.headerEl.style.padding = "var(--size-4-2) 0";
+    this.bodyEl = this.detailEl.createDiv("diff-view");
+    this.bodyEl.style.flex = "1 1 auto";
+    this.bodyEl.style.minHeight = "0";
+    this.bodyEl.style.overflow = "auto";
+    this.buttonsEl = this.detailEl.createDiv();
+  }
+
+  /** Two panes side by side — Obsidian's own sidebar layout, unchanged. */
+  private buildWide(): void {
+    this.modalEl.addClass("mod-sidebar-layout");
     this.sidebarEl = this.contentEl.createDiv("modal-sidebar mod-history");
     this.listEl = this.sidebarEl.createDiv("modal-sidebar-inner").createDiv("modal-sidebar-list");
 
     const container = this.contentEl.createDiv("sync-history-content-container");
     this.detailEl = container;
     const content = container.createDiv("sync-history-content");
-    if (this.isMobile) {
-      // Full width, own scroll, and only one pane visible at a time.
-      this.sidebarEl.style.width = "100%";
-      this.sidebarEl.style.maxHeight = "unset";
-      this.listEl.style.overflowY = "auto";
-      container.style.display = "none";
-    }
     this.headerEl = content.createDiv("u-small u-muted");
     this.headerEl.style.padding = "var(--size-4-3) var(--size-4-4)";
     this.bodyEl = content.createDiv("sync-history-preview diff-view");
     this.buttonsEl = container.createDiv("modal-button-container");
-
-    this.loadingEl = this.listEl.createDiv({ cls: "u-muted u-small", text: "Loading history…" });
-    void this.load();
   }
 
   onClose(): void {
@@ -120,7 +163,7 @@ export class VersionHistoryModal extends Modal {
     this.renderList();
     // Desktop opens the newest version straight away; mobile stays on the list, so every version is
     // reachable rather than the modal landing inside one of them.
-    if (!this.isMobile && this.versions.length > 0) await this.select(0);
+    if (!this.narrow && this.versions.length > 0) await this.select(0);
   }
 
   private renderList(): void {
@@ -156,15 +199,17 @@ export class VersionHistoryModal extends Modal {
   private async select(index: number): Promise<void> {
     this.selected = index;
     this.renderList();
-    if (this.isMobile) this.showPane("detail");
+    if (this.narrow) this.showPane("detail");
     await this.renderContent();
     this.renderButtons();
   }
 
-  /** Mobile only: swap between the version list and one version's content. */
+  /** Narrow layout only: swap between the version list and one version's content. */
   private showPane(which: "list" | "detail"): void {
     this.sidebarEl.style.display = which === "list" ? "" : "none";
-    this.detailEl.style.display = which === "detail" ? "" : "none";
+    // `flex`, not the empty string: this pane is a column of header/body/buttons, and restoring it
+    // to the default `block` would undo the sizing above.
+    this.detailEl.style.display = which === "detail" ? "flex" : "none";
   }
 
   /** Decoded text for a version, or null when it's binary / over the preview cap. */
@@ -236,13 +281,36 @@ export class VersionHistoryModal extends Modal {
     const v = this.versions[this.selected];
     if (!v) return;
 
-    if (this.isMobile) {
-      new Setting(this.buttonsEl).addButton((b) =>
-        b.setButtonText("← All versions").onClick(() => {
-          this.selected = -1;
-          this.renderList();
-          this.showPane("list");
-        }));
+    if (this.narrow) {
+      // Plain stacked buttons rather than `Setting` rows. A Setting is built for a full-width
+      // settings pane — label and description on the left, control floated right — which in a narrow
+      // column renders as a two-word-per-line paragraph with a toggle stranded beside it (screenshot,
+      // 2026-08-23). The diff state goes on the button label instead, so there is nothing to float.
+      const bar = this.buttonsEl.createDiv();
+      bar.style.display = "flex";
+      bar.style.flexDirection = "column";
+      bar.style.gap = "var(--size-4-2)";
+      bar.style.padding = "var(--size-4-2) 0";
+
+      const toggle = bar.createEl("button", {
+        text: this.showDiff ? "Showing changes — tap for full text" : "Showing full text — tap for changes",
+      });
+      toggle.onclick = () => {
+        this.showDiff = !this.showDiff;
+        void this.renderContent();
+        this.renderButtons();
+      };
+
+      const restore = bar.createEl("button", { text: "Restore this version", cls: "mod-cta" });
+      restore.onclick = () => void this.restore(v);
+
+      const back = bar.createEl("button", { text: "← All versions" });
+      back.onclick = () => {
+        this.selected = -1;
+        this.renderList();
+        this.showPane("list");
+      };
+      return;
     }
 
     new Setting(this.buttonsEl)
