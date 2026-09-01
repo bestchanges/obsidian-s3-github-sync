@@ -172,9 +172,11 @@ async function main(): Promise<void> {
     // per-device; other plugins' data.json syncs so their settings distribute across devices.
     ".DS_Store", ".trash/",
     ".obsidian/workspace*.json", "state.json.gz",
-    // vault-s3-sync's own per-device files: creds + diagnostic log (+ rotation backup). The log is
-    // a side-channel that never enters the journal, but mirror it here so nothing leaks either leg.
+    // vault-s3-sync's own per-device files: creds, the unsynced-work snapshot (§4.4a) and the
+    // diagnostic log (+ rotation backup). Neither the snapshot nor the log enters the journal, but
+    // mirror them here so nothing leaks on either leg.
     ".obsidian/plugins/vault-s3-sync/data.json",
+    ".obsidian/plugins/vault-s3-sync/pending.json",
     ".obsidian/plugins/vault-s3-sync/sync.log",
     ".obsidian/plugins/vault-s3-sync/sync.log.1",
   ]);
