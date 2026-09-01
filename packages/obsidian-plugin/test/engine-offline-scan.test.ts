@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { StorageAdapter } from "@vault-sync/core";
 import { contentHash } from "@vault-sync/core";
 import { SyncEngine, SyncState } from "../src/engine";
+// The engine's `obsidian` import is aliased to a stub (vitest.config.ts) whose Notice records here.
+import { noticeLog as notices } from "./obsidian-stub";
 
 /** Storage whose list() (the first async op a reconcile cycle reaches, in pull) blocks until the test
  * releases it — the same gate the serialization test uses. It lets us pin a reconcile cycle mid-flight
@@ -202,5 +204,37 @@ describe("SyncEngine deferred offline scan", () => {
     expect(logs.some((m) => m.includes("state mismatch"))).toBe(false);
     // The 12 absences propagated as tombstones instead of being restored.
     expect(logs.filter((m) => m.startsWith("↑ deleted"))).toHaveLength(12);
+  });
+});
+
+/** The deferred scan runs on every desktop launch, so it must stay silent; a scan the USER asked
+ * for is minutes long and shows nothing while it runs, so it must report its outcome past the
+ * verbose gate — silence after a command reads as "nothing happened". */
+describe("scanForOfflineChanges announcements", () => {
+  it("stays silent for the deferred scan (verbose off, no force)", async () => {
+    const storage = new GatedStorage();
+    const { engine } = makeEngine(makeVault(new Map()), storage, { lastSyncedRev: 0, files: {} });
+    notices.length = 0;
+
+    const scan = engine.scanForOfflineChanges();
+    await settle();
+    storage.releaseOne();
+    await scan;
+
+    expect(notices).toEqual([]);
+  });
+
+  it("announces start and finish, forced, when the user asked for it", async () => {
+    const storage = new GatedStorage();
+    const { engine } = makeEngine(makeVault(new Map()), storage, { lastSyncedRev: 0, files: {} });
+    notices.length = 0;
+
+    const scan = engine.scanForOfflineChanges({ label: "vault scan", announce: true, force: true });
+    await settle();
+    storage.releaseOne();
+    await scan;
+
+    expect(notices.some((n) => n.includes("started (vault scan)"))).toBe(true);
+    expect(notices.some((n) => n.includes("done (vault scan)"))).toBe(true);
   });
 });

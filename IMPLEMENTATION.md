@@ -604,9 +604,19 @@ guard.
 >   seconds; the scan no longer rides the launch path at all.
 > - **Desktop:** the scan is armed `OFFLINE_SCAN_DELAY_MS` (30 s) after launch, keeping the first
 >   moments for the fast pull + quick-edit push.
+>   Its residual job after §4.4a is narrow but real: changes made while Obsidian was **not running**
+>   (an external editor, a git checkout, a restore) fire no vault event at any point, so the walk —
+>   and its `resolveMissing` half — is the only thing that ever sees them. Everything the app itself
+>   observed is now persisted and replayed instead (§4.4a), and `.obsidian/**` is covered by the
+>   per-cycle `scanConfigDir` without any walk.
 > - **Mobile:** no automatic scan — vault files are practically never edited outside the app, so a
 >   routine full-vault walk is pure cost. The **"Scan for external changes"** command runs it on
->   demand (available on all platforms). To keep a *quick-edit-then-close* from stranding (the debounce
+>   demand (available on all platforms). A **user-asked** scan reports itself: a Notice when the walk
+>   starts (it is minutes long on a big vault and shows nothing while it runs, so a silent command
+>   reads as a no-op that ate the keypress), a forced `started`/`done` announcement for its cycle, and
+>   *"a vault scan is already running"* rather than silence when one is already in flight. The
+>   deferred desktop scan stays quiet — it runs on every launch. To keep a *quick-edit-then-close*
+>   from stranding (the debounce
 >   may not have fired), the plugin **flushes the pending push on `visibilitychange → hidden` and
 >   `onunload`** (`flushPendingPush`), so the edit ships before the OS suspends the app.
 >

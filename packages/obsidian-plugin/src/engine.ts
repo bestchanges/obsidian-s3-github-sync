@@ -869,16 +869,21 @@ export class SyncEngine {
    * ~30 s after launch on desktop and on demand via the "Scan for external changes" command — the only
    * trigger on mobile, where vault files are practically never edited outside the app so a routine
    * scan is pure cost. */
-  async scanForOfflineChanges(): Promise<void> {
+  async scanForOfflineChanges(
+    opts: { label?: string; announce?: boolean; force?: boolean } = {},
+  ): Promise<void> {
     const known = await this.scanOfflineWalk(); // off-lock: does not block pull/push cycles
     await this.request({
       resetCursor: false,
       scanOffline: false,
       scanConfig: false,
       fullPull: false,
-      label: "offline scan",
-      announce: false,
-      force: false,
+      label: opts.label ?? "offline scan",
+      // A scan the USER asked for reports its outcome whether or not it moved anything — silence
+      // after a command reads as "nothing happened". The deferred desktop one stays quiet: it runs
+      // on every launch, and announcing that would be pure noise.
+      announce: opts.announce ?? false,
+      force: opts.force ?? false,
       forcePaths: [],
       resolveMissing: { known },
     });

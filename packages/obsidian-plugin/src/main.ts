@@ -840,23 +840,34 @@ export default class S3SyncPlugin extends Plugin {
    * single-flighted so the deferred timer and a manual command can't overlap. */
   private async runOfflineScan(reason: "deferred" | "manual"): Promise<void> {
     this.clearOfflineScan(); // a manual run satisfies (and cancels) any pending deferred one
+    const userAsked = reason === "manual";
     if (!this.engine) {
-      if (reason === "manual") new Notice("S3 Vault Sync: not configured");
+      if (userAsked) new Notice("S3 Vault Sync: not configured");
       return;
     }
     if (this.settings.syncPaused) {
-      if (reason === "manual") new Notice("S3 Vault Sync is paused — resume it in settings to scan.");
+      if (userAsked) new Notice("S3 Vault Sync is paused — resume it in settings to scan.");
       return;
     }
-    if (this.offlineScanRunning) return;
+    if (this.offlineScanRunning) {
+      // The desktop's deferred scan (or a previous press) is already walking. Say so rather than
+      // returning in silence — the work IS happening, just not on this press.
+      if (userAsked) new Notice("S3 Vault Sync: a vault scan is already running.");
+      return;
+    }
     this.offlineScanRunning = true;
     this.logger.info(`offline scan started (${reason})`);
+    // The walk is minutes long on a big vault and shows nothing while it runs, so a command that
+    // started one has to say so up front — otherwise it reads as a no-op that ate the keypress.
+    if (userAsked) new Notice("S3 Vault Sync: scanning the vault for offline changes…");
     try {
-      await this.engine.scanForOfflineChanges();
+      await this.engine.scanForOfflineChanges(
+        userAsked ? { label: "vault scan", announce: true, force: true } : {},
+      );
       this.logger.info("offline scan finished");
     } catch (err) {
       this.logger.error("offline scan failed", err);
-      if (reason === "manual") new Notice(`S3 Vault Sync: scan failed — ${String(err)}`);
+      if (userAsked) new Notice(`S3 Vault Sync: scan failed — ${String(err)}`);
     } finally {
       this.offlineScanRunning = false;
     }
