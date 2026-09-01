@@ -1,6 +1,6 @@
 {
   "name": "@vault-sync/obsidian-plugin",
-  "version": "0.42.0",
+  "version": "0.43.0",
   "type": "module",
   "scripts": {
     "build": "node esbuild.config.mjs"
