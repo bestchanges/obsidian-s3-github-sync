@@ -869,8 +869,27 @@ directions: too slow in the moment you switch devices, and pure waste on a vault
   `FOCUS_SYNC_MIN_GAP_MS` (5 s) so alt-tabbing doesn't cost a cycle each time.
 - The loop is a **self-rescheduling `setTimeout`**, not `setInterval`: each tick re-picks its tier, and
   `startPolling()` stays idempotent (it clears the pending tick first) so settings changes, resumes and
-  visibility flips can all re-arm freely.
-- Tier selection lives in **`poll-schedule.ts`** — pure, no DOM, unit-tested (`test/poll-schedule.test.ts`).
+  visibility flips can all re-arm freely. `startPolling` also bumps a **generation counter** so a tick
+  still awaiting its cycle knows it has been superseded and must not arm a second, parallel loop.
+- **The tick is self-clocking: it `await`s its cycle and only then re-arms** (`pollTick`). The gap is
+  therefore measured from the *end* of one cycle to the start of the next, not from the start of the
+  previous tick. Re-arming on a fixed grid is fine while a cycle is quicker than the interval and
+  pathological when it is not: on mobile a cycle costs 3-6 s and the ACTIVE tier is 5 s, so every tick
+  landed on a busy engine, coalesced into the queue, and ran the instant its predecessor finished — the
+  device never idled. Observed 2026-09-01 on linux-stkv: **18 back-to-back cycles in 90 s, every one
+  `↓0 ↑0`**, each announcing itself twice. And it fired on *every* launch after a break by construction,
+  since the startup pull always pulls something and pulling is exactly what arms the ACTIVE tier.
+- **Busy guard** (`shouldSkipPoll`, `SyncEngine.busySince()` / `idle()`): a tick skips its cycle **only**
+  when the running one began *after* the tick was armed — then that cycle's pull is strictly newer than
+  anything the tick could have observed, so a second cycle would be duplicate work. A cycle that began
+  *earlier* is not grounds to skip: it may have pulled before a revision that has since landed, so the
+  tick still requests one and coalesces as before. A skipping tick parks on `idle()` and re-arms from
+  the cycle's end. Nothing is dropped either way — local edits stay in the dirty set until `push()`
+  drains it, and a remote change a skipped tick would have fetched is picked up by the next tick one
+  interval later, the same bound polling has always given.
+- Tier selection **and the skip rule** live in **`poll-schedule.ts`** — pure, no DOM, unit-tested
+  (`test/poll-schedule.test.ts`, `test/poll-busy-guard.test.ts`; the engine half in
+  `test/engine-idle-guard.test.ts`).
 
 > [!note] Every tier is a hint
 > A tick that never fires costs **latency, never correctness**: the cycle it would have started is the

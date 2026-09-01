@@ -337,6 +337,12 @@ export class SyncEngine {
   private running = false;
   private queuedReq: CycleReq | null = null;
   private queuedWaiters: Deferred[] = [];
+  /** Date.now() when the cycle currently running began. Read through busySince(), which the plugin's
+   * poll loop uses to tell "a cycle newer than my tick is already covering this" from "a long cycle
+   * started before my tick was even armed" — only the former makes a poll genuinely redundant. */
+  private cycleStartedAt = 0;
+  /** Callers parked in idle(), settled the moment the engine stops running a cycle. */
+  private idleWaiters: (() => void)[] = [];
   // Stall reclamation (§4.4). A cycle that makes no progress for STALL_TIMEOUT_MS is DISOWNED: the
   // lock is released so later triggers can sync again, and the stalled cycle — which may never settle
   // at all, since a hung promise cannot be cancelled from outside — is fenced off by these two
@@ -526,6 +532,36 @@ export class SyncEngine {
       // orphan's `this.loopToken === token` check has already gone false.
       void this.runLoop(this.loopToken, queued, qw);
     }
+    // Only actually idle if nothing took the lock straight back.
+    if (!this.running) this.settleIdle();
+  }
+
+  /** Wall-clock time the cycle currently running began, or null when the engine is idle.
+   *
+   * Exists for the poll loop's busy guard (§4.9a). A tick may skip its cycle only when the running
+   * one started AFTER the tick was armed: that cycle's pull is strictly newer than anything this
+   * tick could have observed, so running a second one now would be duplicate work. A cycle that
+   * began BEFORE the tick was armed proves nothing about the present — its pull may predate a
+   * revision that has since landed — so the tick must still request a cycle rather than skip. */
+  busySince(): number | null {
+    return this.running ? this.cycleStartedAt : null;
+  }
+
+  /** Resolves once no cycle is running (immediately when already idle).
+   *
+   * Never rejects: a failed or abandoned cycle still ends the busy period, and the poll loop parked
+   * here only wants to know when to re-arm — the outcome is the running cycle's caller's business.
+   * The stall watchdog bounds the wait: it disowns a stuck cycle after STALL_TIMEOUT_MS, which
+   * releases the lock and settles everyone parked here. */
+  idle(): Promise<void> {
+    if (!this.running) return Promise.resolve();
+    return new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  private settleIdle(): void {
+    const waiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const w of waiters) w();
   }
 
   // --------------------------------------------- deferred conflicts (§4.2a)
@@ -977,7 +1013,10 @@ export class SyncEngine {
         }
       }
     } finally {
-      if (this.loopToken === token) this.running = false;
+      if (this.loopToken === token) {
+        this.running = false;
+        this.settleIdle();
+      }
     }
   }
 
@@ -986,6 +1025,7 @@ export class SyncEngine {
   private async runCycle(req: CycleReq): Promise<void> {
     const seq = ++this.cycleSeq;
     this.progressAt = Date.now();
+    this.cycleStartedAt = this.progressAt;
     this.startStallWatchdog(seq, req.label);
     try {
       await this.reconcile(req, seq);
