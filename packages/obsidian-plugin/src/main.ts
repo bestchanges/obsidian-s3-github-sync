@@ -1,5 +1,5 @@
 import { Menu, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
-import { CycleAbandonedError, SyncEngine, SyncState, FileState } from "./engine";
+import { CycleAbandonedError, PendingWork, SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
 import { VersionHistoryModal } from "./history-modal";
@@ -120,6 +120,25 @@ const FOCUS_SYNC_MIN_GAP_MS = 5_000;
  * failures come in ones and recover on the next cycle; a real outage keeps counting. */
 const TRANSIENT_QUIET_FAILURES = 3;
 
+/** How long after the pending set changes its snapshot is written to disk (§4.4a). Short, because
+ * the whole point is to survive an OS kill that gives no warning; cheap, because the file holds a
+ * handful of paths — unlike state.json.gz, which is ~600 KB gzipped on a real vault and is why the
+ * pending set does not simply live there. */
+const PENDING_SAVE_DEBOUNCE_MS = 2_000;
+/** Ceiling on the persisted list. A pending set this large is never "a few files created offline";
+ * it is a bulk situation (first sync, resync, mass import) that the cycle in progress is already
+ * pushing, and writing it every couple of seconds would cost as much as the state file. Truncated
+ * rather than dropped: a partial hint still recovers most of the work. */
+const PENDING_MAX = 5_000;
+
+/** On-disk shape of the pending-work snapshot. Versioned so a future format change can be detected
+ * rather than half-read. */
+interface PendingFile {
+  v: 1;
+  dirty: string[];
+  renames: [string, string][];
+}
+
 /** Network-level failure (the request never reached S3) as opposed to a protocol/logic error: fetch
  * rejects with TypeError, our own request timeout surfaces as AbortError. These are expected after a
  * resume and self-heal, so they don't deserve the same noise as a real fault. */
@@ -166,6 +185,13 @@ export default class S3SyncPlugin extends Plugin {
   /** Single-flight guard so the deferred timer and a manual "Scan for external changes" can't overlap. */
   private offlineScanRunning = false;
   private foreignStateDetected = false;
+  /** Pending work read from disk at load, handed to the first engine that is built and then cleared
+   * (§4.4a). Null once consumed, so a later rebuildEngine carries over the LIVE set instead. */
+  private pendingSeed: PendingWork | null = null;
+  /** Debounce for the pending-work snapshot; null when no write is armed. */
+  private pendingSaveTimer: number | null = null;
+  /** Body of the last snapshot successfully written, so an unchanged set costs no disk write. */
+  private pendingSaved = "";
   /** True until this device has ever persisted sync state — i.e. no state file existed on load and
    * none was migrated. Gates the engine's first-run "remote wins on collision" bootstrap so a fresh
    * device doesn't union-merge Obsidian's generated config defaults into the canonical settings. */
@@ -180,6 +206,7 @@ export default class S3SyncPlugin extends Plugin {
       enabled: () => this.settings.loggingEnabled,
     });
     this.syncState = await this.loadState(data.syncState);
+    this.pendingSeed = await this.loadPending();
     await this.ensureDeviceIdentity();
 
     this.addSettingTab(new S3SyncSettingTab(this));
@@ -257,7 +284,9 @@ export default class S3SyncPlugin extends Plugin {
 
     // vault change tracking (§2.2) — events don't fire while the app is closed
     const onChange = (file: TAbstractFile) => {
-      if (file instanceof TFile) this.engine?.markDirty(file.path);
+      if (!(file instanceof TFile)) return;
+      this.engine?.markDirty(file.path);
+      this.noteLocalChange(file.path);
     };
     this.registerEvent(this.app.vault.on("create", onChange));
     this.registerEvent(this.app.vault.on("modify", onChange));
@@ -269,9 +298,9 @@ export default class S3SyncPlugin extends Plugin {
         if (file instanceof TFile) this.engine?.recordRename(oldPath, file.path);
         this.engine?.markDirty(oldPath); // tombstone old path
         if (file instanceof TFile) this.engine?.markDirty(file.path);
+        this.noteLocalChange(oldPath);
       }),
     );
-    this.registerEvent(this.app.vault.on("modify", () => this.schedulePush()));
 
     // Coming back to the app after it was backgrounded is the other half of the resume story: on
     // Android the poll timer may not have ticked at all while frozen, so the drift check in
@@ -282,6 +311,9 @@ export default class S3SyncPlugin extends Plugin {
       // mobile, inside the 5 s debounce) ships before the OS suspends the app rather than stranding.
       if (document.visibilityState === "hidden") {
         this.flushPendingPush();
+        // Backgrounded is when mobile gets killed. Land the snapshot NOW rather than at the end of
+        // the debounce window, which the OS may not grant us (§4.4a).
+        void this.savePending();
         // Drop the notification socket: mobile is about to be suspended and the connection dies
         // with it anyway, so holding it open only bills connection-minutes for a dead link (§4.14).
         this.notifier?.stop();
@@ -313,6 +345,7 @@ export default class S3SyncPlugin extends Plugin {
     // Best-effort flush before teardown so a debounced edit isn't lost when the app quits/reloads.
     // Kick it BEFORE clearing pushTimer (flushPendingPush cancels the debounce and syncs now).
     this.flushPendingPush();
+    void this.savePending(); // best-effort: record what the flush above won't have shipped in time
     if (this.pushTimer) window.clearTimeout(this.pushTimer);
     this.polling = false;
     this.notifier?.stop();
@@ -639,6 +672,11 @@ export default class S3SyncPlugin extends Plugin {
   }
 
   rebuildEngine(): void {
+    // Unpublished work the outgoing engine is holding. A settings change rebuilds the engine, and
+    // the replacement starts with an empty dirty set — without this hand-over those edits would be
+    // dropped on the floor (§4.4a). Left untouched when we go unconfigured, so the snapshot on disk
+    // stays the record of what is owed.
+    const prior = this.engine;
     if (!this.configured()) {
       this.engine = null;
       this.logger.setRemote(null, this.settings.deviceId);
@@ -730,6 +768,11 @@ export default class S3SyncPlugin extends Plugin {
         },
       },
     );
+    // First build of the session inherits the PREVIOUS RUN's snapshot; every later rebuild inherits
+    // the live set from the engine it replaces (§4.4a).
+    const carry = prior?.pendingWork() ?? this.pendingSeed;
+    this.pendingSeed = null;
+    if (carry && (carry.dirty.length || carry.renames.length)) this.engine.seedPending(carry);
   }
 
   private async startup(): Promise<void> {
@@ -1066,8 +1109,24 @@ export default class S3SyncPlugin extends Plugin {
       }
       // dirty set is preserved; next poll retries (§2.6)
     }
+    // The cycle either drained the pending set or requeued what it couldn't publish. Either way the
+    // snapshot on disk is now stale, so refresh it (§4.4a). Cheap: savePending skips the write when
+    // nothing actually changed, which is the common case for a no-op poll.
+    this.schedulePendingSave();
     // Ship this device's log tail (no-op unless logging is on and there's new content).
     void this.logger.uploadIfDirty();
+  }
+
+  /** A local change arrived from a vault event. Two jobs: flush it soon (§4.4), and make sure the
+   * mark itself survives an app kill (§4.4a).
+   *
+   * Creates, deletes and renames used to schedule neither — only `modify` armed the debounce — so a
+   * new attachment or a plugin-authored note waited for the next *poll* instead of the 10 s push,
+   * widening exactly the window in which a kill loses it. */
+  private noteLocalChange(path: string): void {
+    if (this.engine?.isExcluded(path)) return;
+    this.schedulePush();
+    this.schedulePendingSave();
   }
 
   private statePath(): string {
@@ -1076,6 +1135,84 @@ export default class S3SyncPlugin extends Plugin {
 
   private logPath(): string {
     return normalizePath(`${this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync"}/sync.log`);
+  }
+
+  // -------------------------------------------------- pending work (§4.4a)
+  private pendingPath(): string {
+    return normalizePath(`${this.manifest.dir ?? ".obsidian/plugins/vault-s3-sync"}/pending.json`);
+  }
+
+  /** Read the previous run's unpublished work, if any. Tolerant by design: anything unreadable or
+   * unrecognised is ignored rather than thrown, because this file is a recovery HINT — losing it
+   * costs the same as not having had it, and failing startup over it would cost far more. */
+  private async loadPending(): Promise<PendingWork | null> {
+    const path = this.pendingPath();
+    try {
+      if (!(await this.app.vault.adapter.exists(path))) return null;
+      const raw = JSON.parse(await this.app.vault.adapter.read(path)) as PendingFile;
+      if (raw?.v !== 1) return null;
+      const dirty = (Array.isArray(raw.dirty) ? raw.dirty : []).filter((p) => typeof p === "string");
+      const renames = (Array.isArray(raw.renames) ? raw.renames : []).filter(
+        (r): r is [string, string] =>
+          Array.isArray(r) && r.length === 2 && typeof r[0] === "string" && typeof r[1] === "string",
+      );
+      if (dirty.length || renames.length) {
+        this.logger.info(
+          `pending: recovered ${dirty.length} unsynced path(s), ${renames.length} rename(s) from the previous run`,
+        );
+      }
+      // Remember what is already on disk so an unchanged set doesn't provoke a rewrite of it.
+      this.pendingSaved = JSON.stringify({ v: 1, dirty, renames } satisfies PendingFile);
+      return { dirty, renames };
+    } catch (err) {
+      this.logger.error("pending work file unreadable — ignoring it", err);
+      return null;
+    }
+  }
+
+  /** Arm the debounced snapshot write. Leading-edge scheduling (an armed timer is left alone), so a
+   * burst of vault events costs one write PENDING_SAVE_DEBOUNCE_MS later rather than one each. */
+  private schedulePendingSave(): void {
+    if (this.pendingSaveTimer !== null) return;
+    this.pendingSaveTimer = window.setTimeout(() => {
+      this.pendingSaveTimer = null;
+      void this.savePending();
+    }, PENDING_SAVE_DEBOUNCE_MS);
+  }
+
+  /** Write (or clear) the pending-work snapshot now, cancelling any armed debounce.
+   *
+   * Best-effort throughout: a failed write is logged and dropped. This file only ever makes recovery
+   * MORE likely, so it must never be able to fail a sync or a teardown. */
+  private async savePending(): Promise<void> {
+    if (this.pendingSaveTimer !== null) {
+      window.clearTimeout(this.pendingSaveTimer);
+      this.pendingSaveTimer = null;
+    }
+    const engine = this.engine;
+    if (!engine) return;
+    const work = engine.pendingWork();
+    if (work.dirty.length > PENDING_MAX) {
+      this.logger.warn(
+        `pending: ${work.dirty.length} paths pending — persisting the first ${PENDING_MAX}`,
+      );
+      work.dirty = work.dirty.slice(0, PENDING_MAX);
+    }
+    const empty = work.dirty.length === 0 && work.renames.length === 0;
+    const payload: PendingFile = { v: 1, dirty: work.dirty, renames: work.renames };
+    const body = empty ? "" : JSON.stringify(payload);
+    if (body === this.pendingSaved) return; // unchanged since the last write — the no-op poll case
+    const path = this.pendingPath();
+    try {
+      if (empty) {
+        if (await this.app.vault.adapter.exists(path)) await this.app.vault.adapter.remove(path);
+      } else {
+        await this.app.vault.adapter.write(path, body);
+      }
+      this.pendingSaved = body;
+    } catch (err) {
+      this.logger.warn(`pending: could not persist unsynced work — ${String(err)}`);
+    }
   }
 
   /** Load per-device sync state from its gzipped file; migrate an older embedded state once. */

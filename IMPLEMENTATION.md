@@ -669,6 +669,54 @@ guard.
 >   ever rename, never delete. Existing case-variant duplicates in S3/the repo collapse automatically
 >   on the next fold — no migration step.
 
+## 4.4a Pending work survives the process (`pending.json`)
+
+`SyncEngine.dirty` and `SyncEngine.renames` are rebuilt from vault events and live **only in RAM**.
+Within a session that is sound — a failed `pushBatch` requeues everything it didn't publish, an
+abandoned cycle never touches the set — and it is exactly the hole when the session ends.
+
+> [!caution] The 2026-08-25 loss shape
+> A note and three photos were created **offline** on `linux-stkv`. Every push failed (~80
+> consecutive `TypeError: Failed to fetch`), the app was killed, and the dirty set went with it.
+> Mobile runs **no startup offline scan** by design (§4.4), so nothing rediscovered them: eleven
+> launches over seven days pulled happily and never pushed those files. They reached S3 only after a
+> manual **Scan for external changes** on 2026-09-01 — `↓0 ↑7`, a week late.
+
+The plugin therefore persists a snapshot of what this device still owes:
+
+- **`<plugin dir>/pending.json`** — `{ v: 1, dirty: string[], renames: [old, new][] }`. A *sidecar*,
+  deliberately **not** part of `state.json.gz`: state is ~600 KB gzipped on a real vault (10k tracked
+  files), and rewriting that on every edit burst on a phone is not affordable. The pending set is
+  normally a handful of paths, so it can be written often and cheaply. It lives in the plugin dir,
+  which never syncs (§4.6), so it stays per-device.
+- **Written** `PENDING_SAVE_DEBOUNCE_MS` (2 s) after any local vault event, at the end of every
+  cycle, and *immediately* on `visibilitychange: hidden` and `onunload` — backgrounding is when
+  mobile gets killed, and that path can't wait out a debounce. `savePending` skips the write when the
+  body is unchanged, so an idle poll costs nothing. Over `PENDING_MAX` (5 000) paths the list is
+  truncated with a warning: a set that large is a bulk situation the running cycle is already
+  pushing, not "a few files created offline".
+- **Read** in `onload`, before the engine exists, and handed to it via `seedPending()`. The first
+  cycle of the next run — the startup pull — therefore publishes them. In the 08-25 case the files
+  would have gone up that same evening.
+- **`rebuildEngine` hands the LIVE set over** from the engine it replaces, so a settings change no
+  longer silently drops edits the old engine was holding.
+- Seeding routes through `markDirty`/`recordRename`, so the **current** exclusion rules apply — a
+  folder excluded since the snapshot was taken is not resurrected by it.
+- **Stale entries are free.** `push()` re-stats and re-hashes every path it carries and drops
+  anything whose hash still matches the baseline (§1.6); a path that turned out to be unchanged costs
+  one read and never a bad write. A path with no baseline and nothing on disk is a no-op, not a
+  tombstone.
+- The file is a **recovery hint**: anything unreadable, unparseable or of an unknown `v` is ignored
+  rather than thrown. Losing it costs exactly as much as never having had it; failing startup over it
+  would cost far more.
+
+Separately, `create`, `delete` and `rename` now arm the **push debounce** as well (§4.4) — previously
+only `modify` did, so a new attachment or a plugin-authored note waited for the next *poll*, widening
+precisely the window a kill destroys.
+
+Tests: `test/engine-pending-work.test.ts`, including the negative case — the same launch **without**
+the snapshot syncs cleanly and leaves the files behind, reproducing the seven-day silence.
+
 ## 4.5 Resync everything (`resyncEverything`)
 
 The escape hatch: clear cursor + state, re-scan all local files as new, then `sync(fullPull=true)`
@@ -685,9 +733,10 @@ the POC, which excluded `.obsidian` wholesale. Only a small **per-device denylis
 - `GIT_META_FILES` by basename: `.gitignore`, `.gitattributes`, `.gitmodules`, `.s3syncignore`
   (a vault lacking these must not tombstone them out of the repo);
 - `isPerDeviceFile(path)`: basename `.DS_Store` or `state.json.gz`, or `.obsidian/workspace*.json`;
-- **this plugin's own** per-device files under `<selfDir>` — `data.json` (AWS creds), `sync.log`, and
-  `sync.log.1` (the diagnostic log + its rotation backup, §4.11). Matched by the full `<selfDir>/…`
-  path (basename set `SELF_DIR_EXCLUDED`) so **other** plugins' `data.json`/`sync.log` still sync;
+- **this plugin's own** per-device files under `<selfDir>` — `data.json` (AWS creds),
+  `pending.json` (the unsynced-work snapshot, §4.4a), `sync.log` and `sync.log.1` (the diagnostic log
+  + its rotation backup, §4.11). Matched by the full `<selfDir>/…` path (basename set
+  `SELF_DIR_EXCLUDED`) so **other** plugins' `data.json`/`sync.log` still sync;
 - `ALWAYS_EXCLUDED` prefixes: `.sync/`, `.git/`, `.github/`, `.sync-tool/`, `.trash/`;
 - user-configured `excludedFolders` (local-only until re-enabled; re-enabling is a scoped first-run
   union merge).
@@ -1274,6 +1323,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | other plugins' `data.json` | syncs | syncs | distribute plugin settings |
 | `community-plugins.json`, `core-plugins.json` | syncs | syncs | auto-enable plugins everywhere |
 | `vault-s3-sync/data.json` | excluded | excluded | our AWS creds, per-device |
+| `vault-s3-sync/pending.json` | excluded | excluded | per-device unsynced-work snapshot (§4.4a) |
 | `vault-s3-sync/sync.log`, `sync.log.1` | excluded | excluded | per-device diagnostic log (§4.11) |
 | `state.json.gz` | excluded | excluded | per-device sync cursor |
 | `.obsidian/workspace*.json` | excluded | excluded | per-device UI layout |

@@ -35,7 +35,7 @@ const ALWAYS_EXCLUDED = [".sync/", ".git/", ".github/", ".sync-tool/", ".trash/"
 const GIT_META_FILES = new Set([".gitignore", ".gitattributes", ".gitmodules", ".s3syncignore"]);
 /** Basenames inside this plugin's own install dir that are per-device and must never sync: its creds
  * and its on-disk log (+ rotation backup). Matched by full path against selfDir in isExcluded(). */
-const SELF_DIR_EXCLUDED = new Set(["data.json", "sync.log", "sync.log.1"]);
+const SELF_DIR_EXCLUDED = new Set(["data.json", "pending.json", "sync.log", "sync.log.1"]);
 /** Per-device files that must never sync anywhere: OS cruft, Obsidian's workspace UI state, and
  * this plugin's own gzipped cursor. Enforced here (not only via .gitignore) so they can't leak on
  * either leg. NOTE: this plugin's data.json (its creds) is per-device too but is excluded by full
@@ -120,6 +120,15 @@ interface PendingPull {
 export interface SyncState {
   lastSyncedRev: number;
   files: Record<string, FileState>;
+}
+
+/** What this device still owes S3: paths marked changed but not yet published, plus renames whose
+ * tombstone hasn't been emitted. Volatile by nature — it lives in RAM and is rebuilt from vault
+ * events — so the plugin persists a snapshot of it between runs (§4.4a). */
+export interface PendingWork {
+  dirty: string[];
+  /** [oldPath, newPath] pairs, in the order they were recorded. */
+  renames: [string, string][];
 }
 
 /** Raised when a cycle is disowned mid-flight by the stall watchdog. A distinct type so runLoop can
@@ -624,6 +633,32 @@ export class SyncEngine {
   }
 
   // ------------------------------------------------------------- dirty tracking
+  /** Snapshot of the unpublished work this engine is holding, for the plugin to persist (§4.4a).
+   *
+   * `dirty` and `renames` are rebuilt from vault events and exist only in RAM, which is fine while
+   * the process lives — a failed push requeues, an abandoned cycle leaves them untouched — and is
+   * exactly the hole when it doesn't. A file created while offline is marked dirty, every push
+   * fails, the app is killed, and the marks evaporate; on mobile nothing rediscovers them, because
+   * the startup offline scan is off there by design (§4.4). Observed 2026-08-25 on linux-stkv: a
+   * note and three photos created offline, ~80 consecutive `TypeError: Failed to fetch`, then
+   * eleven launches over seven days that pulled happily and never pushed them — until a manual
+   * "Scan for external changes" found them on 2026-09-01. */
+  pendingWork(): PendingWork {
+    return { dirty: [...this.dirty], renames: [...this.renames] };
+  }
+
+  /** Re-adopt work persisted by a previous run (or handed over by the engine this one replaced).
+   * Routed through markDirty/recordRename so the CURRENT exclusion rules apply — a folder excluded
+   * since the snapshot was taken must not be resurrected by it. Additive: never clears live state.
+   *
+   * Stale entries are free. push() re-stats and re-hashes every path it carries and drops anything
+   * whose hash still matches the baseline (§1.6), so a path that turned out to be unchanged costs
+   * one read and never a bad write. */
+  seedPending(work: PendingWork): void {
+    for (const path of work.dirty) this.markDirty(path);
+    for (const [from, to] of work.renames) this.recordRename(from, to);
+  }
+
   markDirty(path: string): void {
     if (!this.isExcluded(path) && !this.applying.has(path)) this.dirty.add(path);
   }

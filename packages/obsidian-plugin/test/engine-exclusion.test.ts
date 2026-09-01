@@ -32,6 +32,14 @@ describe("isExcluded — per-device plugin files", () => {
     expect(engine.isExcluded(`${SELF_DIR}/state.json.gz`)).toBe(true);
   });
 
+  it("holds back the unsynced-work snapshot (§4.4a)", () => {
+    // The plugin dir otherwise syncs (self-deploy channel), so one device's pending set would
+    // otherwise land on every other device as ordinary vault content.
+    expect(engine.isExcluded(`${SELF_DIR}/pending.json`)).toBe(true);
+    // …but only ours: another plugin's pending.json is just a file.
+    expect(engine.isExcluded(".obsidian/plugins/other/pending.json")).toBe(false);
+  });
+
   it("does not exclude a sync.log living outside our own plugin dir", () => {
     // Another plugin's file that happens to share the basename must still sync.
     expect(engine.isExcluded(".obsidian/plugins/other/sync.log")).toBe(false);
