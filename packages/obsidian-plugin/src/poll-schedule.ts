@@ -67,6 +67,27 @@ export function pollDelayMs({
   return baseMs;
 }
 
+// ── Busy guard ──────────────────────────────────────────────────────────────
+/** Should this poll tick skip its cycle because one is already running?
+ *
+ * Only when that cycle began AFTER the tick was armed. Then its pull is strictly newer than
+ * anything the tick could have observed, so a second cycle now would be duplicate work — which on
+ * a device where a cycle outlasts the interval is not merely wasteful but self-sustaining: each
+ * tick queues behind the running cycle and starts the instant it ends, so the device never idles
+ * (observed 2026-09-01 on linux-stkv: 18 back-to-back no-op cycles in 90 s).
+ *
+ * A cycle that started BEFORE the tick was armed is NOT grounds to skip. It may have pulled before
+ * a revision that has since landed, so skipping would defer that change by a whole extra interval
+ * for no gain; the tick requests a cycle and coalesces into the engine's queue as it always has.
+ *
+ * Skipping never drops work in either direction: local edits stay in the dirty set until push()
+ * drains it, and a remote change the skipped tick would have fetched is picked up by the next tick
+ * one interval later — the same bound polling has always given.
+ */
+export function shouldSkipPoll(busySince: number | null, armedAt: number): boolean {
+  return busySince !== null && busySince >= armedAt;
+}
+
 // ── Edit-push debounce (§4.4) ───────────────────────────────────────────────
 /** How long after the last save an edit waits before it is pushed. Every save restarts the wait,
  * so a burst of edits becomes one delta instead of one per save.

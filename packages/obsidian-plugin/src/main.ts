@@ -6,7 +6,7 @@ import { VersionHistoryModal } from "./history-modal";
 import { ForeignStateChoice, ForeignStateModal } from "./foreign-state-modal";
 import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
-import { pollDelayMs, pushDelayMs } from "./poll-schedule";
+import { pollDelayMs, pushDelayMs, shouldSkipPoll } from "./poll-schedule";
 import { ChangeNotifier, revTopic } from "./notify";
 import { decodeJsonGz, encodeJsonGz, readStoredVersions } from "@vault-sync/core";
 
@@ -147,6 +147,9 @@ export default class S3SyncPlugin extends Plugin {
    * normal tick from one that fired after the device was frozen (§resume handling in startPolling). */
   private lastPollTick = 0;
   private pollIntervalMs = 0;
+  /** Bumped by startPolling so a tick still awaiting its cycle can tell it has been superseded and
+   * must not re-arm (§4.9a). */
+  private pollGen = 0;
   /** True once the poll loop has been armed — the tier helpers and the focus trigger are no-ops
    * before that (unconfigured vault, or startup still waiting on the vault index). */
   private polling = false;
@@ -859,6 +862,11 @@ export default class S3SyncPlugin extends Plugin {
    * cleared first, so settings changes and resumes can call it freely. */
   startPolling(): void {
     if (this.pollTimer !== null) window.clearTimeout(this.pollTimer);
+    this.pollTimer = null;
+    // Fence any tick still awaiting its cycle: when it lands it must not arm a SECOND timer
+    // alongside the one below. startPolling is called freely (settings saved, resume, focus), so
+    // without this a device that re-armed during a slow cycle would end up with two poll loops.
+    this.pollGen++;
     this.polling = true;
     this.lastPollTick = Date.now();
     this.armPoll();
@@ -866,18 +874,52 @@ export default class S3SyncPlugin extends Plugin {
 
   private armPoll(): void {
     this.pollIntervalMs = this.pollDelayMs();
+    const gen = this.pollGen;
+    const armedAt = Date.now();
     this.pollTimer = window.setTimeout(() => {
       this.pollTimer = null;
-      const now = Date.now();
-      // A tick that is this late means the clock ran on while the WebView didn't: the device was
-      // suspended. Its network stack comes back a beat after the JS does, so let it settle rather
-      // than spend this cycle on a request that can't leave the device.
-      const resumed = now - this.lastPollTick > this.pollIntervalMs * POLL_LATE_FACTOR;
-      this.lastPollTick = now;
-      if (resumed) this.scheduleResumeSync();
-      else void this.runSync("poll");
-      this.armPoll(); // re-arm first thing: the cycle above is fire-and-forget and may outlive a tick
+      void this.pollTick(gen, armedAt);
     }, this.pollIntervalMs);
+  }
+
+  /** One poll tick — and, deliberately, the only place the poll loop re-arms.
+   *
+   * The tick AWAITS its cycle, so the gap between cycles is measured from the end of one to the
+   * start of the next. The old loop re-armed on a fixed grid the instant it fired the (fire-and-
+   * forget) cycle: fine while a cycle is quicker than the interval, pathological when it isn't. On
+   * mobile a cycle costs 3-6 s and the ACTIVE tier is 5 s, so every tick landed on a busy engine,
+   * queued, and ran the moment its predecessor finished. Observed 2026-09-01 on linux-stkv: 18
+   * back-to-back cycles in 90 s, every one ↓0 ↑0, each announcing itself twice. And it fired on
+   * every launch after a break by construction — the startup pull always pulls something, which is
+   * exactly what arms the ACTIVE tier.
+   *
+   * The busy guard is deliberately narrow. Skipping is only sound when the running cycle started
+   * AFTER this tick was armed, because then its pull already covers everything this tick could
+   * have observed. A cycle that began EARLIER may have pulled before a revision that has since
+   * landed, so the tick still requests one — coalescing into the engine's queue exactly as before —
+   * rather than assume it was covered. Nothing is dropped either way: local edits sit in the dirty
+   * set until push() drains it, and a remote change a skipped tick would have fetched is picked up
+   * by the next one a tier interval later, the same bound polling has always given. */
+  private async pollTick(gen: number, armedAt: number): Promise<void> {
+    const now = Date.now();
+    // A tick that is this late means the clock ran on while the WebView didn't: the device was
+    // suspended. Its network stack comes back a beat after the JS does, so let it settle rather
+    // than spend this cycle on a request that can't leave the device.
+    const resumed = now - this.lastPollTick > this.pollIntervalMs * POLL_LATE_FACTOR;
+    this.lastPollTick = now;
+    try {
+      const engine = this.engine;
+      const busySince = engine?.busySince() ?? null;
+      if (resumed) {
+        this.scheduleResumeSync(); // has its own timer; don't hold the loop for the grace period
+      } else if (engine && shouldSkipPoll(busySince, armedAt)) {
+        await engine.idle();
+      } else {
+        await this.runSync("poll");
+      }
+    } finally {
+      if (this.polling && gen === this.pollGen) this.armPoll();
+    }
   }
 
   /** The delay this tick should use — tier choice lives in `poll-schedule.ts` (pure, tested). */
