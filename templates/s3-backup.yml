@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout backup tool
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ vars.S3_BACKUP_TOOL_REPO }} # e.g. your-user/vault-sync
           ref: main
@@ -45,7 +45,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y restic rclone
 
       - name: Configure AWS credentials (OIDC, read-only)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.S3_BACKUP_ROLE_ARN }}
           aws-region: ${{ vars.S3_BACKUP_REGION }}

@@ -33,25 +33,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout vault content
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0 # full history: merge bases via `git show <lastSyncedCommit>:<path>`
 
       - name: Checkout sync tool
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ vars.S3_SYNC_TOOL_REPO }} # e.g. your-user/vault-sync
           path: .sync-tool
           ref: main
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: .sync-tool/package-lock.json
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.S3_SYNC_ROLE_ARN }}
           aws-region: ${{ vars.S3_SYNC_REGION }}
