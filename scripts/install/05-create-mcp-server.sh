@@ -7,26 +7,33 @@
 # prefix, a public Function URL (auth enforced in-handler), and a bearer token saved to
 # .secrets/mcp-<user>-<vault>.json. Then publishes <prefix>mcp.json (no secret) so every device's
 # plugin settings can show how to connect, writes .secrets/mcp-<user>-<vault>-connect.md with the
-# per-client config, and verifies the deployment with an MCP handshake.
+# per-client config, and verifies the deployment with an MCP handshake. Also sets up OAuth (the
+# in-Lambda authorization server) so browser clients — claude.ai, ChatGPT, the Gemini app — can
+# connect: it mints a signing key and takes an owner passphrase for the consent page.
 # Setup guide: MCP.md · design: "MCP Server Design.md" · details: packages/mcp-server/README.md
 #
 # Usage: ./05-create-mcp-server.sh --vault NAME [--user NS] [--bucket B] [--region R]
-#                                  [--rotate-token] [--yes] [--dry-run]
+#                                  [--rotate-token] [--passphrase P] [--rotate-oauth-key]
+#                                  [--no-oauth] [--yes] [--dry-run]
 #
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 load_env
 
 BUCKET="${VAULT_BUCKET:-}"; REGION="${VAULT_REGION:-}"; USER_NS="${VAULT_USER:-}"; VAULT=""; ROTATE=0
+PASSPHRASE=""; ROTATE_OAUTH=0; NO_OAUTH=0
 while [ $# -gt 0 ]; do case "$1" in
   --vault) VAULT="$2"; shift 2 ;;
   --user) USER_NS="$2"; shift 2 ;;
   --bucket) BUCKET="$2"; shift 2 ;;
   --region) REGION="$2"; shift 2 ;;
   --rotate-token) ROTATE=1; shift ;;
+  --passphrase) PASSPHRASE="$2"; shift 2 ;;
+  --rotate-oauth-key) ROTATE_OAUTH=1; shift ;;
+  --no-oauth) NO_OAUTH=1; shift ;;
   --yes) ASSUME_YES=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
-  -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
   *) die "unknown arg: $1" ;;
 esac; done
 
@@ -101,6 +108,53 @@ fi
 # dry-run echoes full aws commands — never let the real token into that output
 [ "${DRY_RUN:-0}" = 1 ] && TOKEN="<redacted>"
 
+# --- 2b. OAuth (in-Lambda authorization server — MCP.md §"web clients") ------------------------
+# Two secrets: a signing key for the tokens this server issues, and a scrypt hash of the vault
+# owner's passphrase, which is the only thing the consent page checks. The passphrase itself is
+# never stored — rotating the key (--rotate-oauth-key) invalidates every issued token at once.
+step "OAuth authorization server"
+SIGNING_KEY=""; PASSWORD_HASH=""
+if [ "$NO_OAUTH" = 1 ]; then
+  log "skipped (--no-oauth): bearer-token clients only"
+else
+  [ -s "$CREDS" ] && SIGNING_KEY="$(jq -r '.oauthSigningKey // ""' "$CREDS")"
+  [ -s "$CREDS" ] && PASSWORD_HASH="$(jq -r '.loginPasswordHash // ""' "$CREDS")"
+  if [ "$ROTATE_OAUTH" = 1 ] || [ -z "$SIGNING_KEY" ]; then
+    [ "$ROTATE_OAUTH" = 1 ] && [ -n "$SIGNING_KEY" ] && warn "rotating the signing key signs every connected app out"
+    SIGNING_KEY="$(openssl rand -hex 32)"
+  fi
+  # Ask only when we have nowhere to read it from and someone is there to type it.
+  if [ -z "$PASSPHRASE" ] && [ -z "$PASSWORD_HASH" ] && [ -t 0 ] && [ "${DRY_RUN:-0}" != 1 ]; then
+    printf 'Vault passphrase for the OAuth consent page (empty = skip OAuth): '
+    read -r -s PASSPHRASE; printf '\n'
+  fi
+  if [ -n "$PASSPHRASE" ]; then
+    # Mirrors hashPassword() in packages/mcp-server/src/oauth/password.ts — same parameters and
+    # format (scrypt$N$r$p$saltHex$hashHex). Change one, change the other.
+    PASSWORD_HASH="$(VAULT_PASSPHRASE="$PASSPHRASE" node -e '
+      const { randomBytes, scryptSync } = require("node:crypto");
+      const salt = randomBytes(16);
+      const key = scryptSync(process.env.VAULT_PASSPHRASE, salt, 32, { N: 16384, r: 8, p: 1 });
+      process.stdout.write(["scrypt",16384,8,1,salt.toString("hex"),key.toString("hex")].join("$"));
+    ')"
+    log "passphrase hashed (scrypt) — the passphrase itself is never stored"
+  fi
+  if [ -z "$PASSWORD_HASH" ]; then
+    SIGNING_KEY=""
+    warn "no passphrase → OAuth stays off; bearer-token clients still work (pass --passphrase to enable)"
+  else
+    if [ "${DRY_RUN:-0}" != 1 ]; then
+      umask 077
+      TMPC="$(mktemp)"
+      jq --arg k "$SIGNING_KEY" --arg h "$PASSWORD_HASH" \
+        '. + {oauthSigningKey:$k, loginPasswordHash:$h}' "$CREDS" >"$TMPC" \
+        && mv "$TMPC" "$CREDS" && chmod 600 "$CREDS"
+    fi
+    log "signing key + passphrase hash saved → $CREDS (never printed)"
+  fi
+fi
+[ "${DRY_RUN:-0}" = 1 ] && [ -n "$SIGNING_KEY" ] && { SIGNING_KEY="<redacted>"; PASSWORD_HASH="<redacted>"; }
+
 # --- 3. build the bundle ----------------------------------------------------------------------
 step "Build Lambda bundle"
 run npm --prefix "$REPO_DIR" run build:mcp
@@ -115,7 +169,10 @@ TIMEOUT=60
 MEMORY=1024
 step "Lambda '$FUNC'  (BUCKET=$BUCKET  PREFIX=$PREFIX)"
 ENVJSON="$(jq -n --arg b "$BUCKET" --arg p "$PREFIX" --arg t "$TOKEN" \
-  '{Variables:{BUCKET:$b,PREFIX:$p,MCP_BEARER_TOKEN:$t}}')"
+  --arg k "$SIGNING_KEY" --arg h "$PASSWORD_HASH" \
+  '{Variables:{BUCKET:$b,PREFIX:$p,MCP_BEARER_TOKEN:$t}}
+   + (if $k == "" then {} else {Variables:{BUCKET:$b,PREFIX:$p,MCP_BEARER_TOKEN:$t,
+        MCP_OAUTH_SIGNING_KEY:$k, MCP_LOGIN_PASSWORD_HASH:$h}} end)')"
 if aws lambda get-function --function-name "$FUNC" --region "$REGION" >/dev/null 2>&1; then
   if [ "${DRY_RUN:-0}" = 1 ]; then
     log "[dry-run] would update code from $ZIP and reapply env/timeout/memory"
@@ -208,12 +265,14 @@ SERVER_NAME="vault-$(printf '%s' "$VAULT" | tr '[:upper:]' '[:lower:]' | sed -e 
 # (IMPLEMENTATION.md §4.15). It carries NO secret: the token stays in .secrets and is pasted
 # per-device. Tool names are read out of the source so this can't drift from what ships.
 step "Publish connection info  (s3://$BUCKET/${PREFIX}mcp.json)"
-TOOLS_JSON="$(grep -A1 'registerTool(' "$REPO_DIR/packages/mcp-server/src/mcp.ts" \
+TOOLS_JSON="$(grep -A1 'registerTool(\|registerWrite(' "$REPO_DIR/packages/mcp-server/src/mcp.ts" \
   | grep -o '"[a-z_]\{3,\}"' | tr -d '"' | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
+AUTH_MODES='["bearer"]'
+[ -n "$PASSWORD_HASH" ] && AUTH_MODES='["bearer","oauth"]'
 INFO="$(jq -n --arg e "$ENDPOINT" --arg r "$REGION" --arg f "$FUNC" --arg v "$VAULT" \
-  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson tools "$TOOLS_JSON" \
+  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson tools "$TOOLS_JSON" --argjson modes "$AUTH_MODES" \
   '{version:1, endpoint:$e, region:$r, functionName:$f, vault:$v,
-    authModes:["bearer"], tools:$tools, updatedAt:$t, docs:"MCP.md"}')"
+    authModes:$modes, tools:$tools, updatedAt:$t, docs:"MCP.md"}')"
 if [ "${DRY_RUN:-0}" = 1 ]; then
   log "[dry-run] would put mcp.json: $(printf '%s' "$INFO" | jq -c .)"
 else
@@ -231,6 +290,21 @@ if [ "${DRY_RUN:-0}" = 1 ]; then
   log "[dry-run] would write $SHEET"
 else
   TOKEN="$(jq -r .token "$CREDS")"
+  if [ -n "$PASSWORD_HASH" ]; then
+    WEB_SECTION="Add a custom connector with this URL — no token, no header:
+
+\`\`\`
+$ENDPOINT
+\`\`\`
+
+The client runs OAuth against the server itself: it opens a consent page, you enter the **vault
+passphrase** you set during install, approve, and it is connected. Add \`?scope=vault.read\` support
+by asking the client for read-only access if you want a look-but-don't-touch connector."
+  else
+    WEB_SECTION="Not enabled for this deployment: these paste a URL into a connector dialog and
+cannot send a static header, so they need the OAuth mode. Re-run the installer with
+\`--passphrase '<your passphrase>'\` to switch it on."
+  fi
   umask 077
   cat >"$SHEET" <<SHEETEOF
 # Connect an AI assistant to vault \`$VAULT\`
@@ -270,8 +344,7 @@ $TOKEN
 
 ## claude.ai · ChatGPT · Gemini app
 
-Not yet: these paste a URL into a connector dialog and cannot send a static header, so they need
-the OAuth mode. See MCP.md.
+$WEB_SECTION
 SHEETEOF
   chmod 600 "$SHEET"
   log "written → $SHEET"
@@ -291,6 +364,19 @@ elif command -v curl >/dev/null 2>&1; then
     401) warn "handshake rejected (401) — the function may still be applying the new token; retry in a moment" ;;
     *)   warn "handshake returned HTTP $CODE — check: aws logs tail /aws/lambda/$FUNC --follow" ;;
   esac
+  if [ -n "$PASSWORD_HASH" ]; then
+    for DOC in .well-known/oauth-protected-resource .well-known/oauth-authorization-server; do
+      DCODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${URL}${DOC}" || echo 000)"
+      [ "$DCODE" = 200 ] && log "$DOC OK" || warn "$DOC returned HTTP $DCODE"
+    done
+    # A challenge on the 401 is what makes a browser client able to discover any of this.
+    CHALLENGE="$(curl -s -o /dev/null -D - --max-time 20 -X POST "$ENDPOINT" -d '{}' 2>/dev/null \
+      | tr -d '\r' | awk 'tolower($1) == "www-authenticate:" {$1=""; print substr($0,2)}')"
+    case "$CHALLENGE" in
+      *resource_metadata=*) log "401 challenge advertises the metadata URL" ;;
+      *) warn "401 challenge missing resource_metadata: ${CHALLENGE:-<none>}" ;;
+    esac
+  fi
 else
   warn "curl not found — skipped the handshake check"
 fi
@@ -299,6 +385,12 @@ step "MCP server ready for '$VAULT'"
 log "Endpoint:  $ENDPOINT"
 log "Token:     $CREDS   (never printed)"
 log "Connect:   $SHEET   (per-client copy-paste, includes the token)"
+if [ -n "$PASSWORD_HASH" ]; then
+  log "Web clients (claude.ai / ChatGPT / Gemini app): add the endpoint above as a custom connector"
+  log "             and sign in with your vault passphrase on the consent page."
+else
+  log "Web clients: OAuth is off — re-run with --passphrase '<passphrase>' to enable them."
+fi
 log "In Obsidian: Settings → S3 Vault Sync → 'AI assistants (MCP)' — endpoint and configs appear on every device"
 log "Redeploy code only:  AWS_REGION=$REGION MCP_FUNCTION=$FUNC npm run deploy -w @vault-sync/mcp-server"
 log "Claude Code:"

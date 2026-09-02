@@ -1,6 +1,6 @@
 ---
 title: Vault MCP Server — POC Design
-tags: [design, mcp, lambda, cognito, s3]
+tags: [design, mcp, lambda, oauth, s3]
 status: draft
 created: 2026-07-17
 ---
@@ -98,11 +98,11 @@ flowchart LR
     C[MCP client\nClaude Code / Desktop / claude.ai] -->|HTTPS + Bearer JWT| FU[Lambda Function URL]
     FU --> L[Lambda: mcp-server\nNode 22, core + S3SdkAdapter]
     L --> S3[(efed-vaults-asia\nsnapshot + deltas + files)]
-    COG[Cognito user pool\ntoken issuer] -.JWT verify\nJWKS cached.-> L
+    L -.issues + verifies\nits own OAuth tokens.-> L
 ```
 
 - **One Lambda function** (Node 22, arm64, 256–512 MB), bundled with esbuild like the plugin.
-  Config via env: `BUCKET`, `PREFIX`, `AWS_REGION`, auth params. **One function per vault** —
+  Config via env: `BUCKET`, `PREFIX`, `AWS_REGION`, auth params (§4). **One function per vault** —
   a second vault is a second function (or the same code with different env), zero shared state.
 - **Lambda Function URL** as the endpoint. HTTPS, free, no per-request charge, no infra to manage.
   `AuthType: NONE` at the URL level; **auth is enforced in the handler** (§4).
@@ -121,43 +121,49 @@ flowchart LR
   is exactly where that question returns, and it's deferred with it.
 
 **Cost:** Lambda + Function URL sit inside the always-free tier at personal traffic volumes
-(1 M requests + 400k GB-s / month); S3 request costs are noise on top of the existing sync traffic;
-Cognito Essentials is free ≤ 10k MAU. **Effectively $0/month.**
+(1 M requests + 400k GB-s / month); S3 request costs are noise on top of the existing sync traffic.
+**Effectively $0/month** — and with the authorization server in-process there is no identity
+provider to pay for or operate.
 
 ---
 
-## 4. Auth — Cognito, phased
+## 4. Auth — bearer, plus an authorization server in the same Lambda
 
-Target end-state per the task: **AWS Cognito**. The MCP spec (2025-06-18) wants the server to act
-as an **OAuth 2.1 resource server**: publish RFC 9728 protected-resource metadata pointing at the
-issuer, return `401 + WWW-Authenticate` when unauthenticated, and let the client run the OAuth
-flow. Claude's clients do this — but they also expect **Dynamic Client Registration (RFC 7591)**,
-which Cognito does not offer. That gap defines the phasing:
+The MCP spec wants the server to act as an **OAuth 2.1 resource server**: publish RFC 9728
+protected-resource metadata, return `401 + WWW-Authenticate` when unauthenticated, and let the
+client run the flow. Two credentials are accepted, because the clients genuinely differ:
 
-**Phase 0 (POC bootstrap) — static bearer token.** A long random secret in the Lambda env
-(or SSM parameter); handler compares `Authorization: Bearer <token>` (constant-time). Claude Code /
-Claude Desktop attach it via the MCP `headers` config. One evening of work, proves the whole pipe.
-Limitation: claude.ai web custom connectors can't send custom headers — they need real OAuth.
+**Static bearer token.** A long random secret in the Lambda env, compared constant-time. Anything
+that can set a header uses it: Claude Code, Claude Desktop, Gemini CLI. Kept indefinitely — it is
+the recovery path when the OAuth side is misconfigured, and the only one that needs no browser.
 
-**Phase 1 — Cognito OAuth (the actual "auth by Cognito"):**
-- Cognito **user pool** (one user: you) + **managed login / hosted UI** domain, one pre-registered
-  **public client** (authorization-code + PKCE, no secret).
-- Lambda validates the access-token JWT with **`aws-jwt-verify`** (issuer/audience/expiry; JWKS
-  cached in the warm container).
-- The same Lambda serves three tiny metadata routes alongside `/mcp`:
-  - `GET /.well-known/oauth-protected-resource` — RFC 9728 doc pointing at the Cognito issuer;
-  - `401` responses carry `WWW-Authenticate: Bearer resource_metadata="…"`;
-  - `POST /register` — a **DCR shim**: ignores the request body and returns the pre-registered
-    Cognito `client_id` (the standard workaround for Cognito's missing RFC 7591). Redirect-URI
-    allowlist in Cognito must include the Claude clients' callback URLs.
+**OAuth 2.1, self-hosted.** For claude.ai, ChatGPT and the Gemini app, which paste a URL into a
+connector dialog and can send no header at all.
 
-Phase 0 and Phase 1 can coexist behind a flag; drop the static token once OAuth is verified from
-every client that matters.
+> **Why not Cognito** (the original plan): every one of those clients registers itself through
+> **DCR** (RFC 7591) or **CIMD**, and Cognito supports neither — as of 2026 there is still no
+> `registration_endpoint`, and Claude selects CIMD only when the AS metadata advertises
+> `client_id_metadata_document_supported` alongside `"none"` token auth, which Cognito also does not
+> emit. Fronting Cognito therefore means writing `/register`, the metadata documents and a token
+> proxy *anyway* — the façade is the work, and Cognito underneath it adds a user pool to operate,
+> a second issuer to keep in sync, and a hosted-UI domain, in exchange for nothing this deployment
+> uses. With exactly one user, the login collapses to a passphrase check, so the AS is ~600 lines in
+> the function that already exists, with zero new infrastructure and no third-party dependency.
 
-**Authorization** is all-or-nothing: any valid token = full read/write of the one vault. Scoping
-(read-only tokens, per-directory grants) is post-POC.
+Shape of it (`src/oauth/`):
 
----
+| Concern | Decision |
+|---|---|
+| Registration | **Stateless DCR** — the `client_id` *is* the registration: a signed JWT carrying the redirect URIs, so nothing is stored and a forged id can't be minted. Claude re-registers on every fresh connection; a table would grow forever. **CIMD** also supported, with the document validated against the URL it came from |
+| Consent + login | One self-contained HTML page under a strict CSP, showing the client name and where it will send you, gated by the owner's passphrase (scrypt, hash-only in env) |
+| Code | Signed JWT, 60 s, PKCE **S256 required**, single-use enforced by a CAS marker (`If-None-Match: *` — the same primitive the delta journal appends with) |
+| Access token | HS256 JWT, 1 h, `aud` = the MCP URL as the client called it, so a token for another vault's function cannot be replayed |
+| Refresh token | 30 d, **rotating**; replaying a rotated-out token revokes the whole family (OAuth 2.1 for public clients) |
+| Scopes | `vault.read` / `vault.write`. A read-only token gets a server where the writing tools are **never registered**, not merely refused |
+| State | `auth/` under the vault's own prefix — outside everything the sync protocol reads, so no table, no lifecycle rule, no new IAM |
+| Issuer | Derived per request from the `Host` header: a Function URL has no configured base URL, and discovery only lines up if the issuer echoes what the client called |
+
+The two paths are independent: a deployment can run bearer-only (`--no-oauth`), OAuth-only, or both.
 
 ## 5. Code layout & deploy
 
@@ -165,10 +171,11 @@ New workspace package, same shape as git-sync:
 
 ```
 packages/mcp-server/
-  src/handler.ts     # Lambda entry: routing (/mcp, /.well-known/*, /register), auth gate
+  src/handler.ts     # Lambda entry: routing (/mcp, /.well-known/*, /authorize, /token, /register)
   src/mcp.ts         # server + tool definitions (stateless per-invocation)
-  src/vault.ts       # the protocol client: fold state, read, write+appendDelta, tombstone
-  src/auth.ts        # bearer check (phase 0) / aws-jwt-verify (phase 1)
+  src/vault.ts       # the protocol client: fold state, search, read, write+appendDelta, tombstone
+  src/auth.ts        # the gate: static bearer OR an OAuth access token, returning scopes
+  src/oauth/         # the authorization server: metadata, register, authorize+consent, token
   test/              # vault.ts against core's in-memory StorageAdapter (no AWS, no Lambda)
 ```
 
@@ -206,6 +213,7 @@ packages/mcp-server/
   in ChatGPT's connector shape sits on the same engine. That is affordable for a personal vault and
   keeps the server a clean stateless protocol client; an index is what a vault too large for the
   budgets would need, and it will likely hang off the same fold with an incremental cursor.
-- Files > ~4 MB upload / presigned-PUT two-step; multi-vault routing in one function; scoped
-  authorization; custom domain; rate limiting (Cognito + obscure URL suffices at POC risk level);
+- Files > ~4 MB upload / presigned-PUT two-step; multi-vault routing in one function; custom domain;
+  rate limiting on the consent page (scrypt makes each guess expensive, and the URL is unguessable,
+  which suffices at this risk level); per-directory authorization (scopes are read/write only);
   MCP resources/prompts surface (tools only for now).

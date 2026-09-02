@@ -83,6 +83,15 @@ describe("clientConfigs", () => {
     expect(web.containsSecret).toBe(false);
   });
 
+  // The web clients can't send a header, so their hint has to say which of the two states the
+  // deployment is in: OAuth ready, or "you still need to enable it".
+  it("tells web clients whether OAuth is available on this deployment", () => {
+    const withOauth = clientConfigs({ ...CONN, authModes: ["bearer", "oauth"] }, "tok").at(-1)!;
+    expect(withOauth.hint).toContain("vault passphrase");
+    const bearerOnly = clientConfigs(CONN, "tok").at(-1)!;
+    expect(bearerOnly.hint).toContain("--passphrase");
+  });
+
   it("falls back to a visible placeholder before a token is pasted on this device", () => {
     for (const cfg of clientConfigs(CONN, "")) {
       expect(cfg.containsSecret).toBe(false);
