@@ -731,7 +731,13 @@ the snapshot syncs cleanly and leaves the files behind, reproducing the seven-da
 
 The escape hatch: clear cursor + state, re-scan all local files as new, then `sync(fullPull=true)`
 (no echo suppression) so the entire live S3 state is reconciled and overlaps union-merge. Persisted
-even if S3 was empty. Exposed as a command and a warning-styled settings button.
+even if S3 was empty.
+
+Reachable **only** from the warning-styled **Resync** button in settings. It used to be a command
+too, which put the most destructive-looking action the plugin has one fuzzy match away from the most
+routine one — typing `sync` in the palette matched both `Sync now` and `Re**sync** everything from
+S3`. The button carries the warning styling and an explanation of what it does; the palette entry
+carried neither, and duplicated it exactly.
 
 ## 4.6 Exclusions & `.obsidian` config sync (`isExcluded`)
 
@@ -885,7 +891,7 @@ new edit.
 - **Settings tab**: **pause sync** (top), bucket, region, access key id, secret (password field),
   key prefix, poll interval (≥ 5 s), excluded folders, **max download size (MB)**, device id, verbose
   toggle, **Resync everything** (warning), **Export setup vault** (CTA).
-- **Commands**: `Sync now`, `Resync everything from S3`, `Pause/resume sync`,
+- **Commands**: `Sync now`, `Pause/resume sync`,
   `Scan for external changes` (§4.4; runs the offline scan on demand — the only scan trigger on mobile),
   `Export setup vault (for a new device)`,
   `Force download linked files of this note (ignore size limit)` (§4.7.1; active-note only),

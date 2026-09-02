@@ -31,8 +31,9 @@ Two-way sync between an Obsidian vault and S3 (desktop **and** mobile), one leg 
   richer source ([IMPLEMENTATION.md §2.9, §4.12](../../IMPLEMENTATION.md)). A **File recovery**
   snapshot is also taken before sync overwrites any local file, covering bytes that never reached S3.
 
-Commands: **Sync now**, **Resync everything from S3**, **Export setup vault**, **Version history of
-this note**; file-menu entry *Version history (S3 sync)*; CLI `vault-s3-sync:history --path <path>`.
+Commands: **Sync now**, **Export setup vault**, **Version history of this note**; file-menu entry
+*Version history (S3 sync)*; CLI `vault-s3-sync:history --path <path>`. A full resync lives only
+behind the warning-styled **Resync** button in settings — deliberately not a command (§4.5).
 Full settings and behavior: [IMPLEMENTATION.md §4.9](../../IMPLEMENTATION.md).
 
 > **Requires Obsidian ≥ 1.12.2** (`minAppVersion`), the release that introduced `registerCliHandler`.
