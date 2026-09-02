@@ -9,6 +9,7 @@ it needs an index and is designed separately.
   auth phasing, cost, out-of-scope list).
 - **The sync protocol it speaks:** [IMPLEMENTATION.md](../../IMPLEMENTATION.md) §2.
 - **Install:** `scripts/install/05-create-mcp-server.sh` (see `scripts/install/README.md`).
+- **Connect a client (user-facing howto):** [MCP.md](../../MCP.md).
 
 ## Design
 
@@ -118,6 +119,9 @@ Tests follow the house pattern — no cloud in the loop: `vault.ts` runs against
 
 ## Connecting a client
 
+Per-client instructions (Claude Code, Claude Desktop, Gemini CLI, and the state of the OAuth-only
+web surfaces) live in **[MCP.md](../../MCP.md)**. The short form:
+
 ```bash
 claude mcp add --transport http vault-<name> "https://<function-url>/mcp" \
   --header "Authorization: Bearer <token>"
@@ -125,3 +129,8 @@ claude mcp add --transport http vault-<name> "https://<function-url>/mcp" \
 
 The install script prints this command with the real URL, reading the token from
 `scripts/install/.secrets/mcp-<user>-<vault>.json` so it never lands in your shell history.
+
+It also publishes `<prefix>mcp.json` — endpoint, region, function name, tool list, **no secret** —
+at the vault prefix root, outside everything the sync protocol reads. The Obsidian plugin's
+"AI assistants (MCP)" settings section reads it, so any device can show the endpoint, probe it, and
+emit a ready-to-paste config without having run the installer (IMPLEMENTATION.md §4.15).

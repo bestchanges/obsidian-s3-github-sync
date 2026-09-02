@@ -12,7 +12,8 @@ two clients — a GitHub Actions **git-sync** job and an **Obsidian plugin** —
   reference (repo layout §1, protocol §2, adapters §3, plugin §4, git-sync §5, exclusion matrix §6,
   config §7, deployment/infra §8, failure/recovery §9, security §10, constants §11).
 - **Design rationale ("why"):** [System Design.md](System%20Design.md).
-- **MCP server (optional third client):** [MCP Server Design.md](MCP%20Server%20Design.md) — design;
+- **MCP server (optional third client):** [MCP.md](MCP.md) — setup + per-client howto (the
+  user-facing guide); [MCP Server Design.md](MCP%20Server%20Design.md) — design;
   [packages/mcp-server/README.md](packages/mcp-server/README.md) — component details;
   installed via `scripts/install/05-create-mcp-server.sh`.
 - **Infra bootstrap (bucket, CORS, OIDC/IAM, workflow install):** [SETUP.md](SETUP.md).

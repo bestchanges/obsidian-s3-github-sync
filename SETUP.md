@@ -112,16 +112,21 @@ Create a dedicated IAM user with the same S3 permissions JSON as above (bucket-s
 
 ## 7. Remote MCP server (optional)
 
-Expose the vault to MCP clients (Claude Code / Desktop) over the internet — a single Lambda +
-Function URL, bearer-token auth, ~$0/month:
+Expose the vault to AI assistants (Claude Code, Claude Desktop, Gemini CLI) over the internet — a
+single Lambda + Function URL, bearer-token auth, ~$0/month:
 
 ```bash
 scripts/install/05-create-mcp-server.sh --vault <name>
 ```
 
-It provisions role + function + URL + token idempotently and prints a ready-to-paste
-`claude mcp add …` command. Design: [MCP Server Design.md](MCP%20Server%20Design.md); component
-details: [packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
+It provisions role + function + URL + token idempotently, publishes `<prefix>mcp.json` so **every
+device's plugin settings** can show how to connect (Settings → S3 Vault Sync → *AI assistants
+(MCP)*), writes a per-client connect sheet to `.secrets/`, and verifies the deployment with an MCP
+handshake.
+
+Full setup + per-client instructions: **[MCP.md](MCP.md)**. Design:
+[MCP Server Design.md](MCP%20Server%20Design.md); component details:
+[packages/mcp-server/README.md](packages/mcp-server/README.md); script details:
 [scripts/install/README.md](scripts/install/README.md).
 
 > [!note] Upgrading an existing vault

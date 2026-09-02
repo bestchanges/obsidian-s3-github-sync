@@ -48,13 +48,16 @@ cp .env.shadow .env      # then edit .env
 ./04-init-vault-zip.sh --vault work
 ```
 
-**Remote MCP server for a vault (optional — lets Claude read/write the vault over the internet):**
+**Remote MCP server for a vault (optional — lets an AI assistant read/write the vault over the internet):**
 ```bash
 ./05-create-mcp-server.sh --vault work   # role + Lambda + Function URL + bearer token
 ```
-It prints the endpoint and a ready-to-paste `claude mcp add …` command. Re-running reconciles
-config and redeploys the current build; `--rotate-token` replaces the bearer token. Component
-design and details: [`packages/mcp-server/README.md`](../../packages/mcp-server/README.md).
+It then publishes `<prefix>mcp.json` (no secret) so every device's plugin settings can show how to
+connect, writes `.secrets/mcp-<user>-<vault>-connect.md` with per-client copy-paste config, verifies
+the deployment with an MCP handshake, and prints the endpoint. Re-running reconciles config and
+redeploys the current build; `--rotate-token` replaces the bearer token. Per-client setup:
+[`MCP.md`](../../MCP.md). Component details:
+[`packages/mcp-server/README.md`](../../packages/mcp-server/README.md).
 
 **Instant sync for a vault (optional — sub-second cross-device delivery instead of polling):**
 ```bash
@@ -85,8 +88,11 @@ plugins, and it starts pulling the whole vault. (No instructions ship inside the
   gitignored.
 - Rotate a key with `./02-create-user.sh --rotate` (deletes old keys, mints a new one), then re-run `04`.
 - `05` writes the MCP bearer token to `.secrets/mcp-<user>-<vault>.json` (gitignored, `chmod 600`),
-  never printed — the printed `claude mcp add` command reads it from the file via `jq`. Rotate with
-  `./05-create-mcp-server.sh --rotate-token` (old token stops working immediately).
+  never printed — the printed `claude mcp add` command reads it from the file via `jq`. It also
+  writes `.secrets/mcp-<user>-<vault>-connect.md`, which **does** inline the token in ready-to-paste
+  client configs: same handling as the zip — keep it in `.secrets`, share privately if at all. The
+  published `mcp.json` carries no secret. Rotate with `./05-create-mcp-server.sh --rotate-token`
+  (old token stops working immediately).
 
 ## Required permissions
 

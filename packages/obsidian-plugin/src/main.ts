@@ -1,4 +1,4 @@
-import { Menu, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath } from "obsidian";
+import { Menu, Notice, Platform, Plugin, PluginSettingTab, Setting, TAbstractFile, TFile, getLinkpath, normalizePath, requestUrl } from "obsidian";
 import { CycleAbandonedError, PendingWork, SyncEngine, SyncState, FileState } from "./engine";
 import { S3FetchAdapter } from "./s3-fetch-adapter";
 import { SyncLogger } from "./logger";
@@ -8,6 +8,13 @@ import { buildStarterZip, deliverFile, safeVaultName } from "./starter";
 import { mobileModelFromUA } from "./device-id";
 import { pollDelayMs, pushDelayMs, shouldSkipPoll } from "./poll-schedule";
 import { ChangeNotifier, revTopic } from "./notify";
+import {
+  clientConfigs,
+  probeMcp,
+  readMcpConnection,
+  TOKEN_PLACEHOLDER,
+  type McpConnection,
+} from "./mcp-info";
 import { decodeJsonGz, encodeJsonGz, readStoredVersions } from "@vault-sync/core";
 
 interface Settings {
@@ -45,6 +52,10 @@ interface Settings {
    * `a1b2c3d4e5f6g7.iot.eu-central-1.amazonaws.com` (`aws iot describe-endpoint
    * --endpoint-type iot:Data-ATS`). Only used when pushNotifications is on. */
   iotEndpoint: string;
+  /** Bearer token for this vault's remote MCP server (§MCP.md). Per-device like the S3 keys —
+   * data.json is excluded from sync by full path on both legs — and used only to build the
+   * copy-ready client configs and the liveness probe in settings. Empty until pasted here. */
+  mcpToken: string;
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -65,6 +76,7 @@ const DEFAULT_SETTINGS: Settings = {
   loggingEnabled: false,
   pushNotifications: false,
   iotEndpoint: "",
+  mcpToken: "",
 };
 
 interface PersistedData {
@@ -151,6 +163,28 @@ function isTransientNetworkError(err: unknown): boolean {
  * and never written to data.json, so it survives OS/WebView/app updates and isn't copied with the
  * bundle. */
 const DEVICE_ANCHOR_KEY = "vault-s3-sync:device-anchor";
+
+/**
+ * Obsidian's own HTTP client, shaped like `fetch` so it can be handed to `probeMcp` (§4.15).
+ *
+ * Not a stylistic choice: the Lambda Function URL returns no CORS headers, and both the desktop
+ * renderer and the mobile WebView enforce CORS on `fetch` — a plain fetch to the MCP endpoint fails
+ * before it leaves the device. (S3 works only because `01-create-bucket.sh` configures bucket CORS.)
+ * `requestUrl` goes through Obsidian's native stack, which is not subject to it.
+ */
+const obsidianFetch: typeof fetch = async (input, init) => {
+  const res = await requestUrl({
+    url: typeof input === "string" ? input : String(input),
+    method: init?.method ?? "GET",
+    headers: (init?.headers ?? {}) as Record<string, string>,
+    body: init?.body as string | undefined,
+    throw: false, // a 401 is a meaningful answer here, not an exception
+  });
+  return new Response(res.status === 204 ? null : res.text, {
+    status: res.status,
+    headers: { "content-type": res.headers?.["content-type"] ?? "application/json" },
+  });
+};
 
 export default class S3SyncPlugin extends Plugin {
   settings: Settings = DEFAULT_SETTINGS;
@@ -352,6 +386,20 @@ export default class S3SyncPlugin extends Plugin {
 
   configured(): boolean {
     return !!(this.settings.bucket && this.settings.accessKeyId && this.settings.secretAccessKey);
+  }
+
+  /** A storage adapter over the configured vault prefix, or null when the vault is unconfigured.
+   * The engine keeps its own (rebuilt on every settings change); this is for one-off reads outside
+   * the sync path, such as the MCP connection document in settings. */
+  createStorage(): S3FetchAdapter | null {
+    if (!this.configured()) return null;
+    return new S3FetchAdapter({
+      bucket: this.settings.bucket,
+      region: this.settings.region,
+      accessKeyId: this.settings.accessKeyId,
+      secretAccessKey: this.settings.secretAccessKey,
+      prefix: this.settings.prefix,
+    });
   }
 
   // -------------------------------------------------- device identity (§4.2)
@@ -1385,7 +1433,162 @@ class S3SyncSettingTab extends PluginSettingTab {
       .addButton((b) =>
         b.setButtonText("Export setup vault").setCta().onClick(() => void this.plugin.exportStarterVault()));
 
+    this.renderMcpSection(containerEl, s, save);
     this.renderLogsSection(containerEl, s, save);
+  }
+
+  /**
+   * "AI assistants (MCP)" section: what this vault's remote MCP server is, whether it answers from
+   * this device, and a copy-ready config for every supported client.
+   *
+   * The endpoint is not configured here — it is read from `mcp.json`, published to the vault prefix
+   * by `scripts/install/05-create-mcp-server.sh`, so installing the server on one machine makes it
+   * discoverable on every device. Only the bearer token is per-device (it lives in data.json, which
+   * never syncs), which is why it is the one field this section writes.
+   */
+  private renderMcpSection(
+    containerEl: HTMLElement,
+    s: Settings,
+    save: () => Promise<void>,
+  ): void {
+    containerEl.createEl("h3", { text: "AI assistants (MCP)" });
+    const intro = containerEl.createEl("p", {
+      text:
+        "Let Claude, ChatGPT or Gemini read and write this vault over the internet through its " +
+        "MCP server. Setup guide: MCP.md in the vault-sync repo.",
+    });
+    Object.assign(intro.style, { opacity: "0.75", marginTop: "0" });
+
+    const body = containerEl.createDiv();
+    let conn: McpConnection | null = null;
+    let status = "Looking for an MCP server…";
+    let showToken = false;
+
+    const copy = async (text: string, what: string): Promise<void> => {
+      try {
+        await navigator.clipboard.writeText(text);
+        new Notice(`${what} copied to clipboard.`);
+      } catch {
+        new Notice("Couldn't copy — select the text and copy manually.");
+      }
+    };
+
+    /** Hide the secret in what is rendered on screen; the Copy button still copies the real thing. */
+    const mask = (text: string): string =>
+      showToken || !s.mcpToken ? text : text.split(s.mcpToken).join("••••••••••••");
+
+    const render = (): void => {
+      body.empty();
+
+      const statusEl = body.createEl("p", { text: status });
+      Object.assign(statusEl.style, { margin: "0 0 0.75em" });
+
+      if (!conn) {
+        new Setting(body)
+          .setName("Check again")
+          .setDesc(
+            this.plugin.configured()
+              ? "No mcp.json found at this vault's prefix. Install the server with " +
+                "scripts/install/05-create-mcp-server.sh --vault <name>, then check again."
+              : "Set the bucket and access keys above first.",
+          )
+          .addButton((b) => b.setButtonText("Check again").onClick(() => void load(true)));
+        return;
+      }
+
+      const facts: [string, string][] = [
+        ["Endpoint", conn.endpoint],
+        ...(conn.vault ? ([["Vault", conn.vault]] as [string, string][]) : []),
+        ...(conn.region ? ([["Region", conn.region]] as [string, string][]) : []),
+        ...(conn.authModes?.length ? ([["Auth", conn.authModes.join(", ")]] as [string, string][]) : []),
+        ...(conn.tools?.length ? ([["Tools", conn.tools.join(", ")]] as [string, string][]) : []),
+        ...(conn.updatedAt ? ([["Installed", conn.updatedAt]] as [string, string][]) : []),
+      ];
+      const factList = body.createEl("ul");
+      Object.assign(factList.style, { margin: "0 0 1em", paddingLeft: "1.2em", fontSize: "13px" });
+      for (const [label, value] of facts) {
+        const li = factList.createEl("li");
+        li.createEl("strong", { text: `${label}: ` });
+        const v = li.createSpan({ text: value });
+        v.style.fontFamily = "monospace";
+      }
+
+      new Setting(body)
+        .setName("Bearer token")
+        .setDesc(
+          "This device only — stored in the plugin's data.json, which never syncs. Find it in " +
+            "scripts/install/.secrets/mcp-<user>-<vault>.json on the machine that ran the installer.",
+        )
+        .addText((t) => {
+          t.inputEl.type = "password";
+          t.setPlaceholder(TOKEN_PLACEHOLDER).setValue(s.mcpToken).onChange(async (v) => {
+            s.mcpToken = v.trim();
+            await save();
+          });
+        });
+
+      new Setting(body)
+        .addButton((b) =>
+          b.setButtonText("Test connection").setCta().onClick(async () => {
+            status = "Testing…";
+            render();
+            await probe();
+          }))
+        .addButton((b) =>
+          b.setButtonText(showToken ? "Hide token" : "Show token").onClick(() => {
+            showToken = !showToken;
+            render();
+          }))
+        .addButton((b) => b.setButtonText("Refresh").onClick(() => void load(true)));
+
+      for (const cfg of clientConfigs(conn, s.mcpToken)) {
+        new Setting(body)
+          .setName(cfg.client)
+          .setDesc(cfg.hint + (cfg.containsSecret ? " Copy puts the real token on your clipboard." : ""))
+          .addButton((b) => b.setButtonText("Copy").onClick(() => void copy(cfg.text, cfg.client)));
+        const pre = body.createEl("pre", { text: mask(cfg.text) });
+        Object.assign(pre.style, {
+          margin: "0 0 1em",
+          padding: "0.6em",
+          fontSize: "12px",
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          background: "var(--background-secondary)",
+          borderRadius: "4px",
+        });
+      }
+    };
+
+    const probe = async (): Promise<void> => {
+      if (!conn) return;
+      const result = await probeMcp(conn.endpoint, s.mcpToken, obsidianFetch);
+      status = result.detail;
+      render();
+    };
+
+    const load = async (withProbe: boolean): Promise<void> => {
+      const storage = this.plugin.createStorage();
+      if (!storage) {
+        status = "Vault not configured — no S3 credentials to read the MCP settings with.";
+        conn = null;
+        render();
+        return;
+      }
+      try {
+        conn = await readMcpConnection(storage);
+      } catch (err) {
+        conn = null;
+        status = `Couldn't read mcp.json: ${err instanceof Error ? err.message : String(err)}`;
+        render();
+        return;
+      }
+      status = conn ? "Found an MCP server for this vault." : "No MCP server installed for this vault.";
+      render();
+      if (conn && withProbe) await probe();
+    };
+
+    render();
+    void load(true);
   }
 
   /** "Logs" section: on/off toggle, a per-device picker (this device + everything shipped to S3),
