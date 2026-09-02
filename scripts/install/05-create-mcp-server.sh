@@ -13,15 +13,16 @@
 # Setup guide: MCP.md · design: "MCP Server Design.md" · details: packages/mcp-server/README.md
 #
 # Usage: ./05-create-mcp-server.sh --vault NAME [--user NS] [--bucket B] [--region R]
-#                                  [--rotate-token] [--passphrase P] [--rotate-oauth-key]
-#                                  [--no-oauth] [--yes] [--dry-run]
+#                                  [--rotate-token] [--passphrase P | --generate-passphrase]
+#                                  [--rotate-oauth-key] [--no-oauth] [--no-publish-token]
+#                                  [--yes] [--dry-run]
 #
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 load_env
 
 BUCKET="${VAULT_BUCKET:-}"; REGION="${VAULT_REGION:-}"; USER_NS="${VAULT_USER:-}"; VAULT=""; ROTATE=0
-PASSPHRASE=""; ROTATE_OAUTH=0; NO_OAUTH=0
+PASSPHRASE=""; ROTATE_OAUTH=0; NO_OAUTH=0; NO_PUBLISH_TOKEN=0; GEN_PASSPHRASE=0
 while [ $# -gt 0 ]; do case "$1" in
   --vault) VAULT="$2"; shift 2 ;;
   --user) USER_NS="$2"; shift 2 ;;
@@ -31,6 +32,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --passphrase) PASSPHRASE="$2"; shift 2 ;;
   --rotate-oauth-key) ROTATE_OAUTH=1; shift ;;
   --no-oauth) NO_OAUTH=1; shift ;;
+  --generate-passphrase) GEN_PASSPHRASE=1; shift ;;
+  --no-publish-token) NO_PUBLISH_TOKEN=1; shift ;;
   --yes) ASSUME_YES=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
   -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
@@ -123,10 +126,23 @@ else
     [ "$ROTATE_OAUTH" = 1 ] && [ -n "$SIGNING_KEY" ] && warn "rotating the signing key signs every connected app out"
     SIGNING_KEY="$(openssl rand -hex 32)"
   fi
+  # A generated passphrase beats a typed one here: it is the only credential guarding an
+  # internet-reachable login page, and it is stored in .secrets rather than printed.
+  if [ "$GEN_PASSPHRASE" = 1 ] && [ "${DRY_RUN:-0}" != 1 ]; then
+    PASSPHRASE="$(node -e '
+      const w = require("node:crypto").randomBytes(24).toString("base64url");
+      process.stdout.write(w.replace(/[^A-Za-z0-9]/g, "").slice(0, 24));
+    ')"
+    log "generated a 24-character passphrase"
+  fi
   # Ask only when we have nowhere to read it from and someone is there to type it.
   if [ -z "$PASSPHRASE" ] && [ -z "$PASSWORD_HASH" ] && [ -t 0 ] && [ "${DRY_RUN:-0}" != 1 ]; then
     printf 'Vault passphrase for the OAuth consent page (empty = skip OAuth): '
     read -r -s PASSPHRASE; printf '\n'
+  fi
+  # The consent page is public; a short passphrase is guessable online no matter how slow the hash.
+  if [ -n "$PASSPHRASE" ] && [ "${#PASSPHRASE}" -lt 12 ]; then
+    warn "that passphrase is ${#PASSPHRASE} characters — anyone who learns the endpoint URL can try it. Consider --generate-passphrase."
   fi
   if [ -n "$PASSPHRASE" ]; then
     # Mirrors hashPassword() in packages/mcp-server/src/oauth/password.ts — same parameters and
@@ -146,11 +162,19 @@ else
     if [ "${DRY_RUN:-0}" != 1 ]; then
       umask 077
       TMPC="$(mktemp)"
-      jq --arg k "$SIGNING_KEY" --arg h "$PASSWORD_HASH" \
-        '. + {oauthSigningKey:$k, loginPasswordHash:$h}' "$CREDS" >"$TMPC" \
-        && mv "$TMPC" "$CREDS" && chmod 600 "$CREDS"
+      # A generated passphrase is kept (you have to be able to type it on the consent page); one you
+      # chose yourself is not stored, only its hash.
+      if [ "$GEN_PASSPHRASE" = 1 ]; then
+        jq --arg k "$SIGNING_KEY" --arg h "$PASSWORD_HASH" --arg p "$PASSPHRASE" \
+          '. + {oauthSigningKey:$k, loginPasswordHash:$h, loginPassphrase:$p}' "$CREDS" >"$TMPC"
+      else
+        jq --arg k "$SIGNING_KEY" --arg h "$PASSWORD_HASH" \
+          '. + {oauthSigningKey:$k, loginPasswordHash:$h} | del(.loginPassphrase)' "$CREDS" >"$TMPC"
+      fi
+      mv "$TMPC" "$CREDS" && chmod 600 "$CREDS"
     fi
     log "signing key + passphrase hash saved → $CREDS (never printed)"
+    [ "$GEN_PASSPHRASE" = 1 ] && log "read the generated passphrase back with:  jq -r .loginPassphrase $CREDS"
   fi
 fi
 [ "${DRY_RUN:-0}" = 1 ] && [ -n "$SIGNING_KEY" ] && { SIGNING_KEY="<redacted>"; PASSWORD_HASH="<redacted>"; }
@@ -269,18 +293,36 @@ TOOLS_JSON="$(grep -A1 'registerTool(\|registerWrite(' "$REPO_DIR/packages/mcp-s
   | grep -o '"[a-z_]\{3,\}"' | tr -d '"' | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
 AUTH_MODES='["bearer"]'
 [ -n "$PASSWORD_HASH" ] && AUTH_MODES='["bearer","oauth"]'
+# The bearer token ships in this document unless --no-publish-token. data.json is where it belongs
+# on a device, but data.json never syncs (it holds the S3 secret), so it cannot carry anything TO a
+# device — this object is the pipe, and every device copies it into its own data.json once. Anyone
+# who can read it already holds the S3 keys to the whole vault, and the token grants a strict subset
+# of that. The object stays inside the private prefix and outside the journal, so it never reaches
+# git. See MCP.md ("Where the connection details live").
+PUB_TOKEN=""
+if [ "$NO_PUBLISH_TOKEN" = 1 ]; then
+  log "--no-publish-token: devices will need the token entered by hand"
+elif [ "${DRY_RUN:-0}" != 1 ]; then
+  PUB_TOKEN="$(jq -r .token "$CREDS")"
+fi
 INFO="$(jq -n --arg e "$ENDPOINT" --arg r "$REGION" --arg f "$FUNC" --arg v "$VAULT" \
   --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson tools "$TOOLS_JSON" --argjson modes "$AUTH_MODES" \
+  --arg tok "$PUB_TOKEN" \
   '{version:1, endpoint:$e, region:$r, functionName:$f, vault:$v,
-    authModes:$modes, tools:$tools, updatedAt:$t, docs:"MCP.md"}')"
+    authModes:$modes, tools:$tools, updatedAt:$t, docs:"MCP.md"}
+   + (if $tok == "" then {} else {token:$tok} end)')"
 if [ "${DRY_RUN:-0}" = 1 ]; then
-  log "[dry-run] would put mcp.json: $(printf '%s' "$INFO" | jq -c .)"
+  log "[dry-run] would put mcp.json: $(printf '%s' "$INFO" | jq -c 'if has("token") then .token = "<redacted>" else . end')"
 else
   INFO_FILE="$(mktemp)"; printf '%s\n' "$INFO" >"$INFO_FILE"
   aws s3api put-object --bucket "$BUCKET" --key "${PREFIX}mcp.json" --body "$INFO_FILE" \
     --content-type application/json --region "$REGION" --no-cli-pager >/dev/null
   rm -f "$INFO_FILE"
-  log "published — the plugin's 'AI assistants (MCP)' settings section picks this up on every device"
+  if [ -n "$PUB_TOKEN" ]; then
+    log "published (with the token) — every device picks it up in Settings → 'AI assistants (MCP)'"
+  else
+    log "published (no token) — devices need the token entered by hand"
+  fi
 fi
 
 # --- 8. connect sheet (holds the token → .secrets, 600) -------------------------------------------
@@ -369,12 +411,18 @@ elif command -v curl >/dev/null 2>&1; then
       DCODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "${URL}${DOC}" || echo 000)"
       [ "$DCODE" = 200 ] && log "$DOC OK" || warn "$DOC returned HTTP $DCODE"
     done
-    # A challenge on the 401 is what makes a browser client able to discover any of this.
-    CHALLENGE="$(curl -s -o /dev/null -D - --max-time 20 -X POST "$ENDPOINT" -d '{}' 2>/dev/null \
-      | tr -d '\r' | awk 'tolower($1) == "www-authenticate:" {$1=""; print substr($0,2)}')"
-    case "$CHALLENGE" in
-      *resource_metadata=*) log "401 challenge advertises the metadata URL" ;;
-      *) warn "401 challenge missing resource_metadata: ${CHALLENGE:-<none>}" ;;
+    # Lambda Function URLs RENAME WWW-Authenticate on a 401 to x-amzn-Remapped-www-authenticate, so
+    # the challenge the handler sends never reaches the client under its real name. Clients fall
+    # back to probing /.well-known/oauth-protected-resource on the server's origin — which is why
+    # both forms of that path are served. Check for either header so this reports the real state.
+    HEADERS="$(curl -s -o /dev/null -D - --max-time 20 -X POST "$ENDPOINT" -d '{}' 2>/dev/null | tr -d '\r')"
+    CHALLENGE="$(printf '%s' "$HEADERS" | awk 'tolower($1) == "www-authenticate:" {$1=""; print substr($0,2)}')"
+    REMAPPED="$(printf '%s' "$HEADERS" | awk 'tolower($1) == "x-amzn-remapped-www-authenticate:" {$1=""; print substr($0,2)}')"
+    case "$CHALLENGE$REMAPPED" in
+      *resource_metadata=*)
+        [ -n "$CHALLENGE" ] && log "401 challenge advertises the metadata URL" \
+          || log "401 challenge present but renamed by Lambda (x-amzn-Remapped-…) — clients discover via /.well-known instead" ;;
+      *) warn "401 carries no challenge at all: clients cannot discover the OAuth endpoints" ;;
     esac
   fi
 else

@@ -14,6 +14,7 @@ const HOST = "fn.lambda-url.ap-southeast-1.on.aws";
 const ISSUER = `https://${HOST}`;
 const STATIC_TOKEN = "static-token-abc";
 
+// One scrypt call, not one per test — see the note in oauth-flow.test.ts.
 beforeAll(() => {
   process.env.BUCKET = "test-bucket";
   process.env.PREFIX = "egorka/vaults/gsd2/";

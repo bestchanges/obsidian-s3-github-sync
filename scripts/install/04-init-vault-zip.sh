@@ -37,9 +37,17 @@ PREFIX="$(vault_prefix "$USER_NS" "$VAULT")"
 [ -n "$OUT" ] || OUT="$PWD/$VAULT.zip"
 
 step "Device zip for '$VAULT'  (prefix $PREFIX)"
+# The vault's MCP token, when one exists, rides along in data.json so the device can reach the MCP
+# server without being told a second secret (it is strictly weaker than the S3 key already in here).
+# Absent — e.g. the zip is built before 05 ran — the device adopts the published token by itself the
+# first time its MCP settings are opened, so this is a convenience, never the only path.
+MCP_CREDS="$SECRETS_DIR/mcp-$USER_NS-$VAULT.json"
+MCP_ARGS=()
+[ -s "$MCP_CREDS" ] && MCP_ARGS=(--mcp-creds-file "$MCP_CREDS")
+
 node "$REPO_DIR/scripts/make-starter-vault.mjs" \
   --name "$VAULT" --bucket "$BUCKET" --region "$REGION" --prefix "$PREFIX" \
-  --creds-file "$CREDS" --out "$OUT"
+  --creds-file "$CREDS" ${MCP_ARGS[@]+"${MCP_ARGS[@]}"} --out "$OUT"
 
 step "Done"
 log "Carry $OUT to a device → extract here → open the $VAULT/ folder as a vault → turn on community plugins."

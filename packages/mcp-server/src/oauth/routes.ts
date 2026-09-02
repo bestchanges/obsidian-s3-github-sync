@@ -310,9 +310,20 @@ export async function handleOAuth(req: OAuthRequest, deps: OAuthDeps): Promise<H
     if (params.get("action") === "deny") {
       return redirectError(v.redirectUri, "access_denied", "the vault owner declined", v.state);
     }
+    // Throttle before checking: an unlimited consent page is an online password oracle.
+    const cooldown = await deps.store.lockoutRemaining(now);
+    if (cooldown > 0) {
+      const minutes = Math.ceil(cooldown / 60_000);
+      return html(
+        429,
+        consentView(deps, params, v, `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.`),
+      );
+    }
     if (!verifyPassword(params.get("password") ?? "", deps.passwordHash)) {
+      await deps.store.recordFailure(now);
       return html(401, consentView(deps, params, v, "That passphrase didn't match. Try again."));
     }
+    await deps.store.clearFailures();
 
     const nowSec = Math.floor(now / 1000);
     const code = signJwt(

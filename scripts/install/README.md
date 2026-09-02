@@ -9,7 +9,8 @@ and the **MCP leg** (05) and **instant sync** (06) are optional.
 02-create-user.sh        per-user IAM plugin user + access key (S3 leg)              ── once per user
                          (re-run after upgrading: version history needs ListBucketVersions)
 03-create-vault-repo.sh  per-vault GitHub repo + OIDC Actions role (git leg)         ── per vault, OPTIONAL
-04-init-vault-zip.sh      per-vault <vault>.zip for a device                          ── per vault
+04-init-vault-zip.sh      per-vault <vault>.zip for a device (run AFTER 05 to embed
+                         its MCP token; otherwise the device adopts it later)       ── per vault
 05-create-mcp-server.sh  per-vault remote MCP server (Lambda + Function URL)         ── per vault, OPTIONAL
 06-enable-push-notifications.sh  instant sync via IoT Core (IAM grants only)         ── per vault, OPTIONAL
 ```
@@ -52,10 +53,11 @@ cp .env.shadow .env      # then edit .env
 ```bash
 ./05-create-mcp-server.sh --vault work   # role + Lambda + Function URL + bearer token
 ```
-It asks for a **vault passphrase** (or takes `--passphrase`), which enables the in-Lambda OAuth
-server that browser clients — claude.ai, ChatGPT, the Gemini app — need; `--no-oauth` skips it and
-leaves bearer-token clients working. It then publishes `<prefix>mcp.json` (no secret) so every
-device's plugin settings can show how to connect, writes
+It asks for a **vault passphrase** (or takes `--passphrase`, or mints one with
+`--generate-passphrase`), which enables the in-Lambda OAuth server that browser clients — claude.ai,
+ChatGPT, the Gemini app — need; `--no-oauth` skips it and leaves bearer-token clients working. It
+then publishes `<prefix>mcp.json` — connection facts **and the bearer token**, so every device
+adopts it without anyone typing a secret (`--no-publish-token` opts out) — writes
 `.secrets/mcp-<user>-<vault>-connect.md` with per-client copy-paste config, verifies the deployment
 (MCP handshake + the OAuth discovery documents + the 401 challenge), and prints the endpoint.
 Re-running reconciles config and redeploys the current build; `--rotate-token` replaces the bearer
@@ -98,8 +100,12 @@ plugins, and it starts pulling the whole vault. (No instructions ship inside the
   published `mcp.json` carries no secret. Rotate with `./05-create-mcp-server.sh --rotate-token`
   (old token stops working immediately).
 - `05` also stores the **OAuth signing key** and a **scrypt hash** of your vault passphrase in the
-  same `.secrets` file. The passphrase itself is never written anywhere — if you lose it, re-run
-  with a new `--passphrase`. `--rotate-oauth-key` invalidates every OAuth session at once.
+  same `.secrets` file. A passphrase you chose is never written anywhere — if you lose it, re-run
+  with a new `--passphrase`; one made by `--generate-passphrase` is kept there so you can read it
+  back (`jq -r .loginPassphrase …`). `--rotate-oauth-key` invalidates every OAuth session at once.
+- `05` **publishes the bearer token** to `<prefix>mcp.json` so devices configure themselves; `04`
+  additionally embeds it in the zip's `data.json` when the vault already has an MCP server. Both are
+  weaker than the S3 key those artifacts already carry. `--no-publish-token` turns the first off.
 
 ## Required permissions
 

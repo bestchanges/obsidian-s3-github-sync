@@ -12,6 +12,7 @@ import {
   clientConfigs,
   probeMcp,
   readMcpConnection,
+  tokenToAdopt,
   TOKEN_PLACEHOLDER,
   type McpConnection,
 } from "./mcp-info";
@@ -528,6 +529,9 @@ export default class S3SyncPlugin extends Plugin {
         accessKeyId: this.settings.accessKeyId,
         secretAccessKey: this.settings.secretAccessKey,
         prefix: this.settings.prefix,
+        // Travels with the S3 keys it is weaker than, so the new device can talk to the vault's MCP
+        // server without being told a second secret (§4.15).
+        mcpToken: this.settings.mcpToken,
         syncPaused: true,
       };
       const dataJson = JSON.stringify({ settings } satisfies PersistedData, null, 2) + "\n";
@@ -1481,7 +1485,7 @@ class S3SyncSettingTab extends PluginSettingTab {
       body.empty();
 
       const statusEl = body.createEl("p", { text: status });
-      Object.assign(statusEl.style, { margin: "0 0 0.75em" });
+      Object.assign(statusEl.style, { margin: "0 0 0.75em", fontWeight: "600" });
 
       if (!conn) {
         new Setting(body)
@@ -1514,33 +1518,16 @@ class S3SyncSettingTab extends PluginSettingTab {
       }
 
       new Setting(body)
-        .setName("Bearer token")
-        .setDesc(
-          "This device only — stored in the plugin's data.json, which never syncs. Find it in " +
-            "scripts/install/.secrets/mcp-<user>-<vault>.json on the machine that ran the installer.",
-        )
-        .addText((t) => {
-          t.inputEl.type = "password";
-          t.setPlaceholder(TOKEN_PLACEHOLDER).setValue(s.mcpToken).onChange(async (v) => {
-            s.mcpToken = v.trim();
-            await save();
-          });
-        });
-
-      new Setting(body)
         .addButton((b) =>
           b.setButtonText("Test connection").setCta().onClick(async () => {
             status = "Testing…";
             render();
             await probe();
           }))
-        .addButton((b) =>
-          b.setButtonText(showToken ? "Hide token" : "Show token").onClick(() => {
-            showToken = !showToken;
-            render();
-          }))
         .addButton((b) => b.setButtonText("Refresh").onClick(() => void load(true)));
 
+      // Setup, in the order a person meets it: the clients that need nothing but the URL first,
+      // then the ones that want a token — which this device already has, adopted from the vault.
       for (const cfg of clientConfigs(conn, s.mcpToken)) {
         new Setting(body)
           .setName(cfg.client)
@@ -1557,6 +1544,34 @@ class S3SyncSettingTab extends PluginSettingTab {
           borderRadius: "4px",
         });
       }
+
+      // The token is normally invisible: the installer publishes it and the device picks it up.
+      // It stays editable for the deployments that don't publish one (`--no-publish-token`) and
+      // for pinning a device to a different token than the vault advertises.
+      const advanced = body.createEl("details");
+      advanced.createEl("summary", { text: "Advanced" }).style.cursor = "pointer";
+      new Setting(advanced)
+        .setName("Bearer token")
+        .setDesc(
+          s.mcpToken
+            ? "Installed on this device. Stored in the plugin's data.json, which never syncs — " +
+              "clearing it here makes the device pick the published token up again."
+            : "This deployment publishes no token. Copy it from " +
+              "scripts/install/.secrets/mcp-<user>-<vault>.json on the machine that ran the installer.",
+        )
+        .addText((t) => {
+          t.inputEl.type = showToken ? "text" : "password";
+          t.setPlaceholder(TOKEN_PLACEHOLDER).setValue(s.mcpToken).onChange(async (v) => {
+            s.mcpToken = v.trim();
+            await save();
+          });
+        })
+        .addButton((b) =>
+          b.setButtonText(showToken ? "Hide" : "Show").onClick(() => {
+            showToken = !showToken;
+            render();
+            advanced.open = true;
+          }));
     };
 
     const probe = async (): Promise<void> => {
@@ -1581,6 +1596,14 @@ class S3SyncSettingTab extends PluginSettingTab {
         status = `Couldn't read mcp.json: ${err instanceof Error ? err.message : String(err)}`;
         render();
         return;
+      }
+      // The installer publishes the token so no one has to type it here. Copy it in once; a token
+      // already present on this device wins, so a per-device override is never overwritten.
+      const adopt = tokenToAdopt(conn, s.mcpToken);
+      if (adopt) {
+        s.mcpToken = adopt;
+        await save();
+        this.plugin.logger.info("mcp: adopted the published bearer token for this device");
       }
       status = conn ? "Found an MCP server for this vault." : "No MCP server installed for this vault.";
       render();

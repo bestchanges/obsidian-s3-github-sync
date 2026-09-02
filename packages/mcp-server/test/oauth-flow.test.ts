@@ -19,6 +19,10 @@ const ISSUER = "https://abc123.lambda-url.ap-southeast-1.on.aws";
 const REDIRECT = "https://claude.ai/api/mcp/auth_callback";
 const NOW = Date.UTC(2026, 8, 2, 12, 0, 0);
 
+// Hashed once for the whole file: scrypt is deliberately expensive (~100 ms), and paying that per
+// test burns seconds of CPU that other suites' real-time deadline tests are measured against.
+const PASSWORD_HASH = hashPassword(PASSPHRASE);
+
 let storage: InMemoryStorage;
 let deps: OAuthDeps;
 let clock: number;
@@ -29,7 +33,7 @@ beforeEach(() => {
   clock = NOW;
   deps = {
     signingKey: SECRET,
-    passwordHash: hashPassword(PASSPHRASE),
+    passwordHash: PASSWORD_HASH,
     store: new AuthStore(storage),
     vaultName: "gsd2",
     now: () => clock,
@@ -398,5 +402,44 @@ describe("token endpoint", () => {
   it("only answers POST on the endpoints that change state", async () => {
     expect((await call("GET", "/token"))!.statusCode).toBe(405);
     expect((await call("GET", "/register"))!.statusCode).toBe(405);
+  });
+});
+
+describe("consent-page throttling", () => {
+  const wrong = async (clientId: string, challenge: string) =>
+    call("POST", "/authorize", {
+      body: authorizeQuery(clientId, challenge) + "&action=approve&password=nope",
+    });
+
+  it("stops answering after a run of wrong passphrases, then recovers", async () => {
+    const clientId = await register();
+    const { challenge } = pkce();
+
+    for (let i = 0; i < 5; i++) expect((await wrong(clientId, challenge))!.statusCode).toBe(401);
+
+    const locked = await wrong(clientId, challenge);
+    expect(locked!.statusCode).toBe(429);
+    expect(locked!.body).toContain("Too many failed attempts");
+
+    // Even the right passphrase is refused while the cooldown runs — that is the point.
+    const duringLockout = await call("POST", "/authorize", {
+      body: authorizeQuery(clientId, challenge) + "&action=approve&password=" + encodeURIComponent(PASSPHRASE),
+    });
+    expect(duringLockout!.statusCode).toBe(429);
+
+    clock = NOW + 16 * 60_000;
+    const after = await call("POST", "/authorize", {
+      body: authorizeQuery(clientId, challenge) + "&action=approve&password=" + encodeURIComponent(PASSPHRASE),
+    });
+    expect(after!.statusCode).toBe(302);
+  });
+
+  it("a correct passphrase resets the count", async () => {
+    const clientId = await register();
+    const { challenge } = pkce();
+    for (let i = 0; i < 4; i++) await wrong(clientId, challenge);
+    await approve(clientId, challenge); // succeeds, clearing the slate
+
+    for (let i = 0; i < 4; i++) expect((await wrong(clientId, challenge))!.statusCode).toBe(401);
   });
 });

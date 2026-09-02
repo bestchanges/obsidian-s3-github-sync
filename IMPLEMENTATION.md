@@ -1232,18 +1232,28 @@ The optional MCP server (§8, `packages/mcp-server/`) is provisioned from a lapt
 publishes what it built and the plugin reads it back:
 
 - **`<prefix>mcp.json`** — `{version, endpoint, region, functionName, vault, authModes, tools,
-  updatedAt, docs}`, written by `scripts/install/05-create-mcp-server.sh`. It sits at the vault
-  prefix **root**, beside `snapshot.json.gz` / `deltas/` / `files/` / `_logs/`. Neither leg lists or
-  folds anything outside those four, so it is invisible to the protocol: never vault content, never
-  in the GitHub repo, never merged. It carries **no secret**.
+  updatedAt, docs, token?}`, written by `scripts/install/05-create-mcp-server.sh`. It sits at the
+  vault prefix **root**, beside `snapshot.json.gz` / `deltas/` / `files/` / `_logs/`. Neither leg
+  lists or folds anything outside those four, so it is invisible to the protocol: never vault
+  content, never in the GitHub repo, never merged.
+  It carries the **bearer token** (unless installed with `--no-publish-token`), and that is
+  load-bearing: `data.json` is where the token belongs on a device, but it is excluded from sync by
+  full path precisely so it can hold the S3 secret — which also means it can never carry anything
+  *to* a device. `mcp.json` is the pipe, `data.json` the destination, and `tokenToAdopt` the one-time
+  copy between them. Threat delta: a reader of this object already holds S3 keys to the whole vault
+  and the token grants a strict subset of that; what it adds is an internet-reachable credential
+  that outlives S3 key rotation, so rotate both together.
 - **Settings → "AI assistants (MCP)"** — reads that document through the ordinary `S3FetchAdapter`
   (`createStorage()`), renders endpoint/region/tools, runs a liveness probe (one MCP `initialize`;
   a 401 is a *successful* probe of an unauthenticated attempt and is reported as "needs a token"),
   and emits copy-ready config per client (`clientConfigs`) — Claude Code, Claude Desktop, Gemini
   CLI, plus the bare URL for the connector dialogs that can't send headers.
-- **`mcpToken`** is the one field this section writes. It is per-device by construction: `data.json`
-  is excluded from sync by full path on both legs (§6), so the token never reaches S3 or git. The
-  rendered snippets mask it; the Copy button copies the real thing.
+- **`mcpToken`** is the one field this section writes, and normally nobody types it: opening the
+  section adopts the published token (`tokenToAdopt` — a token already present always wins, so a
+  per-device override survives), and a `<vault>.zip` built after the MCP server carries it in
+  `data.json` from the start. The field itself lives under *Advanced*, for `--no-publish-token`
+  deployments and for pinning one device to a different token. The rendered snippets mask it; the
+  Copy button copies the real thing.
 
 The probe goes through **`requestUrl`**, not `fetch`: the Lambda Function URL returns no CORS
 headers, and both the desktop renderer and the mobile WebView enforce CORS — a plain `fetch` never
