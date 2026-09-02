@@ -2,7 +2,8 @@
 
 A remote **MCP server** that exposes one synced vault to MCP clients (Claude Code, Claude Desktop,
 Gemini CLI) over the internet: search / list / read / write / delete notes and files. Runs as a
-single AWS **Lambda** behind a **Function URL**; auth is a static bearer token (phase 0).
+single AWS **Lambda** behind a **Function URL**, authenticating either a static bearer token or an
+OAuth 2.1 access token it issues itself.
 
 - **Why it's shaped this way:** [MCP Server Design.md](../../MCP%20Server%20Design.md) (infra choice,
   auth phasing, cost, out-of-scope list).
@@ -65,16 +66,34 @@ A fresh `McpServer` + `SingleShotTransport` pair is built per invocation — `tr
 ~40-line custom `Transport` that delivers the message and resolves with the reply, avoiding an
 express/serverless-http stack just to satisfy the SDK's Node HTTP transport.
 
-### Auth
+### Auth — two paths, one gate
 
-**Phase 0 (current):** `Authorization: Bearer <token>` compared constant-time against the
-`MCP_BEARER_TOKEN` env var (`auth.ts`). Works from any client that can set headers (Claude Code,
-Claude Desktop). claude.ai web connectors cannot — they need real OAuth.
+`auth.ts` accepts either credential; a deployment can run one or both.
 
-**Phase 1 (planned):** Cognito user pool as the OAuth 2.1 issuer; the handler grows
-`/.well-known/oauth-protected-resource` (RFC 9728), `WWW-Authenticate` pointers on 401, a
-`POST /register` DCR shim returning the pre-registered client id (Cognito lacks RFC 7591), and JWT
-validation via `aws-jwt-verify`. See the design doc §4.
+- **Static bearer token** — constant-time compare against `MCP_BEARER_TOKEN`. For clients that can
+  set a header (Claude Code, Claude Desktop, Gemini CLI). Full scope, no expiry.
+- **OAuth 2.1 access token** — a JWT this server signed, checked against `MCP_OAUTH_SIGNING_KEY`
+  with `aud` pinned to the MCP URL as the client called it, so a token minted for another vault's
+  function can't be replayed here. Carries scopes.
+
+The authorization server lives in `src/oauth/` (same Lambda, `/authorize` · `/token` · `/register` ·
+the two `.well-known` documents) because the clients that need OAuth — claude.ai, ChatGPT, the
+Gemini app — all require DCR or CIMD, and **Cognito supports neither**; fronting it would have meant
+writing these endpoints as a façade anyway, plus a user pool to run. With one user, "authorization
+server" collapses to: prove you hold the vault passphrase, then hand out short-lived signed tokens.
+
+| Piece | Choice |
+|---|---|
+| Client registration | stateless DCR (the `client_id` *is* a signed registration) **and** CIMD (fetch + validate the document, cached per warm container) |
+| Proof of possession | PKCE S256 required; `plain` refused |
+| Authorization code | signed JWT, 60 s, single-use via a CAS marker in S3 |
+| Access token | HS256 JWT, 1 h, `aud` = the MCP URL, scopes `vault.read` / `vault.write` |
+| Refresh token | 30 d, rotating; replaying a rotated-out token revokes the family |
+| Owner login | scrypt hash in `MCP_LOGIN_PASSWORD_HASH`; the passphrase is never stored |
+| State | `auth/` in the vault's own prefix — no table, no new IAM (`oauth/store.ts`) |
+
+A read-only token (`vault.read` without `vault.write`) gets a server with the writing tools **not
+registered**, so the surface a client sees matches what it may do.
 
 ## Modules
 
@@ -83,7 +102,13 @@ validation via `aws-jwt-verify`. See the design doc §4.
 | `src/vault.ts` | The protocol client: fold-read, version-pinned `read`, `write` (PUT → CAS delta), tombstone `remove`, budgeted `search`, path policy. Pure against `StorageAdapter`. |
 | `src/mcp.ts` | `McpServer` construction + the tools, including the ChatGPT-shaped `search`/`fetch` pair. |
 | `src/transport.ts` | `SingleShotTransport` — one message per invocation. |
-| `src/auth.ts` | Phase-0 bearer check (sha256 + `timingSafeEqual`). |
+| `src/auth.ts` | The gate: static bearer (sha256 + `timingSafeEqual`) or OAuth JWT, returning the granted scopes. |
+| `src/oauth/routes.ts` | The authorization server: discovery documents, `/register`, `/authorize` (+ consent), `/token`. |
+| `src/oauth/jwt.ts` · `password.ts` | HS256 sign/verify on node:crypto (no dependency); scrypt passphrase hashing. |
+| `src/oauth/clients.ts` | Stateless DCR ids and CIMD resolution, plus RFC 8252 loopback redirect matching. |
+| `src/oauth/store.ts` | The only OAuth state: single-use code markers and refresh-token families, in S3 under `auth/`. |
+| `src/oauth/consent.ts` | The one HTML page — login + consent, self-contained under a strict CSP. |
+| `src/oauth/metadata.ts` | RFC 9728 / RFC 8414 documents, scopes, and the `WWW-Authenticate` challenge. |
 | `src/presign.ts` | Presigned S3 GET for `get_file`, pinned to the recorded object version. |
 | `src/handler.ts` | Lambda Function URL entry: routing, auth gate, message validation, lazy env init (cached for warm containers). |
 | `esbuild.config.mjs` | Bundle → `dist/index.mjs` (node22 ESM) + `dist/mcp-server.zip` (Lambda package, handler `index.handler`). |
@@ -112,9 +137,12 @@ Errors (not found, excluded path, too large, bad base64) come back as MCP tool e
 |---|---|
 | `BUCKET` | S3 bucket (required) |
 | `PREFIX` | vault key prefix, must equal the other legs' prefix (e.g. `<user>/vaults/<vault>/`) |
-| `MCP_BEARER_TOKEN` | phase-0 shared secret (required) |
+| `MCP_BEARER_TOKEN` | shared secret for header-capable clients (optional if OAuth is configured) |
+| `MCP_OAUTH_SIGNING_KEY` | HS256 key for issued tokens; absent = OAuth off (optional if a bearer token is set) |
+| `MCP_LOGIN_PASSWORD_HASH` | scrypt hash of the owner's passphrase, `scrypt$N$r$p$salt$hash`; required for OAuth |
 
-`AWS_REGION` is provided by the Lambda runtime itself. IAM: the execution role needs
+At least one of `MCP_BEARER_TOKEN` / `MCP_OAUTH_SIGNING_KEY` must be set or the handler refuses to
+start. `AWS_REGION` is provided by the Lambda runtime itself. IAM: the execution role needs
 get/put/delete/list scoped to the prefix — `scripts/install/05` provisions exactly that.
 
 ## Build · test · deploy
@@ -126,6 +154,11 @@ npm run build:mcp                              # → dist/index.mjs + dist/mcp-s
 scripts/install/05-create-mcp-server.sh --vault <name>       # full provision / reconcile
 AWS_REGION=<r> MCP_FUNCTION=<fn> npm run deploy -w @vault-sync/mcp-server   # code-only redeploy
 ```
+
+The OAuth suites run the whole flow — register → consent → code → token → refresh — against the
+real route handler with an in-memory S3 and an injected clock, plus the attacks that matter
+(`alg: none`, forged client ids, CIMD documents claiming someone else's URL, PKCE mismatch, code
+replay, refresh reuse, cross-vault token audience).
 
 Tests follow the house pattern — no cloud in the loop: `vault.ts` and `search` run against core's
 `InMemoryStorage` (budgets included — `timeBudgetMs` is injectable so the truncation path is

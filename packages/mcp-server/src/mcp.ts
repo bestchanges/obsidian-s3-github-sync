@@ -18,6 +18,12 @@ export interface ServerDeps {
   presignGet: (path: string, versionId?: string) => Promise<string>;
   /** Vault name, used to build `obsidian://` citation links. Derived from PREFIX by the handler. */
   vaultName?: string;
+  /**
+   * Register the reading tools only. Set when the caller's OAuth token carries `vault.read` without
+   * `vault.write`: the writing tools are not merely refused but never listed, so a read-only client
+   * sees a coherent surface instead of tools that always error.
+   */
+  readOnly?: boolean;
 }
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
@@ -63,6 +69,12 @@ const listArgs = {
 export function buildServer(deps: ServerDeps): McpServer {
   const server = new McpServer(SERVER_INFO);
   const { vault } = deps;
+
+  /** Registers a tool that changes the vault — skipped entirely for a read-only token. */
+  const registerWrite: McpServer["registerTool"] = ((name, config, cb) => {
+    if (deps.readOnly) return undefined as never;
+    return server.registerTool(name, config, cb);
+  }) as McpServer["registerTool"];
 
   const list = (kind: PathKind) => (args: { dir?: string; recursive?: boolean }) =>
     run(async () => ok(await vault.list(kind, args.dir ?? "", args.recursive ?? true)));
@@ -169,7 +181,7 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
-  server.registerTool(
+  registerWrite(
     "save_note",
     {
       description:
@@ -183,7 +195,7 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
-  server.registerTool(
+  registerWrite(
     "remove_note",
     { description: "Delete a markdown note from the vault.", inputSchema: { path: pathArg } },
     (args) =>
@@ -209,7 +221,7 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
-  server.registerTool(
+  registerWrite(
     "save_file",
     {
       description: `Create or overwrite a file from base64 content (max ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB).`,
@@ -226,7 +238,7 @@ export function buildServer(deps: ServerDeps): McpServer {
       }),
   );
 
-  server.registerTool(
+  registerWrite(
     "remove_file",
     { description: "Delete a file from the vault.", inputSchema: { path: pathArg } },
     (args) =>

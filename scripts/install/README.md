@@ -52,10 +52,14 @@ cp .env.shadow .env      # then edit .env
 ```bash
 ./05-create-mcp-server.sh --vault work   # role + Lambda + Function URL + bearer token
 ```
-It then publishes `<prefix>mcp.json` (no secret) so every device's plugin settings can show how to
-connect, writes `.secrets/mcp-<user>-<vault>-connect.md` with per-client copy-paste config, verifies
-the deployment with an MCP handshake, and prints the endpoint. Re-running reconciles config and
-redeploys the current build; `--rotate-token` replaces the bearer token. Per-client setup:
+It asks for a **vault passphrase** (or takes `--passphrase`), which enables the in-Lambda OAuth
+server that browser clients — claude.ai, ChatGPT, the Gemini app — need; `--no-oauth` skips it and
+leaves bearer-token clients working. It then publishes `<prefix>mcp.json` (no secret) so every
+device's plugin settings can show how to connect, writes
+`.secrets/mcp-<user>-<vault>-connect.md` with per-client copy-paste config, verifies the deployment
+(MCP handshake + the OAuth discovery documents + the 401 challenge), and prints the endpoint.
+Re-running reconciles config and redeploys the current build; `--rotate-token` replaces the bearer
+token and `--rotate-oauth-key` signs every connected app out. Per-client setup:
 [`MCP.md`](../../MCP.md). Component details:
 [`packages/mcp-server/README.md`](../../packages/mcp-server/README.md).
 
@@ -93,6 +97,9 @@ plugins, and it starts pulling the whole vault. (No instructions ship inside the
   client configs: same handling as the zip — keep it in `.secrets`, share privately if at all. The
   published `mcp.json` carries no secret. Rotate with `./05-create-mcp-server.sh --rotate-token`
   (old token stops working immediately).
+- `05` also stores the **OAuth signing key** and a **scrypt hash** of your vault passphrase in the
+  same `.secrets` file. The passphrase itself is never written anywhere — if you lose it, re-run
+  with a new `--passphrase`. `--rotate-oauth-key` invalidates every OAuth session at once.
 
 ## Required permissions
 

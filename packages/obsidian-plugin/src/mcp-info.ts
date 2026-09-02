@@ -118,7 +118,10 @@ export function clientConfigs(conn: McpConnection, token: string): ClientConfig[
     {
       client: "claude.ai · ChatGPT · Gemini app",
       kind: "url",
-      hint: "Paste as a custom connector URL. These clients cannot send a static header — they need the OAuth mode.",
+      // These clients can't send a header at all: they paste a URL and run OAuth against it.
+      hint: conn.authModes?.includes("oauth")
+        ? "Paste as a custom connector URL — no token. Sign in on the consent page with your vault passphrase."
+        : "Paste as a custom connector URL. Needs the OAuth mode: re-run 05-create-mcp-server.sh with --passphrase.",
       text: conn.endpoint,
       containsSecret: false,
     },

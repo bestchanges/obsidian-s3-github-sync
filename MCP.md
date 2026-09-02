@@ -17,19 +17,20 @@ What each module does: [packages/mcp-server/README.md](packages/mcp-server/READM
 
 ## 1. Which clients work today
 
-| Client | How it authenticates | Status |
+| Client | How it authenticates | What you paste |
 |---|---|---|
-| **Claude Code** | `Authorization` header | ✅ works |
-| **Claude Desktop** | `Authorization` header in the config file | ✅ works |
-| **Gemini CLI** | `Authorization` header in `settings.json` | ✅ works |
-| **claude.ai** (web, mobile) | OAuth 2.1 — cannot send a static header | ⏳ needs the OAuth mode |
-| **ChatGPT** (developer mode) | OAuth 2.1 — no header or API-key option | ⏳ needs the OAuth mode |
-| **Gemini app** (Spark custom apps) | OAuth 2.1 / DCR | ⏳ needs the OAuth mode |
+| **Claude Code** | `Authorization` header | endpoint + token |
+| **Claude Desktop** | `Authorization` header in the config file | endpoint + token |
+| **Gemini CLI** | `Authorization` header in `settings.json` | endpoint + token |
+| **claude.ai** (web, mobile) | OAuth 2.1 | endpoint only |
+| **ChatGPT** (developer mode) | OAuth 2.1 | endpoint only |
+| **Gemini app** (custom Connected App) | OAuth 2.1 | endpoint only |
 
-The split is not about the vault — it is about the clients. Anything that runs on your machine can
-attach a bearer token to each request; the hosted chat surfaces paste a *URL* into a connector
-dialog and then run an OAuth flow against it. The server currently speaks bearer only, so the
-bottom three are pending the OAuth work (design: [MCP Server Design.md](MCP%20Server%20Design.md) §4).
+Two ways in, because clients differ. Anything running on your machine can attach a bearer token to
+every request. The hosted chat surfaces can't — they paste a *URL* into a connector dialog and run
+an OAuth flow against it, so the server is also its own **authorization server**: it shows you a
+consent page, you enter the vault passphrase, and the client gets a short-lived token. Both paths
+are live at the same time; use whichever the client supports.
 
 ---
 
@@ -52,7 +53,13 @@ URL), and a bearer token, then:
   your real token filled in (mode 600, gitignored);
 - **verifies** the deployment with a real MCP handshake before it declares success.
 
-`--rotate-token` mints a new token and invalidates the old one. `--dry-run` shows what it would do.
+During install it asks for a **vault passphrase**. That passphrase is the login for the OAuth
+consent page — the only thing standing between a stranger with your endpoint URL and your notes, so
+make it a real one. Pass it non-interactively with `--passphrase '<passphrase>'`, or skip OAuth
+entirely with `--no-oauth` (bearer clients keep working). Only a scrypt hash of it is stored.
+
+`--rotate-token` mints a new bearer token; `--rotate-oauth-key` mints a new signing key, which signs
+every connected app out at once. `--dry-run` shows what it would do.
 
 ---
 
@@ -131,12 +138,25 @@ Restart Claude Desktop. The vault appears under the tools icon.
 expands environment variables in header values, so `"Bearer $VAULT_MCP_TOKEN"` keeps the secret out
 of the config file.
 
-### claude.ai, ChatGPT, Gemini app — not yet
+### claude.ai, ChatGPT, Gemini app
 
-These add a connector by URL and then negotiate OAuth; none of them can send a static bearer token
-(Claude has a `static_headers` mode, but it is beta and organization-admin-scoped). When the OAuth
-mode ships, the flow becomes: paste the endpoint into the connector dialog → sign in once → done.
-Until then, use a client from the list above.
+These take the **endpoint alone** — no token, no header:
+
+1. **claude.ai** — Settings → Connectors → *Add custom connector*, paste the endpoint.
+   **ChatGPT** — Settings → Apps → *Advanced* → enable Developer mode, then *Create* a connector and
+   paste the endpoint. **Gemini app** — Settings → Connected apps → *Add custom app*, paste it there.
+2. The client discovers the server's OAuth metadata and opens a consent page.
+3. Enter your **vault passphrase**, review what's being connected, approve.
+4. The client stores a token and refreshes it on its own. Sessions last until you rotate the signing
+   key.
+
+What the consent page shows you is worth reading: the app's name and the address it will send you
+back to. If either looks wrong, cancel — a consent screen you didn't start is the one thing an
+attacker with your endpoint URL could get you to see.
+
+> **ChatGPT note:** custom-connector *write* actions are reported to be limited to Business /
+> Enterprise / Edu workspaces; Plus and Pro get read-only. That is OpenAI's restriction, not this
+> server's. Requesting `vault.read` gives a matching read-only surface deliberately.
 
 ---
 
@@ -174,12 +194,25 @@ Limits worth knowing before you ask an assistant to do something:
 ## 6. Security
 
 The bearer token is **full read/write on that one vault** — treat it like the S3 keys. It grants no
-access to `.obsidian/`, to other vaults, or to AWS itself.
+access to `.obsidian/`, to other vaults, or to AWS itself. The same is true of an OAuth token,
+except that it expires in an hour and can be narrowed to `vault.read`.
 
-- **Rotate:** `./05-create-mcp-server.sh --vault <name> --rotate-token`, then update each client and
-  the token field in the plugin settings on each device.
-- **Revoke everything:** rotate the token, or delete the Function URL
+Three secrets exist, and they do different jobs:
+
+| Secret | Held by | Rotate with |
+|---|---|---|
+| bearer token | each header-capable client | `--rotate-token` |
+| OAuth signing key | the Lambda only | `--rotate-oauth-key` (signs every app out) |
+| vault passphrase | you; only its scrypt hash is stored | `--passphrase '<new one>'` |
+
+- **Rotate a token:** `./05-create-mcp-server.sh --vault <name> --rotate-token`, then update each
+  client and the token field in the plugin settings on each device.
+- **Revoke everything:** `--rotate-oauth-key` (OAuth sessions) plus `--rotate-token` (header
+  clients), or delete the Function URL
   (`aws lambda delete-function-url-config --function-name vault-mcp-<user>-<vault>`).
+- **How the OAuth side is held together:** PKCE (S256) is required on every authorization request,
+  codes are single-use and live 60 seconds, access tokens are bound to this exact endpoint, and
+  refresh tokens rotate — replaying an old one revokes the whole session.
 - **Undo an assistant's edit:** it is an ordinary revision — Obsidian → right-click the note →
   *Version history (S3 sync)*, or restore the object version in S3.
 - The Function URL is public but unguessable, and every request is authenticated in the handler; an
@@ -196,6 +229,9 @@ access to `.obsidian/`, to other vaults, or to AWS itself.
 | Settings says *rejected this token* | wrong or rotated token; re-copy it, or rotate and update everywhere |
 | *Unreachable* | the Lambda or its URL is gone — re-run the installer; check `aws logs tail /aws/lambda/vault-mcp-<user>-<vault> --follow` |
 | Client connects but lists no tools | the client is on SSE/stdio; this server is **Streamable HTTP** — use `--transport http` / `type: "http"` / `httpUrl` |
+| A web client says it can't reach the server | OAuth is probably off for this deployment — re-run the installer with `--passphrase`; check `https://<endpoint-host>/.well-known/oauth-protected-resource` returns JSON |
+| Consent page rejects your passphrase | it is the one you set at install; if it's lost, re-run with a new `--passphrase` |
+| A web client only offers read-only tools | it asked for (or was granted) `vault.read` — reconnect, or check the plan limits above for ChatGPT |
 | An assistant "can't find" a note that exists | it is under a dot-path (hidden by design), or the search was truncated — check `truncated` in the result and scope it with `dir` |
 | Search misses a note you know matches | the budget stopped the scan before reaching it (older notes are read last), or the match is in an attachment rather than a note |
 | `413` or "too large" on upload | over the 4 MB inline cap — put the file in the vault from a device instead |

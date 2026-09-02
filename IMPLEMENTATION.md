@@ -1444,10 +1444,15 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
   `02-create-user.sh` for new users, or `06-enable-push-notifications.sh` for existing ones.
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
 - **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`, 60 s /
-  1024 MB), execution role scoped like the plugin user's policy. No state of its own — reads fold
-  `snapshot ⊕ deltas` per request, writes CAS-append `by: "mcp"`, and search re-uses that one fold
-  to read candidate notes newest-first under explicit budgets (no index). The installer publishes
-  `<prefix>mcp.json` so the plugin can show every device how to connect (§4.15). Setup guide:
+  1024 MB), execution role scoped like the plugin user's policy. Almost no state of its own — reads
+  fold `snapshot ⊕ deltas` per request, writes CAS-append `by: "mcp"`, and search re-uses that one
+  fold to read candidate notes newest-first under explicit budgets (no index). It authenticates a
+  static bearer token **or** an OAuth 2.1 access token it issues itself: the same function serves
+  `/authorize` · `/token` · `/register` and the two `.well-known` documents, which is what lets
+  claude.ai / ChatGPT / the Gemini app connect at all (they can send no header). Its only persistent
+  state is `<prefix>auth/` — single-use code markers and refresh-token families — beside the
+  `<prefix>mcp.json` the installer publishes for device-side discovery (§4.15). Secrets:
+  `MCP_BEARER_TOKEN`, `MCP_OAUTH_SIGNING_KEY`, `MCP_LOGIN_PASSWORD_HASH` (scrypt). Setup guide:
   [[MCP.md|MCP.md]]; component details: `packages/mcp-server/README.md`.
   **Deployed by the install script, not by CI** — a merge ships the plugin, but the Lambda updates
   only when `05-create-mcp-server.sh --vault <name>` is re-run.
