@@ -212,11 +212,6 @@ export default class S3SyncPlugin extends Plugin {
     this.addSettingTab(new S3SyncSettingTab(this));
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.runSync("manual") });
     this.addCommand({
-      id: "resync-everything",
-      name: "Resync everything from S3",
-      callback: () => void this.resyncEverything(),
-    });
-    this.addCommand({
       id: "toggle-sync-pause",
       name: "Pause/resume sync",
       callback: () => void this.setSyncPaused(!this.settings.syncPaused),
@@ -527,6 +522,13 @@ export default class S3SyncPlugin extends Plugin {
     }
   }
 
+  /** Full reconcile: forget the cursor, re-pull all of S3, re-scan the whole vault (§4.5).
+   *
+   * Reachable ONLY from the red "Resync" button in settings — deliberately not a command. In the
+   * palette it sat one fuzzy match away from "Sync now" (typing `sync` matched both "Sync now" and
+   * "Re**sync** everything from S3"), which is a bad way to reach the most destructive-looking
+   * action the plugin has. The settings button carries the warning styling and the explanation of
+   * what it does; the palette entry carried neither. */
   async resyncEverything(): Promise<void> {
     if (!this.engine) {
       new Notice("S3 Vault Sync: not configured");
