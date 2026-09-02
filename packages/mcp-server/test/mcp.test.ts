@@ -10,6 +10,7 @@ async function connect() {
   const server = buildServer({
     vault: new VaultClient(storage),
     presignGet: async (path, versionId) => `https://signed.example/${path}?v=${versionId ?? "latest"}`,
+    vaultName: "gsd2",
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "0.0.0" });
@@ -29,10 +30,11 @@ function payload(res: ToolResult): unknown {
 }
 
 describe("MCP tool surface", () => {
-  it("exposes the eight POC tools", async () => {
+  it("exposes the vault tools plus the ChatGPT-shaped search/fetch pair", async () => {
     const { client } = await connect();
     const names = (await client.listTools()).tools.map((t) => t.name).sort();
     expect(names).toEqual([
+      "fetch",
       "get_file",
       "get_note",
       "list_files",
@@ -41,6 +43,8 @@ describe("MCP tool surface", () => {
       "remove_note",
       "save_file",
       "save_note",
+      "search",
+      "search_notes",
     ]);
   });
 
@@ -103,5 +107,72 @@ describe("MCP tool surface", () => {
     const res = await call(client, "save_note", { path: ".obsidian/app.md", text: "x" });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain("unsafe or excluded");
+  });
+
+  it("search_notes returns matching lines and the scan's budget accounting", async () => {
+    const { client } = await connect();
+    await call(client, "save_note", { path: "notes/plan.md", text: "# Plan\n\nship the thing\n" });
+    await call(client, "save_note", { path: "notes/other.md", text: "unrelated\n" });
+
+    const res = payload(await call(client, "search_notes", { query: "ship the" })) as {
+      hits: { path: string; matches: { line: number; text: string }[] }[];
+      truncated: boolean;
+      candidates: number;
+    };
+    expect(res.hits).toHaveLength(1);
+    expect(res.hits[0].path).toBe("notes/plan.md");
+    expect(res.hits[0].matches[0]).toEqual({ line: 3, text: "ship the thing" });
+    expect(res).toMatchObject({ truncated: false, candidates: 2 });
+  });
+
+  it("search_notes surfaces a bad regex as a tool error, not a crash", async () => {
+    const { client } = await connect();
+    const res = await call(client, "search_notes", { query: "(unclosed", regex: true });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("invalid regular expression");
+  });
+
+  // ChatGPT builds citations from these two: search hands back ids, fetch resolves one.
+  it("search returns citable results and fetch resolves an id", async () => {
+    const { client } = await connect();
+    await call(client, "save_note", { path: "projects/roadmap.md", text: "Q3 milestones\n" });
+
+    const found = payload(await call(client, "search", { query: "milestones" })) as {
+      results: { id: string; title: string; url: string; snippet: string }[];
+    };
+    expect(found.results).toEqual([
+      {
+        id: "projects/roadmap.md",
+        title: "roadmap",
+        url: "obsidian://open?vault=gsd2&file=projects%2Froadmap",
+        snippet: "Q3 milestones",
+      },
+    ]);
+
+    const doc = payload(await call(client, "fetch", { id: found.results[0].id })) as Record<string, unknown>;
+    expect(doc).toMatchObject({
+      id: "projects/roadmap.md",
+      title: "roadmap",
+      text: "Q3 milestones\n",
+      url: "obsidian://open?vault=gsd2&file=projects%2Froadmap",
+    });
+    expect((doc.metadata as { size: number }).size).toBe(14);
+  });
+
+  it("fetch of an attachment hands back a download URL instead of text", async () => {
+    const { client, storage } = await connect();
+    await call(client, "save_file", { path: "assets/blob.bin", base64: Buffer.from([1, 2]).toString("base64") });
+    const stored = await storage.get("files/assets/blob.bin");
+
+    const doc = payload(await call(client, "fetch", { id: "assets/blob.bin" })) as Record<string, unknown>;
+    expect(doc.text).toBe("");
+    expect(doc.url).toBe(`https://signed.example/assets/blob.bin?v=${stored!.versionId}`);
+  });
+
+  it("fetch of an unknown id errors", async () => {
+    const { client } = await connect();
+    const res = await call(client, "fetch", { id: "nope.md" });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain("not found");
   });
 });

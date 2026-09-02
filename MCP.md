@@ -6,8 +6,8 @@ tags: [howto, mcp, setup]
 # Connect an AI assistant to your vault (MCP)
 
 Your vault can expose itself to AI assistants as a **remote MCP server**: one AWS Lambda, one HTTPS
-URL, list/read/write/delete over the same delta-journal protocol the Obsidian plugin and git-sync
-speak. An assistant that connects to it sees the live vault — not a copy — and every edit it makes
+URL, search/list/read/write/delete over the same delta-journal protocol the Obsidian plugin and
+git-sync speak. An assistant that connects to it sees the live vault — not a copy — and every edit it makes
 lands on your devices the same way an edit from another device does.
 
 This is the **setup guide**. Why it is built this way: [MCP Server Design.md](MCP%20Server%20Design.md).
@@ -144,6 +144,8 @@ Until then, use a client from the list above.
 
 | Tool | Effect |
 |---|---|
+| `search_notes` | full-text search across notes — paths and content, newest first, with line numbers |
+| `search` / `fetch` | the same search in the shape ChatGPT's connectors expect, for citations |
 | `list_notes` / `list_files` | list `.md` notes / everything else, optionally under a directory |
 | `get_note` | read a note's text |
 | `save_note` | create or overwrite a note |
@@ -153,7 +155,11 @@ Until then, use a client from the list above.
 
 Limits worth knowing before you ask an assistant to do something:
 
-- **No search yet.** An assistant has to list and read; it cannot grep the vault. Planned.
+- **Search reads, it doesn't index.** There is no search index: a query folds the vault's state and
+  reads candidate notes, newest first, under budgets (20 results, 1500 notes, 32 MB, 20 seconds).
+  If a budget cuts the scan short the result says `truncated` and why — narrow it with `dir`, or ask
+  for `pathOnly`, which matches names without reading anything. Notes only; find attachments by path
+  with `list_files`.
 - **Content only.** Every dot-path (`.obsidian/`, `.sync/`, `.git*`) is hidden and unwritable, so an
   assistant can neither read your credentials nor fight the sync legs over config files.
 - **4 MB** cap on inline uploads (Lambda's request limit).
@@ -190,7 +196,8 @@ access to `.obsidian/`, to other vaults, or to AWS itself.
 | Settings says *rejected this token* | wrong or rotated token; re-copy it, or rotate and update everywhere |
 | *Unreachable* | the Lambda or its URL is gone — re-run the installer; check `aws logs tail /aws/lambda/vault-mcp-<user>-<vault> --follow` |
 | Client connects but lists no tools | the client is on SSE/stdio; this server is **Streamable HTTP** — use `--transport http` / `type: "http"` / `httpUrl` |
-| An assistant "can't find" a note that exists | it is under a dot-path (hidden by design), or the assistant guessed a path — ask it to `list_notes` in the folder first |
+| An assistant "can't find" a note that exists | it is under a dot-path (hidden by design), or the search was truncated — check `truncated` in the result and scope it with `dir` |
+| Search misses a note you know matches | the budget stopped the scan before reaching it (older notes are read last), or the match is in an attachment rather than a note |
 | `413` or "too large" on upload | over the 4 MB inline cap — put the file in the vault from a device instead |
 
 ---

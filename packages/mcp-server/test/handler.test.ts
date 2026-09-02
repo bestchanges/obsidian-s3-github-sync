@@ -72,4 +72,15 @@ describe("handler", () => {
     const garbage = { ...post(initialize), body: "{nope" };
     expect((await handler(garbage)).statusCode).toBe(400);
   });
+
+  // Citation links (`obsidian://open?vault=…`) need the vault's own name, and the only place the
+  // Lambda learns it is its key prefix.
+  it("derives the vault name from the key prefix", async () => {
+    const { vaultNameFromPrefix } = await import("../src/handler");
+    expect(vaultNameFromPrefix("egorka/vaults/gsd2/")).toBe("gsd2");
+    expect(vaultNameFromPrefix("egorka/vaults/gsd2")).toBe("gsd2");
+    for (const odd of ["", "unit/", "vaults/", "a/vaults//"]) {
+      expect(vaultNameFromPrefix(odd), odd).toBeUndefined();
+    }
+  });
 });

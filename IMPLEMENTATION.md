@@ -1443,11 +1443,14 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
   on the git-sync OIDC role, both scoped to `vaultsync/<user>-vaults-*/rev`. Written by
   `02-create-user.sh` for new users, or `06-enable-push-notifications.sh` for existing ones.
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
-- **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
-  role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`
-  per request, writes CAS-append `by: "mcp"`. The installer publishes `<prefix>mcp.json` so the
-  plugin can show every device how to connect (§4.15). Setup guide: [[MCP.md|MCP.md]]; component
-  details: `packages/mcp-server/README.md`.
+- **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`, 60 s /
+  1024 MB), execution role scoped like the plugin user's policy. No state of its own — reads fold
+  `snapshot ⊕ deltas` per request, writes CAS-append `by: "mcp"`, and search re-uses that one fold
+  to read candidate notes newest-first under explicit budgets (no index). The installer publishes
+  `<prefix>mcp.json` so the plugin can show every device how to connect (§4.15). Setup guide:
+  [[MCP.md|MCP.md]]; component details: `packages/mcp-server/README.md`.
+  **Deployed by the install script, not by CI** — a merge ships the plugin, but the Lambda updates
+  only when `05-create-mcp-server.sh --vault <name>` is re-run.
 - **Plugin distribution** — because `.obsidian` now syncs, a new `main.js` **and `styles.css`**
   committed/synced into one vault propagate to all devices as ordinary vault content; the starter-vault export bootstraps a
   brand-new device.
