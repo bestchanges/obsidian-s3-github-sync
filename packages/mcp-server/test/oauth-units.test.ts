@@ -9,7 +9,7 @@ import {
 } from "../src/oauth/clients";
 import { randomId, signJwt, verifyJwt } from "../src/oauth/jwt";
 import { hashPassword, verifyPassword } from "../src/oauth/password";
-import { AuthStore } from "../src/oauth/store";
+import { AuthStore, LOCKOUT_MS, MAX_FAILURES } from "../src/oauth/store";
 
 const SECRET = "unit-test-signing-key";
 const NOW = Date.UTC(2026, 8, 2, 12, 0, 0);
@@ -201,5 +201,34 @@ describe("AuthStore", () => {
     const left = (await storage.list("auth/used/")).map((o) => o.key);
     expect(left).toHaveLength(1);
     expect(left[0]).toContain("fresh");
+  });
+});
+
+describe("AuthStore — consent-page throttling", () => {
+  it("locks the page after a run of wrong passphrases, and frees it when the cooldown passes", async () => {
+    const store = new AuthStore(new InMemoryStorage());
+    expect(await store.lockoutRemaining(NOW)).toBe(0);
+
+    for (let i = 0; i < MAX_FAILURES - 1; i++) await store.recordFailure(NOW);
+    expect(await store.lockoutRemaining(NOW)).toBe(0); // still under the limit
+
+    await store.recordFailure(NOW);
+    expect(await store.lockoutRemaining(NOW)).toBe(LOCKOUT_MS);
+    expect(await store.lockoutRemaining(NOW + LOCKOUT_MS + 1)).toBe(0);
+  });
+
+  it("forgets failures that are older than the window", async () => {
+    const store = new AuthStore(new InMemoryStorage());
+    for (let i = 0; i < MAX_FAILURES - 1; i++) await store.recordFailure(NOW);
+    // A day later the counter starts over rather than tipping into a lockout on one more miss.
+    await store.recordFailure(NOW + 24 * 3600_000);
+    expect(await store.lockoutRemaining(NOW + 24 * 3600_000)).toBe(0);
+  });
+
+  it("clears the counter once the right passphrase arrives", async () => {
+    const store = new AuthStore(new InMemoryStorage());
+    for (let i = 0; i < MAX_FAILURES; i++) await store.recordFailure(NOW);
+    await store.clearFailures();
+    expect(await store.lockoutRemaining(NOW)).toBe(0);
   });
 });

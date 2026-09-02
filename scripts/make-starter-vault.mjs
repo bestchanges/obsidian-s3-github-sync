@@ -3,8 +3,9 @@
  * make-starter-vault: bundle a ready-to-sync vault zip for a device.
  *
  * The zip contains ONLY the vault: a single top folder (named with --name) holding just the S3-sync
- * plugin (main.js + manifest.json) and a data.json that carries S3 connection fields on top of the
- * plugin's DEFAULT settings — most importantly the 10 MB download cap, so a device starts lean.
+ * plugin (main.js + manifest.json) and a data.json carrying just the connection fields — the plugin
+ * supplies every other setting from its own defaults, including the 10 MB download cap that keeps a
+ * new device lean.
  * Per-device fields are cleared (deviceId + machineFingerprint → the device mints its own identity)
  * and NO state.json.gz is included, so the plugin does a clean full pull on first run.
  *
@@ -17,7 +18,8 @@
  * Usage:
  *   node scripts/make-starter-vault.mjs --name <vault> \
  *     --bucket <b> --region <r> --prefix <user/vaults/name/> \
- *     --creds-file <json {accessKeyId,secretAccessKey}> [--out <file.zip>] [--no-build]
+ *     --creds-file <json {accessKeyId,secretAccessKey}> [--mcp-creds-file <json {token}>] \
+ *     [--out <file.zip>] [--no-build]
  *
  * Env alternative to --creds-file: VAULT_ACCESS_KEY_ID, VAULT_SECRET_ACCESS_KEY.
  *
@@ -33,22 +35,14 @@ import { fileURLToPath } from "node:url";
 const PLUGIN_ID = "vault-s3-sync";
 const repoDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-// Mirrors DEFAULT_SETTINGS in packages/obsidian-plugin/src/main.ts.
-const DEFAULT_SETTINGS = {
-  bucket: "",
-  region: "us-east-1",
-  accessKeyId: "",
-  secretAccessKey: "",
-  prefix: "",
-  deviceId: "", // minted on first load from the machine label + a random suffix
-  machineFingerprint: "",
-  pollIntervalSec: 15,
-  excludedFolders: [],
-  maxDownloadMB: 10, // small by default → the device stays lean
-  verbose: false,
-  mobileConcurrency: 8,
-  desktopConcurrency: 50,
-};
+/**
+ * Only what this device must be TOLD. Everything else is left out on purpose: the plugin loads
+ * settings as `{...DEFAULT_SETTINGS, ...data.settings}`, so an absent key takes the plugin's own
+ * default — including `maxDownloadMB: 10`, `deviceId: ""` (the device mints its own) and
+ * `machineFingerprint: ""`. A copy of the defaults here used to drift out of step with main.ts
+ * every time a setting was added; not repeating them is what keeps that impossible.
+ */
+const DEFAULT_REGION = "us-east-1";
 
 function flag(name, fallback) {
   const i = process.argv.indexOf(name);
@@ -92,14 +86,32 @@ async function loadCreds() {
   return { accessKeyId, secretAccessKey };
 }
 
+/**
+ * Optional MCP bearer token, read from `05-create-mcp-server.sh`'s credentials file. Carried in
+ * data.json so a new device can reach the vault's MCP server without being told a second secret —
+ * it is strictly weaker than the S3 key already in this zip. Absent = the device adopts the token
+ * the vault publishes the first time its MCP settings are opened.
+ */
+async function loadMcpToken() {
+  const file = flag("--mcp-creds-file");
+  if (!file) return "";
+  try {
+    return JSON.parse(await fs.readFile(file, "utf8")).token ?? "";
+  } catch {
+    console.log(`• no MCP token at ${file} — the device will adopt the published one`);
+    return "";
+  }
+}
+
 async function main() {
   const bucket = flag("--bucket");
-  const region = flag("--region", DEFAULT_SETTINGS.region);
+  const region = flag("--region", DEFAULT_REGION);
   const prefix = flag("--prefix", "");
   const vaultName = safeVaultName(flag("--name", "vault"));
   const out = path.resolve(flag("--out", path.join(process.cwd(), `${vaultName}.zip`)));
   if (!bucket) die("--bucket is required");
   const { accessKeyId, secretAccessKey } = await loadCreds();
+  const mcpToken = await loadMcpToken();
 
   // 1. build the plugin so main.js is current (skippable if dist already present)
   const dist = path.join(repoDir, "packages/obsidian-plugin/dist/main.js");
@@ -113,8 +125,9 @@ async function main() {
     "utf8",
   );
 
-  // 2. data.json = DEFAULTS + connection fields (identity + state cleared)
-  const settings = { ...DEFAULT_SETTINGS, bucket, region, accessKeyId, secretAccessKey, prefix };
+  // 2. data.json = the connection fields only; the plugin fills the rest from its own defaults
+  const settings = { bucket, region, accessKeyId, secretAccessKey, prefix };
+  if (mcpToken) settings.mcpToken = mcpToken;
   const dataJson = JSON.stringify({ settings }, null, 2) + "\n";
 
   // 3. stage the vault ONLY — a single top folder named after the vault, no instructions inside
@@ -134,8 +147,9 @@ async function main() {
 
   const kb = Math.round((await fs.stat(out)).size / 1024);
   console.log(`\n✓ wrote ${out} (${kb} KB) — extracts to ${vaultName}/`);
-  console.log(`  bucket=${bucket} region=${region} prefix=${prefix || "(none)"} maxDownloadMB=${settings.maxDownloadMB}`);
+  console.log(`  bucket=${bucket} region=${region} prefix=${prefix || "(none)"}`);
   console.log(`  accessKeyId=${accessKeyId.slice(0, 4)}… (secret embedded, ${secretAccessKey.length} chars)`);
+  console.log(`  mcpToken=${mcpToken ? "embedded" : "not included (device adopts the published one)"}`);
   console.log("  deviceId + state: cleared → fresh identity and full pull on first run");
   console.log("  ⚠ this zip contains the AWS secret access key — share it over a trusted channel only.");
 }

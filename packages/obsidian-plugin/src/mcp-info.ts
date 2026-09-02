@@ -9,8 +9,17 @@ import type { StorageAdapter } from "@vault-sync/core";
  * `_logs/`. Neither sync leg lists or folds anything outside those, so this object is invisible to
  * the protocol: it never becomes vault content and never reaches the GitHub repo.
  *
- * Deliberately carries NO secret. The bearer token is per-device and lives in this plugin's
- * `data.json` (excluded from sync by full path on both legs), or in the installer's `.secrets/`.
+ * It also carries the bearer **token**, which is what makes the MCP server usable without typing a
+ * secret into every device. That needs a word of justification:
+ *
+ * `data.json` is where the token belongs — per-device, and excluded from sync by full path on both
+ * legs, which is the same reason it can hold the AWS secret key. But precisely because it never
+ * syncs, it cannot *transport* anything: a device that didn't run the installer would never see it.
+ * A synced file inside the plugin's own directory would reach every device, and would also land in
+ * the GitHub content repo and its history. So the token travels here — one object beside the
+ * journal, inside the same private prefix, never in git — and each device copies it into its own
+ * `data.json` once (`adoptToken`). Anyone who can read this object already holds the S3 keys to the
+ * whole vault; the token grants a strict subset of that.
  */
 export const MCP_INFO_KEY = "mcp.json";
 
@@ -30,6 +39,11 @@ export interface McpConnection {
   updatedAt?: string;
   /** where the human-facing setup guide lives */
   docs?: string;
+  /**
+   * Bearer token for this server, published so devices don't have to be told it by hand. Absent
+   * when the installer was run with `--no-publish-token`, in which case the token is typed in.
+   */
+  token?: string;
 }
 
 /** Parse + validate a published document. Unknown fields are kept; a bad endpoint means "no info". */
@@ -51,6 +65,17 @@ export async function readMcpConnection(storage: StorageAdapter): Promise<McpCon
   const res = await storage.get(MCP_INFO_KEY);
   if (!res) return null;
   return parseMcpConnection(new TextDecoder().decode(res.body));
+}
+
+/**
+ * Copy the published token into this device's settings, once. Returns the token that should now be
+ * in use, or null when there is nothing to adopt — an unpublished deployment, or a device that
+ * already has one (a token typed in here always wins, so a per-device override survives).
+ */
+export function tokenToAdopt(conn: McpConnection | null, current: string): string | null {
+  if (current.length > 0) return null;
+  const published = conn?.token?.trim();
+  return published ? published : null;
 }
 
 /** Placeholder shown in copyable configs until this device has been given the bearer token. */

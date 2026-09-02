@@ -6,6 +6,7 @@ import {
   parseMcpConnection,
   probeMcp,
   readMcpConnection,
+  tokenToAdopt,
   TOKEN_PLACEHOLDER,
   type McpConnection,
 } from "../src/mcp-info";
@@ -49,10 +50,34 @@ describe("readMcpConnection", () => {
     expect(await readMcpConnection(storage)).toMatchObject({ endpoint: CONN.endpoint, vault: "gsd2" });
   });
 
+  it("carries the published token through", async () => {
+    const storage = new InMemoryStorage();
+    await put(storage, JSON.stringify({ ...CONN, token: "tok-from-s3" }));
+    expect((await readMcpConnection(storage))?.token).toBe("tok-from-s3");
+  });
+
   it("treats a corrupt document as absent rather than throwing into settings", async () => {
     const storage = new InMemoryStorage();
     await put(storage, "half-written{");
     expect(await readMcpConnection(storage)).toBeNull();
+  });
+});
+
+// data.json is where the token belongs but it never syncs, so it cannot carry anything TO a device.
+// The published document is the pipe; this is the one-time copy at the other end.
+describe("tokenToAdopt", () => {
+  it("takes the published token when this device has none", () => {
+    expect(tokenToAdopt({ ...CONN, token: "published" }, "")).toBe("published");
+  });
+
+  it("never overwrites a token already set on this device", () => {
+    expect(tokenToAdopt({ ...CONN, token: "published" }, "mine")).toBeNull();
+  });
+
+  it("has nothing to adopt from a deployment that publishes no token", () => {
+    expect(tokenToAdopt(CONN, "")).toBeNull();
+    expect(tokenToAdopt({ ...CONN, token: "   " }, "")).toBeNull();
+    expect(tokenToAdopt(null, "")).toBeNull();
   });
 });
 

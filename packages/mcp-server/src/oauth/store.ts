@@ -17,6 +17,29 @@ import { PreconditionFailedError, type StorageAdapter } from "@vault-sync/core";
 
 const USED_PREFIX = "auth/used/";
 const REFRESH_PREFIX = "auth/refresh/";
+const ATTEMPTS_KEY = "auth/login-attempts.json";
+
+/**
+ * Online-guess throttling for the consent page. The passphrase is human-chosen and the page is
+ * reachable by anyone who learns the endpoint URL, so scrypt — which only makes *offline* guessing
+ * expensive — is not the whole answer.
+ *
+ * A single global counter, because there is a single passphrase; keying by IP would just invite
+ * rotation. That means an attacker can lock the owner out of the consent page for the cooldown,
+ * which is a deliberate trade: bearer-token clients and every already-issued OAuth session keep
+ * working throughout, so the vault never becomes unreachable.
+ */
+export const MAX_FAILURES = 5;
+export const FAILURE_WINDOW_MS = 15 * 60_000;
+export const LOCKOUT_MS = 15 * 60_000;
+
+export interface AttemptRecord {
+  fails: number;
+  /** epoch ms of the first failure in the current window */
+  since: number;
+  /** epoch ms until which the consent page refuses to check a passphrase at all */
+  lockedUntil?: number;
+}
 
 /** Refresh-token lifetime; a family untouched for this long is dead anyway. */
 export const REFRESH_TTL_SECONDS = 30 * 24 * 3600;
@@ -70,6 +93,45 @@ export class AuthStore {
   /** Refresh-token reuse means the family is compromised: drop it, so both copies stop working. */
   async revokeRefresh(familyId: string): Promise<void> {
     await this.storage.delete(`${REFRESH_PREFIX}${familyId}.json`);
+  }
+
+  /** Milliseconds left on a lockout, or 0 when the consent page is free to check a passphrase. */
+  async lockoutRemaining(now = Date.now()): Promise<number> {
+    const record = await this.readAttempts();
+    return record?.lockedUntil && record.lockedUntil > now ? record.lockedUntil - now : 0;
+  }
+
+  /** Count one wrong passphrase; locks the page once the window fills up. */
+  async recordFailure(now = Date.now()): Promise<void> {
+    const prev = await this.readAttempts();
+    const fresh = !prev || now - prev.since > FAILURE_WINDOW_MS;
+    const fails = fresh ? 1 : prev.fails + 1;
+    const record: AttemptRecord = {
+      fails,
+      since: fresh ? now : prev.since,
+      ...(fails >= MAX_FAILURES ? { lockedUntil: now + LOCKOUT_MS } : {}),
+    };
+    await this.storage.put(ATTEMPTS_KEY, enc(record));
+  }
+
+  /** A correct passphrase clears the slate. */
+  async clearFailures(): Promise<void> {
+    try {
+      await this.storage.delete(ATTEMPTS_KEY);
+    } catch {
+      // a stale counter costs at most one cooldown; never fail a successful login over it
+    }
+  }
+
+  private async readAttempts(): Promise<AttemptRecord | null> {
+    try {
+      const res = await this.storage.get(ATTEMPTS_KEY);
+      if (!res) return null;
+      const record = JSON.parse(new TextDecoder().decode(res.body)) as AttemptRecord;
+      return typeof record.fails === "number" && typeof record.since === "number" ? record : null;
+    } catch {
+      return null;
+    }
   }
 
   /**

@@ -55,8 +55,14 @@ URL), and a bearer token, then:
 
 During install it asks for a **vault passphrase**. That passphrase is the login for the OAuth
 consent page — the only thing standing between a stranger with your endpoint URL and your notes, so
-make it a real one. Pass it non-interactively with `--passphrase '<passphrase>'`, or skip OAuth
-entirely with `--no-oauth` (bearer clients keep working). Only a scrypt hash of it is stored.
+make it a real one, or let the installer do it: `--generate-passphrase` mints a 24-character one,
+stores it in `.secrets/` (read it back with `jq -r .loginPassphrase …`) and never prints it. Pass
+your own with `--passphrase '<passphrase>'`, or skip OAuth entirely with `--no-oauth` (bearer
+clients keep working). For a passphrase you choose, only its scrypt hash is stored.
+
+Five wrong passphrases in fifteen minutes lock the consent page for fifteen — the page is on the
+public internet, and a slow hash only makes *offline* guessing expensive. Bearer clients and
+already-connected apps keep working through a lockout.
 
 `--rotate-token` mints a new bearer token; `--rotate-oauth-key` mints a new signing key, which signs
 every connected app out at once. `--dry-run` shows what it would do.
@@ -67,22 +73,37 @@ every connected app out at once. `--dry-run` shows what it would do.
 
 | Place | What it holds | Secret? |
 |---|---|---|
-| **Obsidian → Settings → S3 Vault Sync → "AI assistants (MCP)"** | endpoint, region, tools, live status, copy-ready config for each client | token only if you paste it there |
-| `s3://<bucket>/<user>/vaults/<vault>/mcp.json` | the published connection document every device reads | no |
-| `scripts/install/.secrets/mcp-<user>-<vault>.json` | the bearer token, as minted | **yes** |
+| **Obsidian → Settings → S3 Vault Sync → "AI assistants (MCP)"** | endpoint, region, tools, live status, copy-ready config for each client | holds the token, adopted automatically |
+| `s3://<bucket>/<user>/vaults/<vault>/mcp.json` | the published connection document every device reads — including the bearer token | **yes** |
+| `scripts/install/.secrets/mcp-<user>-<vault>.json` | token, OAuth signing key, passphrase hash | **yes** |
 | `scripts/install/.secrets/mcp-<user>-<vault>-connect.md` | per-client snippets with the token inlined | **yes** |
+
+**You should never have to type a token.** The installer publishes it, and each device copies it
+into its own settings the first time you open that section — including devices that were set up long
+before the MCP server existed. A device provisioned from a `<vault>.zip` built after the server
+already gets it in `data.json`.
 
 The settings section is the everyday answer to "how do I connect this vault?" — it works on mobile,
 on a device that never ran the installer, and after you've forgotten the URL. It shows a live status
-line (`Connected — vault-mcp 0.1.0`, or a reason it isn't), a **Bearer token** field, and a **Copy**
-button per client.
+line (`Connected — vault-mcp 0.2.0`, or a reason it isn't), a **Copy** button per client, and the
+token itself tucked under *Advanced* for the rare case you need to see or override it.
 
-> The token is stored in this plugin's `data.json`, which is excluded from sync by full path on both
-> legs — it stays on the device you paste it into and never reaches S3 or the GitHub repo.
+### Why the token travels through S3
 
-`mcp.json` sits beside `snapshot.json.gz`, `deltas/`, `files/` and `_logs/` at the vault prefix.
-Neither sync leg looks outside those, so it is invisible to the protocol: not vault content, not in
-git, never merged.
+`data.json` is where the token belongs on a device, and it is **excluded from sync by full path on
+both legs** — the same reason it can safely hold your AWS secret key. But that also means it can
+never carry anything *to* another device: it is the destination, not the pipe.
+
+So the pipe is `mcp.json`, which sits beside `snapshot.json.gz`, `deltas/`, `files/` and `_logs/` at
+the vault prefix. Neither sync leg looks outside those four, so it is invisible to the protocol: not
+vault content, not in git, never merged. The alternative — a synced file inside the plugin's own
+folder — would reach every device *and* land in the GitHub content repo's history.
+
+Publishing the token there is a smaller step than it sounds: anyone who can read that object already
+holds the vault's S3 keys, and the token grants a strict **subset** of what those keys do (content
+only, no `.obsidian/`, no other vaults, no version history). The one real difference is that an S3
+key leak would then also expose an internet-reachable credential which outlives S3 key rotation — so
+rotate both together, or install with `--no-publish-token` and enter the token by hand.
 
 ---
 
@@ -205,8 +226,9 @@ Three secrets exist, and they do different jobs:
 | OAuth signing key | the Lambda only | `--rotate-oauth-key` (signs every app out) |
 | vault passphrase | you; only its scrypt hash is stored | `--passphrase '<new one>'` |
 
-- **Rotate a token:** `./05-create-mcp-server.sh --vault <name> --rotate-token`, then update each
-  client and the token field in the plugin settings on each device.
+- **Rotate a token:** `./05-create-mcp-server.sh --vault <name> --rotate-token`. The new one is
+  republished, so devices adopt it by themselves — but only where the field is empty, so clear it
+  under *Advanced* on any device still holding the old token, and update your CLI clients.
 - **Revoke everything:** `--rotate-oauth-key` (OAuth sessions) plus `--rotate-token` (header
   clients), or delete the Function URL
   (`aws lambda delete-function-url-config --function-name vault-mcp-<user>-<vault>`).
@@ -231,6 +253,8 @@ Three secrets exist, and they do different jobs:
 | Client connects but lists no tools | the client is on SSE/stdio; this server is **Streamable HTTP** — use `--transport http` / `type: "http"` / `httpUrl` |
 | A web client says it can't reach the server | OAuth is probably off for this deployment — re-run the installer with `--passphrase`; check `https://<endpoint-host>/.well-known/oauth-protected-resource` returns JSON |
 | Consent page rejects your passphrase | it is the one you set at install; if it's lost, re-run with a new `--passphrase` |
+| Consent page says *too many failed attempts* | the lockout above — wait it out, or connect a bearer client meanwhile |
+| Settings shows no token and offers no copy configs | that deployment was installed with `--no-publish-token`; paste the token from `.secrets/` under *Advanced* |
 | A web client only offers read-only tools | it asked for (or was granted) `vault.read` — reconnect, or check the plan limits above for ChatGPT |
 | An assistant "can't find" a note that exists | it is under a dot-path (hidden by design), or the search was truncated — check `truncated` in the result and scope it with `dir` |
 | Search misses a note you know matches | the budget stopped the scan before reaching it (older notes are read last), or the match is in an attachment rather than a note |
