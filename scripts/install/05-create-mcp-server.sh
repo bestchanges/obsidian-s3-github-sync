@@ -5,8 +5,10 @@
 # Builds packages/mcp-server and provisions (idempotently): an execution role `vault-mcp-<user>`
 # scoped to s3://<bucket>/<user>/*, a Lambda `vault-mcp-<user>-<vault>` pointed at that vault's
 # prefix, a public Function URL (auth enforced in-handler), and a bearer token saved to
-# .secrets/mcp-<user>-<vault>.json. Prints the MCP endpoint + client config at the end.
-# Design: "MCP Server Design.md" · component details: packages/mcp-server/README.md
+# .secrets/mcp-<user>-<vault>.json. Then publishes <prefix>mcp.json (no secret) so every device's
+# plugin settings can show how to connect, writes .secrets/mcp-<user>-<vault>-connect.md with the
+# per-client config, and verifies the deployment with an MCP handshake.
+# Setup guide: MCP.md · design: "MCP Server Design.md" · details: packages/mcp-server/README.md
 #
 # Usage: ./05-create-mcp-server.sh --vault NAME [--user NS] [--bucket B] [--region R]
 #                                  [--rotate-token] [--yes] [--dry-run]
@@ -24,7 +26,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --rotate-token) ROTATE=1; shift ;;
   --yes) ASSUME_YES=1; shift ;;
   --dry-run) DRY_RUN=1; shift ;;
-  -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+  -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
   *) die "unknown arg: $1" ;;
 esac; done
 
@@ -184,17 +186,116 @@ for GRANT in "FunctionURLPublicAccess lambda:InvokeFunctionUrl" \
   fi
 done
 
-# --- 6. record + summary ----------------------------------------------------------------------
+# --- 6. record locally --------------------------------------------------------------------------
 if [ "${DRY_RUN:-0}" != 1 ] && [ -n "$URL" ]; then
   TMP="$(mktemp)"
   jq --arg f "$FUNC" --arg u "$URL" --arg r "$REGION" '. + {functionName:$f, url:$u, region:$r}' \
     "$CREDS" >"$TMP" && mv "$TMP" "$CREDS" && chmod 600 "$CREDS"
 fi
 
+ENDPOINT="${URL:-https://<function-url>/}mcp"
+SERVER_NAME="vault-$(printf '%s' "$VAULT" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9_-]\{1,\}/-/g' -e 's/^-*//' -e 's/-*$//')"
+
+# --- 7. publish connection info to the vault -----------------------------------------------------
+# `<prefix>mcp.json` sits beside snapshot.json.gz / deltas/ / files/ / _logs/. Neither sync leg
+# lists or folds anything outside those, so it never becomes vault content and never reaches the
+# GitHub repo — it is a side-channel the plugin reads to show every device how to connect
+# (IMPLEMENTATION.md §4.15). It carries NO secret: the token stays in .secrets and is pasted
+# per-device. Tool names are read out of the source so this can't drift from what ships.
+step "Publish connection info  (s3://$BUCKET/${PREFIX}mcp.json)"
+TOOLS_JSON="$(grep -A1 'registerTool(' "$REPO_DIR/packages/mcp-server/src/mcp.ts" \
+  | grep -o '"[a-z_]\{3,\}"' | tr -d '"' | jq -R . | jq -sc . 2>/dev/null || echo '[]')"
+INFO="$(jq -n --arg e "$ENDPOINT" --arg r "$REGION" --arg f "$FUNC" --arg v "$VAULT" \
+  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson tools "$TOOLS_JSON" \
+  '{version:1, endpoint:$e, region:$r, functionName:$f, vault:$v,
+    authModes:["bearer"], tools:$tools, updatedAt:$t, docs:"MCP.md"}')"
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  log "[dry-run] would put mcp.json: $(printf '%s' "$INFO" | jq -c .)"
+else
+  INFO_FILE="$(mktemp)"; printf '%s\n' "$INFO" >"$INFO_FILE"
+  aws s3api put-object --bucket "$BUCKET" --key "${PREFIX}mcp.json" --body "$INFO_FILE" \
+    --content-type application/json --region "$REGION" --no-cli-pager >/dev/null
+  rm -f "$INFO_FILE"
+  log "published — the plugin's 'AI assistants (MCP)' settings section picks this up on every device"
+fi
+
+# --- 8. connect sheet (holds the token → .secrets, 600) -------------------------------------------
+SHEET="$SECRETS_DIR/mcp-$USER_NS-$VAULT-connect.md"
+step "Connect sheet"
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  log "[dry-run] would write $SHEET"
+else
+  TOKEN="$(jq -r .token "$CREDS")"
+  umask 077
+  cat >"$SHEET" <<SHEETEOF
+# Connect an AI assistant to vault \`$VAULT\`
+
+Endpoint: \`$ENDPOINT\`
+Auth: static bearer token (below). Full guide: MCP.md in the vault-sync repo.
+
+> This file contains the token. Keep it in .secrets; anyone holding it can read and write the vault.
+
+## Claude Code
+
+\`\`\`bash
+claude mcp add --transport http $SERVER_NAME "$ENDPOINT" --header "Authorization: Bearer $TOKEN"
+\`\`\`
+
+## Claude Desktop — Settings → Developer → Edit Config
+
+\`\`\`json
+{ "mcpServers": { "$SERVER_NAME": { "type": "http", "url": "$ENDPOINT",
+    "headers": { "Authorization": "Bearer $TOKEN" } } } }
+\`\`\`
+
+## Gemini CLI — ~/.gemini/settings.json
+
+\`\`\`json
+{ "mcpServers": { "$SERVER_NAME": { "httpUrl": "$ENDPOINT",
+    "headers": { "Authorization": "Bearer $TOKEN" } } } }
+\`\`\`
+
+## Obsidian (any device)
+
+Settings → S3 Vault Sync → **AI assistants (MCP)** → paste the token:
+
+\`\`\`
+$TOKEN
+\`\`\`
+
+## claude.ai · ChatGPT · Gemini app
+
+Not yet: these paste a URL into a connector dialog and cannot send a static header, so they need
+the OAuth mode. See MCP.md.
+SHEETEOF
+  chmod 600 "$SHEET"
+  log "written → $SHEET"
+fi
+
+# --- 9. verify + summary --------------------------------------------------------------------------
+step "Verify"
+if [ "${DRY_RUN:-0}" = 1 ]; then
+  log "[dry-run] would POST an MCP initialize to $ENDPOINT"
+elif command -v curl >/dev/null 2>&1; then
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "$ENDPOINT" \
+    -H "Authorization: Bearer $(jq -r .token "$CREDS")" -H 'content-type: application/json' \
+    -H 'accept: application/json, text/event-stream' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"installer","version":"1"}}}' || echo 000)"
+  case "$CODE" in
+    200) log "handshake OK (HTTP 200)" ;;
+    401) warn "handshake rejected (401) — the function may still be applying the new token; retry in a moment" ;;
+    *)   warn "handshake returned HTTP $CODE — check: aws logs tail /aws/lambda/$FUNC --follow" ;;
+  esac
+else
+  warn "curl not found — skipped the handshake check"
+fi
+
 step "MCP server ready for '$VAULT'"
-log "Endpoint: ${URL:-https://<function-url>/}mcp"
-log "Token:    $CREDS   (never printed; ships to the client via the command below)"
+log "Endpoint:  $ENDPOINT"
+log "Token:     $CREDS   (never printed)"
+log "Connect:   $SHEET   (per-client copy-paste, includes the token)"
+log "In Obsidian: Settings → S3 Vault Sync → 'AI assistants (MCP)' — endpoint and configs appear on every device"
 log "Redeploy code only:  AWS_REGION=$REGION MCP_FUNCTION=$FUNC npm run deploy -w @vault-sync/mcp-server"
 log "Claude Code:"
-printf '    claude mcp add --transport http %s "%smcp" --header "Authorization: Bearer $(jq -r .token %s)"\n' \
-  "vault-$VAULT" "${URL:-https://<function-url>/}" "$CREDS"
+printf '    claude mcp add --transport http %s "%s" --header "Authorization: Bearer $(jq -r .token %s)"\n' \
+  "$SERVER_NAME" "$ENDPOINT" "$CREDS"

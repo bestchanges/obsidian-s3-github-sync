@@ -23,7 +23,8 @@ from the POC design. Section §12 maps design → implementation for anyone hold
 > a split settings/state persistence model, a per-device download cap, full `.obsidian` config sync
 > with a per-device denylist, and a one-click "starter vault" exporter. An optional third client —
 > a stateless **MCP server** on AWS Lambda — exposes a vault to MCP clients over the internet
-> (design: [[MCP Server Design.md|MCP Server Design.md]], details: `packages/mcp-server/README.md`).
+> (setup: [[MCP.md|MCP.md]], design: [[MCP Server Design.md|MCP Server Design.md]], details:
+> `packages/mcp-server/README.md`).
 
 ```mermaid
 flowchart LR
@@ -64,6 +65,7 @@ runner — the property that guarantees both legs merge the same way.
 | `packages/obsidian-plugin/src/poll-schedule.ts` | Pure poll-tier + push-debounce cadence (§4.9a, §4.4) — no DOM, unit-tested. |
 | `packages/obsidian-plugin/src/notify.ts` | `ChangeNotifier`: MQTT-over-WSS subscribe/publish, presign, backoff (§4.14). |
 | `packages/obsidian-plugin/src/mqtt.ts` | Hand-rolled QoS-0 MQTT 3.1.1 codec — pure, unit-tested (§4.14). |
+| `packages/obsidian-plugin/src/mcp-info.ts` | Reads the published `mcp.json`, builds per-client MCP configs, probes the endpoint (§4.15). |
 | `packages/obsidian-plugin/src/logger.ts` | `SyncLogger`: rotating on-disk log + per-device S3 shipping (§4.11). |
 | `packages/obsidian-plugin/src/history-modal.ts` | `VersionHistoryModal`: per-note revision list, diff, restore (§4.12). |
 | `packages/obsidian-plugin/styles.css` | Plugin stylesheet (version-history layout, §4.12). Auto-loaded by Obsidian; shipped through every channel. |
@@ -1223,6 +1225,33 @@ should announce too.
 > the earlier vault — the moment a second vault was set up. The wildcard is no wider in practice:
 > the identity it attaches to already has S3 access to every one of that user's vaults.
 
+## 4.15 MCP connection surface (`mcp-info.ts`)
+
+The optional MCP server (§8, `packages/mcp-server/`) is provisioned from a laptop, but has to be
+*connectable* from every device — including ones that never ran the installer. So the installer
+publishes what it built and the plugin reads it back:
+
+- **`<prefix>mcp.json`** — `{version, endpoint, region, functionName, vault, authModes, tools,
+  updatedAt, docs}`, written by `scripts/install/05-create-mcp-server.sh`. It sits at the vault
+  prefix **root**, beside `snapshot.json.gz` / `deltas/` / `files/` / `_logs/`. Neither leg lists or
+  folds anything outside those four, so it is invisible to the protocol: never vault content, never
+  in the GitHub repo, never merged. It carries **no secret**.
+- **Settings → "AI assistants (MCP)"** — reads that document through the ordinary `S3FetchAdapter`
+  (`createStorage()`), renders endpoint/region/tools, runs a liveness probe (one MCP `initialize`;
+  a 401 is a *successful* probe of an unauthenticated attempt and is reported as "needs a token"),
+  and emits copy-ready config per client (`clientConfigs`) — Claude Code, Claude Desktop, Gemini
+  CLI, plus the bare URL for the connector dialogs that can't send headers.
+- **`mcpToken`** is the one field this section writes. It is per-device by construction: `data.json`
+  is excluded from sync by full path on both legs (§6), so the token never reaches S3 or git. The
+  rendered snippets mask it; the Copy button copies the real thing.
+
+The probe goes through **`requestUrl`**, not `fetch`: the Lambda Function URL returns no CORS
+headers, and both the desktop renderer and the mobile WebView enforce CORS — a plain `fetch` never
+leaves the device. (S3 works only because `01-create-bucket.sh` configures bucket CORS.)
+
+Pure helpers (parse, `clientConfigs`, `probeMcp` with an injected `fetch`) are unit-tested in
+`test/mcp-info.test.ts`. User-facing guide: [[MCP.md|MCP.md]].
+
 ---
 
 # 5. git-sync — `packages/git-sync`
@@ -1372,6 +1401,7 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 | `loggingEnabled` | **false** | disk + S3 diagnostic log (§4.11) |
 | `pushNotifications` | **false** | instant sync over IoT Core (§4.14) |
 | `iotEndpoint` | `""` | IoT ATS data endpoint host; required when the above is on |
+| `mcpToken` | `""` | bearer token for this vault's MCP server (§4.15); per-device, never synced |
 
 ## 7.2 git-sync env (set by the workflow)
 
@@ -1415,7 +1445,9 @@ The two legs must agree exactly: if one syncs a file the other tombstones, they 
 - **Multi-vault** — one bucket, distinct `PREFIX`/`prefix` per vault.
 - **MCP server (optional)** — one Lambda + Function URL per vault (`scripts/install/05`), execution
   role scoped like the plugin user's policy. No state of its own — reads fold `snapshot ⊕ deltas`
-  per request, writes CAS-append `by: "mcp"`. See `packages/mcp-server/README.md`.
+  per request, writes CAS-append `by: "mcp"`. The installer publishes `<prefix>mcp.json` so the
+  plugin can show every device how to connect (§4.15). Setup guide: [[MCP.md|MCP.md]]; component
+  details: `packages/mcp-server/README.md`.
 - **Plugin distribution** — because `.obsidian` now syncs, a new `main.js` **and `styles.css`**
   committed/synced into one vault propagate to all devices as ordinary vault content; the starter-vault export bootstraps a
   brand-new device.
