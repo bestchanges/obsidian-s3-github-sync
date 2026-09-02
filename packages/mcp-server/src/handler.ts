@@ -59,9 +59,19 @@ function init(): { config: Config; deps: ServerDeps } {
         }),
       ),
       presignGet: makePresigner(config.bucket, config.prefix, config.region),
+      vaultName: vaultNameFromPrefix(config.prefix),
     },
   };
   return cached;
+}
+
+/**
+ * The vault's name out of its key prefix (`<user>/vaults/<vault>/`) — the same name the user's
+ * Obsidian vault folder carries, which is what `obsidian://open?vault=…` citation links need.
+ * Undefined for any prefix that doesn't follow the layout; links then omit the vault.
+ */
+export function vaultNameFromPrefix(prefix: string): string | undefined {
+  return /(?:^|\/)vaults\/([^/]+)\/?$/.exec(prefix)?.[1];
 }
 
 function json(statusCode: number, value: unknown): HttpResult {

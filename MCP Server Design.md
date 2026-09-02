@@ -7,10 +7,11 @@ created: 2026-07-17
 
 # Vault MCP Server — POC Design
 
-Expose a synced vault as a remote **MCP server** reachable from the internet, so Claude (Code,
-Desktop, claude.ai) can list, read, write, and delete notes and files. This document covers the POC:
-the smallest, cheapest infrastructure that is still a **correct citizen of the sync protocol**.
-**Search is out of scope** (it needs a persistent index — SQLite/OpenSearch — designed separately).
+Expose a synced vault as a remote **MCP server** reachable from the internet, so an assistant
+(Claude Code/Desktop, Gemini CLI, and — once OAuth lands — the hosted chat surfaces) can search,
+list, read, write, and delete notes and files. This document covers the POC: the smallest, cheapest
+infrastructure that is still a **correct citizen of the sync protocol**. A search *index* remains
+out of scope; budgeted index-free search shipped instead (§7).
 
 Related: [IMPLEMENTATION.md](IMPLEMENTATION.md) (protocol §2, adapters §3),
 [System Design.md](System%20Design.md) (why S3-as-hub).
@@ -66,10 +67,12 @@ Transport: **Streamable HTTP, stateless mode** (`@modelcontextprotocol/sdk`,
 Plain JSON request/response — no SSE stream needed — which is exactly what a Lambda can serve.
 A new server+transport pair is constructed per invocation (the SDK's documented stateless pattern).
 
-Tools (POC — mirrors the task list; search deliberately absent):
+Tools:
 
 | Tool | Input | Output | Notes |
 |---|---|---|---|
+| `search_notes` | `query`, `dir?`, `regex?`, `caseSensitive?`, `maxResults?`, `maxMatchesPerFile?`, `pathOnly?` | `{hits, scanned, candidates, truncated, reason?}` | index-free: one fold, then reads candidates newest-first under four budgets (§7) |
+| `search` / `fetch` | `query` / `id` | ChatGPT connector shape | thin envelopes over `search_notes` / `get_note`, so OpenAI's clients can cite results |
 | `list_notes` | `dir?` (prefix), `recursive?` (default true) | `[{path, size, mtime}]` | fold, filter `*.md`, drop tombstones + dot-paths |
 | `list_files` | same | same, non-`.md` | same fold, one implementation |
 | `get_note` | `path` | `{text, hash, size, mtime}` | 404 on tombstone/absent; `hash` returned to enable optimistic concurrency later |
@@ -197,9 +200,12 @@ packages/mcp-server/
 
 ## 7. Out of scope (POC)
 
-- **Search** and any index (SQLite, embeddings) — separate design; it will likely hang off the
-  same fold with an incremental cursor, which is another reason the MCP server stays a clean
-  protocol client.
+- **A search index** (SQLite, embeddings) — still deferred. Search *itself* shipped without one:
+  `search_notes` folds state and reads candidate notes newest-first under explicit budgets (results,
+  files, bytes, 20 s), returning `truncated` + `reason` when one bites, and a `search`/`fetch` pair
+  in ChatGPT's connector shape sits on the same engine. That is affordable for a personal vault and
+  keeps the server a clean stateless protocol client; an index is what a vault too large for the
+  budgets would need, and it will likely hang off the same fold with an incremental cursor.
 - Files > ~4 MB upload / presigned-PUT two-step; multi-vault routing in one function; scoped
   authorization; custom domain; rate limiting (Cognito + obscure URL suffices at POC risk level);
   MCP resources/prompts surface (tools only for now).

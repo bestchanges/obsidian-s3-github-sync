@@ -108,6 +108,11 @@ run npm --prefix "$REPO_DIR" run build:mcp
 
 # --- 4. Lambda function -----------------------------------------------------------------------
 # AWS_REGION is set by the Lambda runtime itself (it is a reserved key — do not put it in env).
+# 60 s / 1024 MB: search has no index, so one call folds remote state and reads candidate notes in
+# parallel (packages/mcp-server/src/vault.ts). Its own budget stops at 20 s — this is the headroom
+# around it, and more memory buys proportionally more CPU and network for the parallel reads.
+TIMEOUT=60
+MEMORY=1024
 step "Lambda '$FUNC'  (BUCKET=$BUCKET  PREFIX=$PREFIX)"
 ENVJSON="$(jq -n --arg b "$BUCKET" --arg p "$PREFIX" --arg t "$TOKEN" \
   '{Variables:{BUCKET:$b,PREFIX:$p,MCP_BEARER_TOKEN:$t}}')"
@@ -120,7 +125,7 @@ if aws lambda get-function --function-name "$FUNC" --region "$REGION" >/dev/null
       --region "$REGION" --no-cli-pager >/dev/null
     aws lambda wait function-updated --function-name "$FUNC" --region "$REGION"
     aws lambda update-function-configuration --function-name "$FUNC" \
-      --environment "$ENVJSON" --timeout 30 --memory-size 512 \
+      --environment "$ENVJSON" --timeout "$TIMEOUT" --memory-size "$MEMORY" \
       --region "$REGION" --no-cli-pager >/dev/null
     aws lambda wait function-updated --function-name "$FUNC" --region "$REGION"
     log "updated"
@@ -128,14 +133,14 @@ if aws lambda get-function --function-name "$FUNC" --region "$REGION" >/dev/null
 else
   confirm "Create Lambda function '$FUNC'?" || die "aborted"
   if [ "${DRY_RUN:-0}" = 1 ]; then
-    log "[dry-run] would create function $FUNC (nodejs22.x, arm64, role $ROLE_ARN)"
+    log "[dry-run] would create function $FUNC (nodejs22.x, arm64, ${TIMEOUT}s/${MEMORY}MB, role $ROLE_ARN)"
   else
     # a just-created role takes a few seconds to become assumable by Lambda — retry briefly
     CREATED=0; ERR=""
     for i in 1 2 3 4 5 6 7 8; do
       if ERR="$(aws lambda create-function --function-name "$FUNC" \
             --runtime nodejs22.x --architectures arm64 --handler index.handler \
-            --role "$ROLE_ARN" --timeout 30 --memory-size 512 \
+            --role "$ROLE_ARN" --timeout "$TIMEOUT" --memory-size "$MEMORY" \
             --environment "$ENVJSON" --zip-file "fileb://$ZIP" \
             --region "$REGION" --no-cli-pager 2>&1 >/dev/null)"; then CREATED=1; break; fi
       [ "$ROLE_CREATED" = 1 ] || break

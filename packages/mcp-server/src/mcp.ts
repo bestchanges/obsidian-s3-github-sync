@@ -1,8 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { isNotePath, MAX_UPLOAD_BYTES, VaultClient, type PathKind } from "./vault";
+import {
+  isNotePath,
+  MAX_UPLOAD_BYTES,
+  VaultClient,
+  type PathKind,
+  type SearchHit,
+} from "./vault";
 
-export const SERVER_INFO = { name: "vault-mcp", version: "0.1.0" };
+export const SERVER_INFO = { name: "vault-mcp", version: "0.2.0" };
 /** get_file presigned-URL lifetime */
 export const PRESIGN_TTL_SECONDS = 300;
 
@@ -10,6 +16,8 @@ export interface ServerDeps {
   vault: VaultClient;
   /** presigned S3 GET for `files/<path>` — binary content never transits the Lambda */
   presignGet: (path: string, versionId?: string) => Promise<string>;
+  /** Vault name, used to build `obsidian://` citation links. Derived from PREFIX by the handler. */
+  vaultName?: string;
 }
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
@@ -27,6 +35,25 @@ function run(fn: () => Promise<ToolResult>): Promise<ToolResult> {
 }
 
 const pathArg = z.string().describe("Vault-relative path, e.g. 'projects/idea.md'");
+
+/** Deep-link a result back into the user's own vault, so a citation resolves on their machine. */
+function noteUrl(vaultName: string | undefined, path: string): string {
+  const file = encodeURIComponent(isNotePath(path) ? path.replace(/\.md$/i, "") : path);
+  return vaultName
+    ? `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${file}`
+    : `obsidian://open?file=${file}`;
+}
+
+function titleOf(path: string): string {
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  return isNotePath(base) ? base.slice(0, -3) : base;
+}
+
+/** One line of context for a hit: its first matching line, or the path match that found it. */
+function hitSnippet(hit: SearchHit): string {
+  return hit.matches[0]?.text ?? `(matched on path) ${hit.path}`;
+}
+
 const listArgs = {
   dir: z.string().optional().describe("Scope to this directory (default: vault root)"),
   recursive: z.boolean().optional().describe("Include subdirectories (default: true)"),
@@ -50,6 +77,77 @@ export function buildServer(deps: ServerDeps): McpServer {
     "list_files",
     { description: "List non-markdown files in the vault ({path, size, mtime}).", inputSchema: listArgs },
     list("file"),
+  );
+
+  server.registerTool(
+    "search_notes",
+    {
+      description:
+        "Full-text search across the vault's markdown notes. Matches note paths and content, " +
+        "newest notes first. Returns matching lines with their line numbers; large vaults are " +
+        "scanned under a budget and the result says when it was truncated.",
+      inputSchema: {
+        query: z.string().describe("Literal substring, or a regular expression when regex is true"),
+        dir: z.string().optional().describe("Scope to this directory (default: whole vault)"),
+        regex: z.boolean().optional().describe("Treat query as a JavaScript regular expression"),
+        caseSensitive: z.boolean().optional().describe("Default: false"),
+        maxResults: z.number().int().positive().optional().describe("Matching notes to return (default 20)"),
+        maxMatchesPerFile: z.number().int().positive().optional().describe("Lines per note (default 5)"),
+        pathOnly: z.boolean().optional().describe("Match paths only — reads no content, much faster"),
+      },
+    },
+    (args) => run(async () => ok(await vault.search(args))),
+  );
+
+  // ── ChatGPT-shaped aliases ──────────────────────────────────────────────────────────────────
+  // OpenAI's connectors look for a `search`/`fetch` pair with this exact result shape (results
+  // carrying id/title/url, then a fetch by id) to build citations. Same engine underneath as
+  // search_notes / get_note; only the envelope differs.
+  server.registerTool(
+    "search",
+    {
+      description: "Search the vault's notes and return citable results (id, title, url).",
+      inputSchema: { query: z.string().describe("What to look for") },
+    },
+    (args) =>
+      run(async () => {
+        const res = await vault.search({ query: args.query });
+        return ok({
+          results: res.hits.map((hit) => ({
+            id: hit.path,
+            title: titleOf(hit.path),
+            url: noteUrl(deps.vaultName, hit.path),
+            snippet: hitSnippet(hit),
+          })),
+          truncated: res.truncated,
+        });
+      }),
+  );
+
+  server.registerTool(
+    "fetch",
+    {
+      description: "Fetch one vault document by the id returned from search.",
+      inputSchema: { id: z.string().describe("Document id — the vault-relative path from search") },
+    },
+    (args) =>
+      run(async () => {
+        const entry = await vault.entry(args.id);
+        if (!entry) return fail(`not found: ${args.id}`);
+        const base = {
+          id: args.id,
+          title: titleOf(args.id),
+          url: noteUrl(deps.vaultName, args.id),
+          metadata: { path: args.id, size: entry.size, mtime: entry.mtime, hash: entry.hash },
+        };
+        if (!isNotePath(args.id)) {
+          // Binary/attachment: there is no text to cite, so hand back a download URL instead.
+          return ok({ ...base, text: "", url: await deps.presignGet(args.id, entry.s3VersionId) });
+        }
+        const res = await vault.read(args.id);
+        if (!res) return fail(`not found: ${args.id}`);
+        return ok({ ...base, text: new TextDecoder().decode(res.bytes) });
+      }),
   );
 
   server.registerTool(

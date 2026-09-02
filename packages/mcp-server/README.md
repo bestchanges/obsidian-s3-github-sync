@@ -1,9 +1,8 @@
 # @vault-sync/mcp-server
 
-A remote **MCP server** that exposes one synced vault to MCP clients (Claude Code, Claude Desktop)
-over the internet: list / read / write / delete notes and files. Runs as a single AWS **Lambda**
-behind a **Function URL**; auth is a static bearer token (phase 0). Search is deliberately absent —
-it needs an index and is designed separately.
+A remote **MCP server** that exposes one synced vault to MCP clients (Claude Code, Claude Desktop,
+Gemini CLI) over the internet: search / list / read / write / delete notes and files. Runs as a
+single AWS **Lambda** behind a **Function URL**; auth is a static bearer token (phase 0).
 
 - **Why it's shaped this way:** [MCP Server Design.md](../../MCP%20Server%20Design.md) (infra choice,
   auth phasing, cost, out-of-scope list).
@@ -37,6 +36,19 @@ Unlike the plugin (cursor + per-file state) and git-sync (`.sync/state.json`), t
 **nothing** between requests — no cursor, no resync concept — which is what makes a stateless
 Lambda the right runtime.
 
+### Search without an index
+
+There is none — `search` folds remote state and **reads** candidate notes, newest first
+(`vault.ts`). That is affordable for a personal vault and honest about its limits: every scan runs
+under four budgets — result count, files, bytes, and a 20 s wall clock — and a result that hit one
+says `truncated: true` with the `reason`, rather than timing out with nothing. Notes only: other
+files have no text to grep, and `list_files` finds them by path. Path matches cost nothing (they
+need no content), so they are collected first and never spend budget.
+
+One fold per search, not per note: content reads are pinned to the entry the fold already produced
+(`readAt`), the same version-pinning `read` uses. The function runs at 60 s / 1024 MB to leave
+headroom around the 20 s budget.
+
 ### Path policy (POC)
 
 All tools reject traversal/absolute/malformed paths and **hide every dot-path** (`.obsidian/`,
@@ -68,8 +80,8 @@ validation via `aws-jwt-verify`. See the design doc §4.
 
 | File | Role |
 |---|---|
-| `src/vault.ts` | The protocol client: fold-read, version-pinned `read`, `write` (PUT → CAS delta), tombstone `remove`, path policy. Pure against `StorageAdapter`. |
-| `src/mcp.ts` | `McpServer` construction + the eight tools. |
+| `src/vault.ts` | The protocol client: fold-read, version-pinned `read`, `write` (PUT → CAS delta), tombstone `remove`, budgeted `search`, path policy. Pure against `StorageAdapter`. |
+| `src/mcp.ts` | `McpServer` construction + the tools, including the ChatGPT-shaped `search`/`fetch` pair. |
 | `src/transport.ts` | `SingleShotTransport` — one message per invocation. |
 | `src/auth.ts` | Phase-0 bearer check (sha256 + `timingSafeEqual`). |
 | `src/presign.ts` | Presigned S3 GET for `get_file`, pinned to the recorded object version. |
@@ -82,6 +94,8 @@ The S3 `StorageAdapter` is imported from `@vault-sync/git-sync` (AWS SDK v3); `c
 
 | Tool | Input | Returns |
 |---|---|---|
+| `search_notes` | `query`, `dir?`, `regex?`, `caseSensitive?`, `maxResults?`, `maxMatchesPerFile?`, `pathOnly?` | `{hits:[{path, size, mtime, pathMatch, matches:[{line,text}]}], scanned, candidates, truncated, reason?}` |
+| `search` / `fetch` | `query` / `id` | ChatGPT-connector shape: `{results:[{id,title,url,snippet}]}` and `{id,title,text,url,metadata}` — same engine as `search_notes` / `get_note` |
 | `list_notes` / `list_files` | `dir?`, `recursive?` (default true) | `[{path, size, mtime}]` — `.md` vs non-`.md` |
 | `get_note` | `path` | `{path, text, hash, size, mtime}` |
 | `save_note` | `path`, `text` | `{rev, hash}` — create or overwrite (LWW; device merges handle races) |
@@ -113,9 +127,10 @@ scripts/install/05-create-mcp-server.sh --vault <name>       # full provision / 
 AWS_REGION=<r> MCP_FUNCTION=<fn> npm run deploy -w @vault-sync/mcp-server   # code-only redeploy
 ```
 
-Tests follow the house pattern — no cloud in the loop: `vault.ts` runs against core's
-`InMemoryStorage`, the tools end-to-end through the SDK `Client` + `InMemoryTransport`, the handler
-(HTTP/auth/transport) invoked directly.
+Tests follow the house pattern — no cloud in the loop: `vault.ts` and `search` run against core's
+`InMemoryStorage` (budgets included — `timeBudgetMs` is injectable so the truncation path is
+exercised in real time), the tools end-to-end through the SDK `Client` + `InMemoryTransport`, the
+handler (HTTP/auth/transport) invoked directly.
 
 ## Connecting a client
 
